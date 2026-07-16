@@ -6,6 +6,7 @@ eSCL (AirScan) 扫描引擎 — 合并版
   - photo-scan-split: 极简 mDNS 发现
 """
 
+import copy
 import io
 import logging
 import time
@@ -23,7 +24,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status",
-    "execute_scan", "scan_to_file", "auto_exposure", "manual_exposure",
+    "execute_scan", "scan_to_file",
+    "apply_exposure", "auto_exposure", "manual_exposure",
     "FORMAT_MIME", "MIME_EXT",
 ]
 
@@ -142,11 +144,12 @@ def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
 def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInfo:
     """
     从 /eSCL/ScannerCapabilities 解析扫描仪全部能力。
-    就地修改传入的 scanner 对象并返回同一引用。
+    返回修改后的副本，不修改传入的 scanner 对象。
     """
     if not scanner.escl_url:
-        return scanner
+        return copy.copy(scanner)
 
+    scanner = copy.copy(scanner)
     url = scanner.escl_url.rstrip("/") + "/ScannerCapabilities"
     try:
         r = requests.get(url, timeout=timeout, verify=False)
@@ -321,6 +324,7 @@ MIME_EXT = {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/tiff": "tiff",
+    "image/bmp": "bmp",
     "application/pdf": "pdf",
     "application/octet-stream": "jpg",
 }
@@ -345,25 +349,43 @@ def _stretch_channel(ch_img):
     return ch_img.point(lut)
 
 
+def apply_exposure(img: Image.Image, mode: str = "off",
+                   brightness: int = 0, contrast: int = 0,
+                   mime: str = "image/jpeg") -> Image.Image:
+    """
+    统一曝光后处理入口。
+    mode: "off" | "auto" | "manual"
+    直接操作 PIL Image 对象，避免 bytes 序列化往返。
+    """
+    if mode == "off" or img.mode not in ("RGB", "L"):
+        return img
+    if mode == "auto":
+        if img.mode == "RGB":
+            return Image.merge("RGB", tuple(_stretch_channel(ch) for ch in img.split()))
+        return _stretch_channel(img)
+    if mode == "manual":
+        if brightness == 0 and contrast == 0:
+            return img
+        factor = (259 * (contrast + 255)) / (255 * (259 - contrast)) if contrast != 0 else 1.0
+        lut = [max(0, min(255, int(factor * (v - 128) + 128 + brightness))) for v in range(256)]
+        return img.point(lut)
+    return img
+
+
+def _img_to_bytes(img: Image.Image, mime: str = "image/jpeg") -> bytes:
+    """PIL Image → bytes，按 MIME 选择格式。"""
+    buf = io.BytesIO()
+    fmt = "JPEG" if mime == "image/jpeg" else "PNG"
+    img.save(buf, fmt)
+    return buf.getvalue()
+
+
 def auto_exposure(data: bytes, mime: str = "image/jpeg") -> bytes:
-    """
-    自动曝光后处理 — 直方图拉伸。
-    分析图像各通道像素分布，取 1%-99% 分位区间线性拉伸到 0-255，
-    有效去除扫描件灰底、提升文字对比度。
-    """
+    """自动曝光后处理 — 直方图拉伸。（向后兼容的 bytes 接口）"""
     try:
         img = Image.open(io.BytesIO(data))
-        if img.mode == "RGB":
-            img = Image.merge("RGB", tuple(_stretch_channel(ch) for ch in img.split()))
-        elif img.mode == "L":
-            img = _stretch_channel(img)
-        else:
-            return data
-
-        buf = io.BytesIO()
-        fmt = "JPEG" if mime == "image/jpeg" else "PNG"
-        img.save(buf, fmt)
-        return buf.getvalue()
+        result = apply_exposure(img, mode="auto", mime=mime)
+        return _img_to_bytes(result, mime)
     except Exception as e:
         logging.debug("自动曝光处理失败: %s", e)
         return data
@@ -371,30 +393,14 @@ def auto_exposure(data: bytes, mime: str = "image/jpeg") -> bytes:
 
 def manual_exposure(data: bytes, brightness: int = 0, contrast: int = 0,
                     mime: str = "image/jpeg") -> bytes:
-    """
-    手动曝光后处理 — 亮度/对比度调整。
-    brightness: -100 ~ 100（0 = 不变）
-    contrast:   -100 ~ 100（0 = 不变）
-    """
+    """手动曝光后处理 — 亮度/对比度调整。（向后兼容的 bytes 接口）"""
     if brightness == 0 and contrast == 0:
         return data
     try:
         img = Image.open(io.BytesIO(data))
-        if img.mode not in ("RGB", "L"):
-            return data
-
-        # 构建 LUT：先对比度，后亮度
-        factor = (259 * (contrast + 255)) / (255 * (259 - contrast)) if contrast != 0 else 1.0
-        lut = []
-        for v in range(256):
-            val = int(factor * (v - 128) + 128 + brightness)
-            lut.append(max(0, min(255, val)))
-
-        img = img.point(lut)
-        buf = io.BytesIO()
-        fmt = "JPEG" if mime == "image/jpeg" else "PNG"
-        img.save(buf, fmt)
-        return buf.getvalue()
+        result = apply_exposure(img, mode="manual", brightness=brightness,
+                                contrast=contrast, mime=mime)
+        return _img_to_bytes(result, mime)
     except Exception as e:
         logging.debug("手动曝光处理失败: %s", e)
         return data

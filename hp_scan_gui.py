@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import customtkinter as ctk
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
-    get_scanner_status, execute_scan, auto_exposure, manual_exposure,
-    ScannerInfo,
+    get_scanner_status, execute_scan, apply_exposure,
+    ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
 
 # ---------- 配置 ----------
@@ -599,6 +599,21 @@ class ScanApp(ctk.CTk):
 
         add_btn.configure(command=probe)
 
+    # ────────── 异步工具 ──────────
+    def _run_async(self, task, callback=None):
+        """后台线程执行 task()，完成后在主线程调用 callback(result)。
+        异常时 callback 接收 Exception 对象；无 callback 则仅 logging。
+        """
+        def _worker():
+            try:
+                result = task()
+            except Exception as e:
+                logging.debug("异步任务失败: %s", e)
+                result = e
+            if callback:
+                self.after(0, lambda: callback(result))
+        threading.Thread(target=_worker, daemon=True).start()
+
     # ────────── 能力查询 ──────────
     def _query_caps(self):
         if not self.selected:
@@ -609,13 +624,11 @@ class ScanApp(ctk.CTk):
             return
 
         self._set_loading(True)
-        scanner_ref = self.selected  # 捕获当前引用，避免线程中读取到已切换的打印机
-
-        def do():
-            s = fetch_capabilities(scanner_ref, timeout=5.0)
-            self.after(0, lambda: self._apply_caps(s))
-
-        threading.Thread(target=do, daemon=True).start()
+        scanner_ref = self.selected
+        self._run_async(
+            lambda: fetch_capabilities(scanner_ref, timeout=5.0),
+            self._apply_caps,
+        )
 
     def _apply_caps(self, s):
         """主线程：原子应用能力查询结果"""
@@ -648,15 +661,13 @@ class ScanApp(ctk.CTk):
             return
 
         url = self.selected.escl_url  # 捕获到局部变量，防止切换打印机后读到新值
-
-        def do():
-            st = get_scanner_status(url, timeout=4.0)
-            self.after(0, lambda: messagebox.showinfo(
+        self._run_async(
+            lambda: get_scanner_status(url, timeout=4.0),
+            lambda st: messagebox.showinfo(
                 "打印机状态",
                 f"状态: {st.get('state', '未知')}\nADF 有纸: {'是' if st.get('adf_loaded') else '否'}"
-            ))
-
-        threading.Thread(target=do, daemon=True).start()
+            ),
+        )
 
     # ────────── 浏览 ──────────
     def _browse(self):
@@ -780,31 +791,23 @@ class ScanApp(ctk.CTk):
         self._set_loading(True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fpath = os.path.join(out_dir, f"WIA_scan_{ts}.{self.output_format_val}")
+        model_tag = self.selected.model.replace(" ", "_") if self.selected.model else "scan"
+        fpath = os.path.join(out_dir, f"WIA_{model_tag}_{ts}.{self.output_format_val}")
 
         def do():
             from wia_engine import try_wia_scan
             result = try_wia_scan(
-                output_path=fpath,
                 resolution=self.resolution_val,
                 color_mode_name=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
                 output_format=self.output_format_val,
             )
-            self.after(0, lambda: self._wia_done(result is not None, result or "WIA 扫描失败"))
+            if result:
+                data, ext = result
+                self.after(0, lambda: self._show_preview(data, ext, fpath))
+            else:
+                self.after(0, lambda: self._scan_error("WIA 扫描失败，未找到可用扫描仪"))
 
         threading.Thread(target=do, daemon=True).start()
-
-    def _wia_done(self, success, result):
-        self.scanning = False
-        self.scan_btn.configure(text="扫描", state="normal")
-        self._set_loading(False)
-        if success:
-            self.status_bar.configure(text="扫描完成")
-            if messagebox.askyesno("扫描完成", f"已保存:\n{result}\n\n打开所在文件夹？"):
-                os.startfile(os.path.dirname(result))
-        else:
-            self.status_bar.configure(text="扫描失败")
-            messagebox.showerror("扫描失败", result)
 
     def _reset_scan_ui(self):
         self.scanning = False
@@ -845,9 +848,7 @@ class PreviewDialog(ctk.CTkToplevel):
         self.raw = raw_data
         self.ext = ext
         self.output_path = output_path
-        self.mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                     "png": "image/png", "tiff": "image/tiff",
-                     "bmp": "image/bmp"}.get(ext.lower(), "image/jpeg")
+        self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
 
         self.exp_mode = "关闭"
         self.bri = 0
@@ -955,21 +956,16 @@ class PreviewDialog(ctk.CTkToplevel):
 
     # ────────── 预览渲染 ──────────
     def _update_preview(self):
-        """根据当前曝光设置实时刷新预览图"""
+        """根据当前曝光设置实时刷新预览图（直接操作 PIL Image，无 bytes 往返）"""
         try:
             img = Image.open(io.BytesIO(self.raw))
 
-            # 应用曝光处理（全精度原图）
-            if self.exp_mode == "自动":
-                buf = io.BytesIO()
-                img.save(buf, "JPEG" if img.mode == "RGB" else "PNG")
-                processed = auto_exposure(buf.getvalue(), self.mime)
-                img = Image.open(io.BytesIO(processed))
-            elif self.exp_mode == "手动" and (self.bri != 0 or self.con != 0):
-                buf = io.BytesIO()
-                img.save(buf, "JPEG" if img.mode == "RGB" else "PNG")
-                processed = manual_exposure(buf.getvalue(), self.bri, self.con, self.mime)
-                img = Image.open(io.BytesIO(processed))
+            # 映射 UI 中文模式名 → 引擎模式名
+            mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
+            mode = mode_map.get(self.exp_mode, "off")
+            img = apply_exposure(img, mode=mode,
+                                 brightness=self.bri, contrast=self.con,
+                                 mime=self.mime)
 
             # 缩放到预览尺寸
             img.thumbnail((self.PW, self.PH), Image.LANCZOS)
@@ -981,17 +977,16 @@ class PreviewDialog(ctk.CTkToplevel):
 
     # ────────── 确认保存 ──────────
     def _confirm(self):
-        data = self.raw
-        # 按最终选择的曝光模式处理全精度数据
-        if self.exp_mode == "自动":
-            data = auto_exposure(data, self.mime)
-        elif self.exp_mode == "手动" and (self.bri != 0 or self.con != 0):
-            data = manual_exposure(data, self.bri, self.con, self.mime)
+        img = Image.open(io.BytesIO(self.raw))
+        mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
+        mode = mode_map.get(self.exp_mode, "off")
+        img = apply_exposure(img, mode=mode,
+                             brightness=self.bri, contrast=self.con,
+                             mime=self.mime)
 
         # 格式转换（如需要）
         out_ext = self.output_path.rsplit(".", 1)[-1].lower()
         if out_ext == "pdf" and self.ext != "pdf":
-            img = Image.open(io.BytesIO(data))
             pdf_path = self.output_path.rsplit(".", 1)[0] + ".pdf"
             img.convert("RGB").save(pdf_path, "PDF")
             saved = pdf_path
@@ -999,8 +994,8 @@ class PreviewDialog(ctk.CTkToplevel):
             final = self.output_path
             if not final.lower().endswith(f".{self.ext}"):
                 final = f"{final}.{self.ext}"
-            with open(final, "wb") as f:
-                f.write(data)
+            fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
+            img.save(final, fmt)
             saved = final
 
         self.destroy()
