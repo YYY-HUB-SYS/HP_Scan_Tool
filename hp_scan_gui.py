@@ -842,12 +842,13 @@ class ScanApp(ctk.CTk):
 class PreviewDialog(ctk.CTkToplevel):
     """扫描后预览：实时调整曝光效果，确认后保存"""
 
-    PW, PH = 420, 360  # 预览区域尺寸
+    PW, PH = 420, 320  # 预览区域尺寸
+    HW, HH = 420, 80   # 直方图尺寸
 
     def __init__(self, parent, raw_data: bytes, ext: str, output_path: str):
         super().__init__(parent)
         self.title("扫描预览 — 调整曝光效果")
-        self.geometry("540x640")
+        self.geometry("540x820")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -860,7 +861,12 @@ class PreviewDialog(ctk.CTkToplevel):
         self.exp_mode = "关闭"
         self.bri = 0
         self.con = 0
-        self._base_photo = None   # 缓存预览尺寸的原始图
+        self.gamma = 1.0
+        self.shadows = 0
+        self.highlights = 0
+        self.r_gain = 1.0
+        self.g_gain = 1.0
+        self.b_gain = 1.0
         self._preview_photo = None
 
         self._build()
@@ -869,7 +875,7 @@ class PreviewDialog(ctk.CTkToplevel):
         # 居中显示
         self.update_idletasks()
         x = parent.winfo_x() + (parent.winfo_width() - 540) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 640) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 820) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -884,6 +890,13 @@ class PreviewDialog(ctk.CTkToplevel):
                                     fg_color=("gray85", "gray25"),
                                     corner_radius=6)
         self.img_lbl.pack(padx=6, pady=6)
+
+        # 直方图区域
+        from tkinter import Canvas
+        self.hist_canvas = Canvas(self, width=self.HW, height=self.HH,
+                                  bg="#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#e8e8e8",
+                                  highlightthickness=0)
+        self.hist_canvas.pack(padx=14, pady=(0, 4))
 
         # 曝光控制区
         ef = ctk.CTkFrame(self)
@@ -922,8 +935,35 @@ class PreviewDialog(ctk.CTkToplevel):
         self.con_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
         self.con_v.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
 
+        ctk.CTkLabel(mf, text="Gamma", font=ctk.CTkFont(size=11)).grid(
+            row=2, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        self.gam_s = ctk.CTkSlider(mf, from_=0.1, to=3.0, number_of_steps=290,
+                                    command=self._on_gamma)
+        self.gam_s.grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.gam_s.configure(state="disabled")
+        self.gam_v = ctk.CTkLabel(mf, text="1.0", font=ctk.CTkFont(size=11), width=30)
+        self.gam_v.grid(row=2, column=2, padx=(4, 0), pady=(4, 0))
+
+        ctk.CTkLabel(mf, text="阴影", font=ctk.CTkFont(size=11)).grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        self.shd_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_shadows)
+        self.shd_s.grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.shd_s.configure(state="disabled")
+        self.shd_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
+        self.shd_v.grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
+
+        ctk.CTkLabel(mf, text="高光", font=ctk.CTkFont(size=11)).grid(
+            row=4, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
+        self.hil_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_highlights)
+        self.hil_s.grid(row=4, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.hil_s.configure(state="disabled")
+        self.hil_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
+        self.hil_v.grid(row=4, column=2, padx=(4, 0), pady=(4, 0))
+
         # 提示
-        ctk.CTkLabel(ef, text="「自动」去灰底拉伸  |  「手动」微调亮度对比度",
+        ctk.CTkLabel(ef, text="「自动」去灰底  |  「手动」亮度/对比度/Gamma/阴影高光/通道增益",
                      font=ctk.CTkFont(size=10),
                      text_color=("gray50", "gray60")).pack(pady=(0, 6))
 
@@ -943,12 +983,9 @@ class PreviewDialog(ctk.CTkToplevel):
     # ────────── 曝光模式切换 ──────────
     def _on_mode(self, value):
         self.exp_mode = value
-        if value == "手动":
-            self.bri_s.configure(state="normal")
-            self.con_s.configure(state="normal")
-        else:
-            self.bri_s.configure(state="disabled")
-            self.con_s.configure(state="disabled")
+        state = "normal" if value == "手动" else "disabled"
+        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hil_s):
+            s.configure(state=state)
         self._update_preview()
 
     def _on_bri(self, val):
@@ -959,6 +996,21 @@ class PreviewDialog(ctk.CTkToplevel):
     def _on_con(self, val):
         self.con = int(val)
         self.con_v.configure(text=str(self.con))
+        self._update_preview()
+
+    def _on_gamma(self, val):
+        self.gamma = round(float(val), 2)
+        self.gam_v.configure(text=f"{self.gamma:.1f}")
+        self._update_preview()
+
+    def _on_shadows(self, val):
+        self.shadows = int(val)
+        self.shd_v.configure(text=str(self.shadows))
+        self._update_preview()
+
+    def _on_highlights(self, val):
+        self.highlights = int(val)
+        self.hil_v.configure(text=str(self.highlights))
         self._update_preview()
 
     # ────────── 预览渲染 ──────────
@@ -972,7 +1024,13 @@ class PreviewDialog(ctk.CTkToplevel):
             mode = mode_map.get(self.exp_mode, "off")
             img = apply_exposure(img, mode=mode,
                                  brightness=self.bri, contrast=self.con,
+                                 gamma=self.gamma, shadows=self.shadows,
+                                 highlights=self.highlights,
+                                 channel_gains=(self.r_gain, self.g_gain, self.b_gain),
                                  mime=self.mime)
+
+            # 更新直方图（在缩放前，用全分辨率数据）
+            self._update_histogram(img)
 
             # 缩放到预览尺寸
             img.thumbnail((self.PW, self.PH), Image.LANCZOS)
@@ -982,6 +1040,39 @@ class PreviewDialog(ctk.CTkToplevel):
         except Exception as e:
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
+    def _update_histogram(self, img):
+        """绘制直方图：RGB 三通道叠加或灰度单通道"""
+        self.hist_canvas.delete("all")
+        w, h = self.HW, self.HH
+        try:
+            hist_data = img.histogram()
+        except Exception:
+            return
+
+        if img.mode == "RGB":
+            # 三通道：R(0-255), G(256-511), B(512-767)
+            channels = [
+                (hist_data[0:256], "#e05050"),    # R 红
+                (hist_data[256:512], "#50c050"),   # G 绿
+                (hist_data[512:768], "#5080e0"),   # B 蓝
+            ]
+        elif img.mode == "L":
+            channels = [(hist_data[0:256], "#c0c0c0")]  # 灰度
+        else:
+            return
+
+        # 找最大值用于归一化
+        max_val = max(max(ch) for ch, _ in channels) or 1
+
+        for values, color in channels:
+            points = []
+            for i in range(256):
+                x = i * w / 255
+                y = h - (values[i] / max_val) * h * 0.9
+                points.extend([x, y])
+            # 绘制为折线
+            self.hist_canvas.create_line(points, fill=color, width=1)
+
     # ────────── 确认保存 ──────────
     def _confirm(self):
         img = Image.open(io.BytesIO(self.raw))
@@ -989,6 +1080,9 @@ class PreviewDialog(ctk.CTkToplevel):
         mode = mode_map.get(self.exp_mode, "off")
         img = apply_exposure(img, mode=mode,
                              brightness=self.bri, contrast=self.con,
+                             gamma=self.gamma, shadows=self.shadows,
+                             highlights=self.highlights,
+                             channel_gains=(self.r_gain, self.g_gain, self.b_gain),
                              mime=self.mime)
 
         # 格式转换（如需要）
