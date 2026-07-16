@@ -908,6 +908,27 @@ class PreviewDialog(ctk.CTkToplevel):
                                   highlightthickness=0)
         self.hist_canvas.pack(padx=14, pady=(0, 4))
 
+        # 预设选择行
+        import preset_manager
+        self._preset_mgr = preset_manager
+        preset_row = ctk.CTkFrame(self, fg_color="transparent")
+        preset_row.pack(fill="x", padx=14, pady=(2, 0))
+        ctk.CTkLabel(preset_row, text="预设",
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
+        self._preset_names = [p["name"] for p in preset_manager.load_presets()]
+        self._preset_combo = ctk.CTkComboBox(
+            preset_row, values=self._preset_names, state="readonly",
+            width=140, height=26, font=ctk.CTkFont(size=11),
+            command=self._on_preset_select)
+        self._preset_combo.pack(side="left", padx=(0, 4))
+        self._preset_combo.set("预设...")
+        ctk.CTkButton(preset_row, text="保存当前", width=60, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._on_preset_save).pack(side="left")
+
         # 曝光控制区
         ef = ctk.CTkFrame(self)
         ef.pack(fill="x", padx=14, pady=4)
@@ -1022,6 +1043,66 @@ class PreviewDialog(ctk.CTkToplevel):
         self.highlights = int(val)
         self.hil_v.configure(text=str(self.highlights))
         self._update_preview()
+
+    # ────────── 预设 ──────────
+    def _on_preset_select(self, name):
+        """应用预设参数到所有滑块和状态"""
+        presets = self._preset_mgr.load_presets()
+        preset = next((p for p in presets if p["name"] == name), None)
+        if not preset:
+            return
+
+        # 设置曝光模式
+        mode_ui = {"off": "关闭", "auto": "自动", "manual": "手动"}.get(preset["mode"], "关闭")
+        self.exp_var.set(mode_ui)
+        self.exp_mode = mode_ui
+        state = "normal" if mode_ui == "手动" else "disabled"
+        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hil_s):
+            s.configure(state=state)
+
+        # 设置参数
+        self.bri = preset.get("brightness", 0)
+        self.con = preset.get("contrast", 0)
+        self.gamma = preset.get("gamma", 1.0)
+        self.shadows = preset.get("shadows", 0)
+        self.highlights = preset.get("highlights", 0)
+        gains = preset.get("channel_gains", [1.0, 1.0, 1.0])
+        self.r_gain, self.g_gain, self.b_gain = gains[0], gains[1], gains[2]
+
+        # 更新滑块位置
+        self.bri_slider.set(self.bri) if hasattr(self, 'bri_slider') else None
+        self.bri_s.set(self.bri)
+        self.bri_v.configure(text=str(self.bri))
+        self.con_s.set(self.con)
+        self.con_v.configure(text=str(self.con))
+        self.gam_s.set(self.gamma)
+        self.gam_v.configure(text=f"{self.gamma:.1f}")
+        self.shd_s.set(self.shadows)
+        self.shd_v.configure(text=str(self.shadows))
+        self.hil_s.set(self.highlights)
+        self.hil_v.configure(text=str(self.highlights))
+
+        self._update_preview()
+
+    def _on_preset_save(self):
+        """将当前参数保存为用户预设"""
+        from tkinter import simpledialog
+        name = simpledialog.askstring("保存预设", "预设名称:", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        preset = {
+            "name": name,
+            "mode": {"关闭": "off", "自动": "auto", "手动": "manual"}.get(self.exp_mode, "off"),
+            "brightness": self.bri, "contrast": self.con,
+            "gamma": self.gamma, "shadows": self.shadows, "highlights": self.highlights,
+            "channel_gains": [self.r_gain, self.g_gain, self.b_gain],
+        }
+        self._preset_mgr.save_user_preset(preset)
+        # 刷新下拉列表
+        self._preset_names = [p["name"] for p in self._preset_mgr.load_presets()]
+        self._preset_combo.configure(values=self._preset_names)
+        self._preset_combo.set(name)
 
     # ────────── 预览渲染 ──────────
     def _update_preview(self):
