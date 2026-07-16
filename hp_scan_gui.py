@@ -22,6 +22,7 @@ from escl_engine import (
     get_scanner_status, execute_scan, execute_multipage_scan,
     apply_exposure, ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
+from wsd_engine import discover_all_scanners
 import cache_manager
 import history_manager
 
@@ -455,7 +456,7 @@ class ScanApp(ctk.CTk):
         threading.Thread(target=self._do_discover, daemon=True).start()
 
     def _do_discover(self):
-        discovered = discover_scanners(timeout=4.0)
+        discovered = discover_all_scanners(timeout=4.0)
         existing_ips = {s.ip for s in self.scanners if s.ip}  # 快照读取
         new_scanners = []
         new_count = 0
