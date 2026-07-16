@@ -24,7 +24,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status",
-    "execute_scan", "scan_to_file",
+    "execute_scan", "execute_multipage_scan", "scan_to_file",
     "apply_exposure", "auto_exposure", "manual_exposure",
     "FORMAT_MIME", "MIME_EXT",
 ]
@@ -541,6 +541,103 @@ def execute_scan(
             time.sleep(0.5)
 
         raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
+    finally:
+        session.close()
+
+
+def execute_multipage_scan(
+    scanner: ScannerInfo,
+    resolution: int = 300,
+    color_mode: str = "RGB24",
+    output_format: str = "jpg",
+    source: str = "Platen",
+    duplex: bool = False,
+    timeout: float = 300.0,
+    page_timeout: float = 60.0,
+    progress_callback=None,
+) -> list[tuple[bytes, str]]:
+    """
+    执行多页 ADF 扫描，返回 [(数据, 扩展名), ...]。
+    循环获取 NextDocument 直到 HTTP 404（无更多页面）。
+    progress_callback(page_num, total_so_far) 可选，用于 UI 进度更新。
+    """
+    escl_url = scanner.escl_url
+    if not escl_url:
+        raise RuntimeError("未配置 eSCL URL")
+
+    base = escl_url.rstrip("/")
+    mime = FORMAT_MIME.get(output_format.lower(), "image/jpeg")
+    ext = MIME_EXT.get(mime, output_format)
+
+    xml_body = _build_scan_job_xml(
+        resolution=resolution,
+        color_mode=color_mode,
+        doc_format=mime,
+        width=scanner.max_width,
+        height=scanner.max_height,
+        source=source,
+        duplex=duplex,
+    )
+
+    headers = {"Content-Type": "application/xml"}
+    session = requests.Session()
+    session.verify = False
+
+    try:
+        # Step 1: 创建扫描任务
+        r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
+        if r.status_code not in (200, 201, 202):
+            raise RuntimeError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
+
+        job_uri = r.headers.get("Location", "")
+        if not job_uri:
+            try:
+                root = ET.fromstring(r.text)
+                for el in root.iter():
+                    if "JobUri" in (el.tag.split("}")[-1] if "}" in el.tag else el.tag):
+                        job_uri = el.text or ""
+                        break
+            except Exception:
+                pass
+
+        if not job_uri:
+            raise RuntimeError("无法获取 ScanJob URI")
+
+        if not job_uri.startswith("http"):
+            host = base.split("://")[1].split("/")[0]
+            job_uri = f"http://{host}{job_uri}"
+
+        # Step 2: 循环获取页面
+        pages = []
+        nd_url = job_uri.rstrip("/") + "/NextDocument"
+        overall_start = time.time()
+
+        while time.time() - overall_start < timeout:
+            # 等待当前页面就绪
+            page_start = time.time()
+            while time.time() - page_start < page_timeout:
+                try:
+                    r = session.get(nd_url, timeout=10)
+                    if r.status_code == 200:
+                        pages.append((r.content, ext))
+                        if progress_callback:
+                            progress_callback(len(pages), len(pages))
+                        break  # 获取成功，进入下一页
+                    elif r.status_code == 404:
+                        # 无更多页面
+                        return pages
+                    elif r.status_code == 503:
+                        pass  # 扫描进行中，继续等待
+                except requests.RequestException:
+                    pass
+                time.sleep(0.5)
+            else:
+                # 单页超时
+                if pages:
+                    break  # 已有页面，结束扫描
+                raise RuntimeError("扫描超时：未能获取第一页数据")
+
+        return pages
     finally:
         session.close()
 

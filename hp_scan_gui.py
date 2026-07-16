@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import customtkinter as ctk
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
-    get_scanner_status, execute_scan, apply_exposure,
-    ScannerInfo, FORMAT_MIME, MIME_EXT,
+    get_scanner_status, execute_scan, execute_multipage_scan,
+    apply_exposure, ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
 import cache_manager
 
@@ -772,21 +772,49 @@ class ScanApp(ctk.CTk):
                     logging.debug("ADF 状态检测失败，保持手动选择: %s", e)
 
             self.after(0, lambda: self.status_bar.configure(text="正在扫描..."))
-            data, ext = execute_scan(
-                scanner=scanner,
-                resolution=self.resolution_val,
-                color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
-                output_format=self.output_format_val,
-                source=source_val,
-                timeout=90.0,
-            )
 
-            # 写入磁盘缓存（不再将全分辨率数据保留在内存）
             job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            cache_path = cache_manager.write_page(job_id, 1, data, ext)
-            del data  # 释放内存
+            use_adf = source_val == "Feeder"
 
-            self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
+            if use_adf:
+                # 多页 ADF 扫描
+                def _progress(n, _total):
+                    self.after(0, lambda: self.status_bar.configure(
+                        text=f"正在扫描... 已获取 {n} 页"))
+
+                pages = execute_multipage_scan(
+                    scanner=scanner,
+                    resolution=self.resolution_val,
+                    color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+                    output_format=self.output_format_val,
+                    source=source_val,
+                    timeout=300.0,
+                    progress_callback=_progress,
+                )
+                # 写入缓存
+                ext = pages[0][1] if pages else self.output_format_val
+                for i, (data, ext) in enumerate(pages, 1):
+                    cache_manager.write_page(job_id, i, data, ext)
+                    del data
+
+                if len(pages) > 1:
+                    self.after(0, lambda: self._show_multi_preview(job_id, ext, output_path, len(pages)))
+                else:
+                    cache_path = cache_manager.job_dir(job_id) + f"/page_001.{ext}"
+                    self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
+            else:
+                # 单页平板扫描
+                data, ext = execute_scan(
+                    scanner=scanner,
+                    resolution=self.resolution_val,
+                    color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+                    output_format=self.output_format_val,
+                    source=source_val,
+                    timeout=90.0,
+                )
+                cache_path = cache_manager.write_page(job_id, 1, data, ext)
+                del data
+                self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
         except Exception as e:
             tb = traceback.format_exc()
             self.after(0, lambda: self._scan_error(f"{type(e).__name__}: {e}\n\n{tb}"))
@@ -842,6 +870,11 @@ class ScanApp(ctk.CTk):
         self._reset_scan_ui()
         self.status_bar.configure(text="扫描完成 — 调整曝光效果后点击保存")
         PreviewDialog(self, cache_path, ext, output_path, job_id)
+
+    def _show_multi_preview(self, job_id, ext, output_path, page_count):
+        self._reset_scan_ui()
+        self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存")
+        MultiPagePreviewDialog(self, job_id, ext, output_path, page_count)
 
 
 # ================================================
@@ -1195,6 +1228,291 @@ class PreviewDialog(ctk.CTkToplevel):
         self.destroy()
         if messagebox.askyesno("保存成功", f"已保存:\n{saved}\n\n打开所在文件夹？"):
             os.startfile(os.path.dirname(saved))
+
+    def _cancel(self):
+        cache_manager.remove_job(self.job_id)
+        self.destroy()
+
+
+# ================================================
+#  多页批量预览对话框（ADF 扫描后）
+# ================================================
+
+class MultiPagePreviewDialog(ctk.CTkToplevel):
+    """多页 ADF 扫描后的批量预览：缩略图导航、删除、统一/逐页曝光调整"""
+
+    TW, TH = 80, 100   # 缩略图尺寸
+    PW, PH = 400, 300  # 主预览区尺寸
+
+    def __init__(self, parent, job_id: str, ext: str, output_path: str, page_count: int):
+        super().__init__(parent)
+        self.title(f"扫描预览 — {page_count} 页")
+        self.geometry("600x780")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self.job_id = job_id
+        self.ext = ext
+        self.output_path = output_path
+        self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
+
+        # 页面状态
+        self.pages = list(range(1, page_count + 1))  # 当前保留的页码
+        self.selected_idx = 0
+
+        # 曝光参数（全局）
+        self.exp_mode = "关闭"
+        self.bri = 0
+        self.con = 0
+        self.gamma = 1.0
+        self.shadows = 0
+        self.highlights = 0
+
+        self._preview_photo = None
+        self._thumb_photos = {}
+
+        self._build()
+        self._refresh_thumbs()
+        self._update_preview()
+
+        # 居中
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 600) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 780) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _cache_path(self, page_num):
+        return os.path.join(cache_manager.job_dir(self.job_id),
+                            f"page_{page_num:03d}.{self.ext}")
+
+    def _build(self):
+        # 主预览区
+        pf = ctk.CTkFrame(self)
+        pf.pack(fill="x", padx=14, pady=(14, 4))
+        self.img_lbl = ctk.CTkLabel(pf, text="加载中...",
+                                    width=self.PW, height=self.PH,
+                                    fg_color=("gray85", "gray25"),
+                                    corner_radius=6)
+        self.img_lbl.pack(padx=6, pady=6)
+
+        self.page_info_lbl = ctk.CTkLabel(pf, text="",
+                                           font=ctk.CTkFont(size=11),
+                                           text_color=("gray45", "gray65"))
+        self.page_info_lbl.pack()
+
+        # 缩略图条
+        tf = ctk.CTkFrame(self)
+        tf.pack(fill="x", padx=14, pady=4)
+        self.thumb_container = ctk.CTkScrollableFrame(tf, fg_color="transparent",
+                                                       orientation="horizontal", height=self.TH + 20)
+        self.thumb_container.pack(fill="x", padx=4, pady=4)
+
+        # 曝光控制（简化版）
+        ef = ctk.CTkFrame(self)
+        ef.pack(fill="x", padx=14, pady=4)
+        ef.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(ef, text="曝光",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, padx=8, pady=(8, 2), sticky="w")
+
+        self.exp_var = ctk.StringVar(value="关闭")
+        ctk.CTkSegmentedButton(
+            ef, values=["关闭", "自动", "手动"],
+            variable=self.exp_var,
+            command=self._on_mode, height=28,
+        ).grid(row=0, column=1, columnspan=2, padx=8, pady=(8, 2), sticky="w")
+
+        # 手动滑块行
+        mf = ctk.CTkFrame(ef, fg_color="transparent")
+        mf.grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+        mf.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(mf, text="亮度", font=ctk.CTkFont(size=10)).grid(row=0, column=0, padx=(0, 4))
+        self.bri_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_bri)
+        self.bri_s.grid(row=0, column=1, sticky="ew", padx=4)
+        self.bri_s.configure(state="disabled")
+        self.bri_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
+        self.bri_v.grid(row=0, column=2, padx=(4, 8))
+
+        ctk.CTkLabel(mf, text="对比度", font=ctk.CTkFont(size=10)).grid(row=1, column=0, padx=(0, 4), pady=(4, 0))
+        self.con_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_con)
+        self.con_s.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.con_s.configure(state="disabled")
+        self.con_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
+        self.con_v.grid(row=1, column=2, padx=(4, 8), pady=(4, 0))
+
+        # 按钮行
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(fill="x", padx=14, pady=(4, 14))
+
+        ctk.CTkButton(bf, text="重新扫描", width=90, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._cancel).pack(side="left")
+        self.save_btn = ctk.CTkButton(bf, text="保存全部", width=140, height=36,
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       command=self._confirm)
+        self.save_btn.pack(side="right")
+
+    # ────────── 缩略图 ──────────
+    def _refresh_thumbs(self):
+        for w in self.thumb_container.winfo_children():
+            w.destroy()
+        self._thumb_photos.clear()
+
+        for idx, page_num in enumerate(self.pages):
+            frame = ctk.CTkFrame(self.thumb_container, fg_color="transparent")
+            frame.pack(side="left", padx=2)
+
+            try:
+                img = Image.open(self._cache_path(page_num))
+                img.thumbnail((self.TW, self.TH), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                self._thumb_photos[idx] = photo
+            except Exception:
+                photo = None
+
+            btn = ctk.CTkButton(
+                frame, text=str(idx + 1), image=photo,
+                width=self.TW, height=self.TH + 16,
+                compound="top", font=ctk.CTkFont(size=10),
+                fg_color=("gray80", "gray30") if idx == self.selected_idx else "transparent",
+                command=lambda i=idx: self._select_page(i))
+            btn.pack()
+
+            # 删除按钮（至少保留 1 页）
+            if len(self.pages) > 1:
+                ctk.CTkButton(
+                    frame, text="x", width=18, height=18,
+                    font=ctk.CTkFont(size=9), corner_radius=9,
+                    fg_color="#c04040", hover_color="#a03030",
+                    command=lambda i=idx: self._delete_page(i)
+                ).place(relx=1.0, rely=0.0, anchor="ne")
+
+    def _select_page(self, idx):
+        self.selected_idx = idx
+        self._refresh_thumbs()
+        self._update_preview()
+
+    def _delete_page(self, idx):
+        page_num = self.pages[idx]
+        self.pages.pop(idx)
+        # 删除缓存文件
+        try:
+            os.remove(self._cache_path(page_num))
+        except OSError:
+            pass
+        self.selected_idx = min(self.selected_idx, len(self.pages) - 1)
+        self._refresh_thumbs()
+        self._update_preview()
+
+    # ────────── 曝光控制 ──────────
+    def _on_mode(self, value):
+        self.exp_mode = value
+        state = "normal" if value == "手动" else "disabled"
+        self.bri_s.configure(state=state)
+        self.con_s.configure(state=state)
+        self._update_preview()
+
+    def _on_bri(self, val):
+        self.bri = int(val)
+        self.bri_v.configure(text=str(self.bri))
+        self._update_preview()
+
+    def _on_con(self, val):
+        self.con = int(val)
+        self.con_v.configure(text=str(self.con))
+        self._update_preview()
+
+    # ────────── 预览渲染 ──────────
+    def _update_preview(self):
+        try:
+            page_num = self.pages[self.selected_idx]
+            img = Image.open(self._cache_path(page_num))
+
+            mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
+            mode = mode_map.get(self.exp_mode, "off")
+            img = apply_exposure(img, mode=mode,
+                                 brightness=self.bri, contrast=self.con,
+                                 gamma=self.gamma, shadows=self.shadows,
+                                 highlights=self.highlights,
+                                 mime=self.mime)
+
+            img.thumbnail((self.PW, self.PH), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            self._preview_photo = photo
+            self.img_lbl.configure(image=photo, text="")
+            self.page_info_lbl.configure(
+                text=f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页")
+        except Exception as e:
+            self.img_lbl.configure(image=None, text=f"预览失败: {e}")
+
+    # ────────── 保存 ──────────
+    def _confirm(self):
+        mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
+        mode = mode_map.get(self.exp_mode, "off")
+        saved_files = []
+
+        out_ext = self.output_path.rsplit(".", 1)[-1].lower()
+        base_path = self.output_path.rsplit(".", 1)[0]
+
+        for i, page_num in enumerate(self.pages, 1):
+            try:
+                img = Image.open(self._cache_path(page_num))
+                img = apply_exposure(img, mode=mode,
+                                     brightness=self.bri, contrast=self.con,
+                                     gamma=self.gamma, shadows=self.shadows,
+                                     highlights=self.highlights,
+                                     mime=self.mime)
+
+                if out_ext == "pdf":
+                    # PDF: 合并所有页到单个文件
+                    continue  # 下面统一处理
+                else:
+                    fpath = f"{base_path}_{i:03d}.{self.ext}"
+                    fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
+                    img.save(fpath, fmt)
+                    saved_files.append(fpath)
+            except Exception as e:
+                logging.debug("保存第 %d 页失败: %s", i, e)
+
+        # PDF 合并
+        if out_ext == "pdf":
+            pdf_images = []
+            for i, page_num in enumerate(self.pages):
+                try:
+                    img = Image.open(self._cache_path(page_num))
+                    img = apply_exposure(img, mode=mode,
+                                         brightness=self.bri, contrast=self.con,
+                                         gamma=self.gamma, shadows=self.shadows,
+                                         highlights=self.highlights,
+                                         mime=self.mime)
+                    pdf_images.append(img.convert("RGB"))
+                except Exception:
+                    pass
+            if pdf_images:
+                pdf_path = f"{base_path}.pdf"
+                pdf_images[0].save(pdf_path, "PDF", save_all=True,
+                                    append_images=pdf_images[1:])
+                saved_files.append(pdf_path)
+
+        # 清除缓存
+        cache_manager.remove_job(self.job_id)
+        self.destroy()
+
+        if saved_files:
+            msg = "\n".join(saved_files[:5])
+            if len(saved_files) > 5:
+                msg += f"\n... 等 {len(saved_files)} 个文件"
+            if messagebox.askyesno("保存成功", f"已保存:\n{msg}\n\n打开所在文件夹？"):
+                os.startfile(os.path.dirname(saved_files[0]))
 
     def _cancel(self):
         cache_manager.remove_job(self.job_id)
