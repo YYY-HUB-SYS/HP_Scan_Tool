@@ -23,6 +23,7 @@ from escl_engine import (
     apply_exposure, ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
 import cache_manager
+import history_manager
 
 # ---------- 配置 ----------
 def _app_dir():
@@ -304,6 +305,14 @@ class ScanApp(ctk.CTk):
                                        hover_color=("gray82", "gray25"),
                                        command=self._check_status)
         self.stat_btn.pack(side="left", padx=3)
+
+        ctk.CTkButton(action, text="扫描历史",
+                      height=32, border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      fg_color="transparent",
+                      hover_color=("gray82", "gray25"),
+                      command=self._show_history).pack(side="left", padx=3)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
                                        height=40, width=160,
@@ -801,10 +810,10 @@ class ScanApp(ctk.CTk):
                     del data
 
                 if len(pages) > 1:
-                    self.after(0, lambda: self._show_multi_preview(job_id, ext, output_path, len(pages)))
+                    self.after(0, lambda s=scanner: self._show_multi_preview(job_id, ext, output_path, len(pages), scanner=s))
                 else:
                     cache_path = cache_manager.job_dir(job_id) + f"/page_001.{ext}"
-                    self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
+                    self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, output_path, job_id, scanner=s))
             else:
                 # 单页平板扫描
                 data, ext = execute_scan(
@@ -817,7 +826,7 @@ class ScanApp(ctk.CTk):
                 )
                 cache_path = cache_manager.write_page(job_id, 1, data, ext)
                 del data
-                self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
+                self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, output_path, job_id, scanner=s))
         except Exception as e:
             tb = traceback.format_exc()
             self.after(0, lambda: self._scan_error(f"{type(e).__name__}: {e}\n\n{tb}"))
@@ -853,7 +862,7 @@ class ScanApp(ctk.CTk):
                 job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 cache_path = cache_manager.write_page(job_id, 1, data, ext)
                 del data
-                self.after(0, lambda: self._show_preview(cache_path, ext, fpath, job_id))
+                self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, fpath, job_id, scanner=s))
             else:
                 self.after(0, lambda: self._scan_error("WIA 扫描失败，未找到可用扫描仪"))
 
@@ -880,19 +889,28 @@ class ScanApp(ctk.CTk):
                             "2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达\n"
                             "3. 防火墙未拦截")
 
-    def _show_preview(self, cache_path, ext, output_path, job_id):
+    def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         self._reset_scan_ui()
         with self._scan_lock:
             count = self._active_scans
         self.status_bar.configure(text=f"扫描完成 — 调整曝光效果后点击保存 (活跃: {count})")
-        PreviewDialog(self, cache_path, ext, output_path, job_id)
+        dev_name = (scanner.model or "") if scanner else ""
+        dev_ip = scanner.ip if scanner else ""
+        PreviewDialog(self, cache_path, ext, output_path, job_id,
+                      device_name=dev_name, device_ip=dev_ip)
 
-    def _show_multi_preview(self, job_id, ext, output_path, page_count):
+    def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
         self._reset_scan_ui()
         with self._scan_lock:
             count = self._active_scans
         self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存 (活跃: {count})")
-        MultiPagePreviewDialog(self, job_id, ext, output_path, page_count)
+        dev_name = (scanner.model or "") if scanner else ""
+        dev_ip = scanner.ip if scanner else ""
+        MultiPagePreviewDialog(self, job_id, ext, output_path, page_count,
+                               device_name=dev_name, device_ip=dev_ip)
+
+    def _show_history(self):
+        HistoryDialog(self)
 
 
 # ================================================
@@ -905,7 +923,8 @@ class PreviewDialog(ctk.CTkToplevel):
     PW, PH = 420, 320  # 预览区域尺寸
     HW, HH = 420, 80   # 直方图尺寸
 
-    def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str):
+    def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str,
+                 device_name: str = "", device_ip: str = ""):
         super().__init__(parent)
         self.title("扫描预览 — 调整曝光效果")
         self.geometry("540x820")
@@ -917,6 +936,8 @@ class PreviewDialog(ctk.CTkToplevel):
         self.ext = ext
         self.output_path = output_path
         self.job_id = job_id
+        self.device_name = device_name
+        self.device_ip = device_ip
         self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
 
         self.exp_mode = "关闭"
@@ -1243,6 +1264,16 @@ class PreviewDialog(ctk.CTkToplevel):
 
         # 清除缓存
         cache_manager.remove_job(self.job_id)
+
+        # 记录扫描历史
+        history_manager.append({
+            "device_name": self.device_name,
+            "device_ip": self.device_ip,
+            "page_count": 1,
+            "format": self.ext,
+            "file_path": saved,
+        })
+
         self.destroy()
         if messagebox.askyesno("保存成功", f"已保存:\n{saved}\n\n打开所在文件夹？"):
             os.startfile(os.path.dirname(saved))
@@ -1262,7 +1293,8 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
     TW, TH = 80, 100   # 缩略图尺寸
     PW, PH = 400, 300  # 主预览区尺寸
 
-    def __init__(self, parent, job_id: str, ext: str, output_path: str, page_count: int):
+    def __init__(self, parent, job_id: str, ext: str, output_path: str, page_count: int,
+                 device_name: str = "", device_ip: str = ""):
         super().__init__(parent)
         self.title(f"扫描预览 — {page_count} 页")
         self.geometry("600x780")
@@ -1273,6 +1305,8 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.job_id = job_id
         self.ext = ext
         self.output_path = output_path
+        self.device_name = device_name
+        self.device_ip = device_ip
         self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
 
         # 页面状态
@@ -1669,6 +1703,18 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
 
         # 清除缓存
         cache_manager.remove_job(self.job_id)
+
+        # 记录扫描历史（每个分组一条记录，或整体一条）
+        if saved_files:
+            history_manager.append({
+                "device_name": self.device_name,
+                "device_ip": self.device_ip,
+                "page_count": len(self.pages),
+                "format": self.ext,
+                "file_path": saved_files[0],  # 首个文件代表此次扫描
+                "file_count": len(saved_files),
+            })
+
         self.destroy()
 
         if saved_files:
@@ -1826,6 +1872,126 @@ class ScannerCard(ctk.CTkFrame):
         ctk.CTkButton(pop, text="确认", command=confirm).pack(pady=4)
         entry.focus_set()
         entry.bind("<Return>", lambda e: confirm())
+
+
+# ================================================
+#  扫描历史对话框
+# ================================================
+
+class HistoryDialog(ctk.CTkToplevel):
+    """显示扫描历史记录，双击可打开文件或所在文件夹"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("扫描历史")
+        self.geometry("700x500")
+        self.transient(parent)
+        self.grab_set()
+
+        self._build()
+        self._load_records()
+
+        # 居中
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - 700) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 500) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _build(self):
+        # 标题
+        ctk.CTkLabel(self, text="扫描历史记录",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(12, 8))
+
+        # 列表区域
+        list_frame = ctk.CTkFrame(self)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=4)
+
+        # 使用 Treeview 显示列表
+        import tkinter.ttk as ttk
+        columns = ("time", "device", "pages", "format", "path")
+        self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=15)
+        self.tree.heading("time", text="时间")
+        self.tree.heading("device", text="设备")
+        self.tree.heading("pages", text="页数")
+        self.tree.heading("format", text="格式")
+        self.tree.heading("path", text="文件路径")
+
+        self.tree.column("time", width=140)
+        self.tree.column("device", width=120)
+        self.tree.column("pages", width=50)
+        self.tree.column("format", width=60)
+        self.tree.column("path", width=280)
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # 双击打开文件
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        # 按钮行
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(fill="x", padx=14, pady=(8, 14))
+
+        ctk.CTkButton(bf, text="清空历史", width=100, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("#c04040", "#e06060"),
+                      border_color=("#c04040", "#e06060"),
+                      hover_color=("#f0e0e0", "#3a2020"),
+                      command=self._clear_history).pack(side="left")
+
+        ctk.CTkButton(bf, text="打开文件夹", width=120, height=32,
+                      command=self._open_folder).pack(side="right", padx=4)
+        ctk.CTkButton(bf, text="打开文件", width=100, height=32,
+                      command=self._open_file).pack(side="right", padx=4)
+        ctk.CTkButton(bf, text="关闭", width=80, height=32,
+                      command=self.destroy).pack(side="right", padx=4)
+
+    def _load_records(self):
+        records = history_manager.list_records(limit=200)
+        for r in records:
+            ts = r.get("timestamp", "")[:19].replace("T", " ")
+            device = r.get("device_name", r.get("device_ip", "?"))
+            pages = str(r.get("page_count", 1))
+            fmt = r.get("format", "?").upper()
+            path = r.get("file_path", "")
+            self.tree.insert("", "end", values=(ts, device, pages, fmt, path))
+
+    def _get_selected_path(self):
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        item = self.tree.item(sel[0])
+        return item["values"][4]  # path column
+
+    def _on_double_click(self, event):
+        path = self._get_selected_path()
+        if path and os.path.exists(path):
+            os.startfile(path)
+
+    def _open_file(self):
+        path = self._get_selected_path()
+        if path and os.path.exists(path):
+            os.startfile(path)
+        else:
+            messagebox.showinfo("提示", "文件不存在或已被移动")
+
+    def _open_folder(self):
+        path = self._get_selected_path()
+        if path:
+            folder = os.path.dirname(path)
+            if os.path.exists(folder):
+                os.startfile(folder)
+            else:
+                messagebox.showinfo("提示", "文件夹不存在")
+
+    def _clear_history(self):
+        if messagebox.askyesno("确认", "确定要清空所有扫描历史记录吗？"):
+            history_manager.clear()
+            for item in self.tree.get_children():
+                self.tree.delete(item)
 
 
 # ================================================
