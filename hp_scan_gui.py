@@ -1261,6 +1261,10 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.pages = list(range(1, page_count + 1))  # 当前保留的页码
         self.selected_idx = 0
 
+        # 页面分组：splits 存储分割点（在某页之后分割），group_names 存储分组自定义名称
+        self.splits = set()          # e.g. {2, 5} 表示在第2页后和第5页后分割
+        self.group_names = {}        # e.g. {0: "合同", 1: "发票"} 分组索引→名称
+
         # 曝光参数（全局）
         self.exp_mode = "关闭"
         self.bri = 0
@@ -1309,6 +1313,29 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.thumb_container = ctk.CTkScrollableFrame(tf, fg_color="transparent",
                                                        orientation="horizontal", height=self.TH + 20)
         self.thumb_container.pack(fill="x", padx=4, pady=4)
+
+        # 分组控制条
+        gf = ctk.CTkFrame(self, fg_color="transparent")
+        gf.pack(fill="x", padx=14, pady=(0, 2))
+        ctk.CTkButton(gf, text="在此页后插入分割", width=110, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color=("gray75", "gray35"),
+                      hover_color=("gray65", "gray45"),
+                      command=self._insert_split).pack(side="left", padx=4)
+        ctk.CTkButton(gf, text="移除分割", width=80, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color=("gray75", "gray35"),
+                      hover_color=("gray65", "gray45"),
+                      command=self._remove_split).pack(side="left", padx=4)
+        ctk.CTkButton(gf, text="重命名分组", width=90, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color=("gray75", "gray35"),
+                      hover_color=("gray65", "gray45"),
+                      command=self._rename_group).pack(side="left", padx=4)
+        self.group_info_lbl = ctk.CTkLabel(gf, text="1 个分组",
+                                            font=ctk.CTkFont(size=10),
+                                            text_color=("gray45", "gray65"))
+        self.group_info_lbl.pack(side="right", padx=8)
 
         # 曝光控制（简化版）
         ef = ctk.CTkFrame(self)
@@ -1362,12 +1389,43 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.save_btn.pack(side="right")
 
     # ────────── 缩略图 ──────────
+    def _get_groups(self):
+        """返回分组列表，每组是页索引列表。e.g. [[0,1,2],[3,4],[5]]"""
+        split_positions = sorted(self.splits)
+        groups = []
+        start = 0
+        for sp in split_positions:
+            # sp 是页索引（0-based），分割在 sp 之后
+            if sp + 1 < len(self.pages):
+                groups.append(list(range(start, sp + 1)))
+                start = sp + 1
+        groups.append(list(range(start, len(self.pages))))
+        return [g for g in groups if g]  # 过滤空组
+
     def _refresh_thumbs(self):
         for w in self.thumb_container.winfo_children():
             w.destroy()
         self._thumb_photos.clear()
 
+        groups = self._get_groups()
+        group_of_page = {}  # page_idx → group_idx
+        for gi, g in enumerate(groups):
+            for pi in g:
+                group_of_page[pi] = gi
+
+        # 更新分组信息标签
+        n_groups = len(groups)
+        self.group_info_lbl.configure(text=f"{n_groups} 个分组")
+
         for idx, page_num in enumerate(self.pages):
+            # 分割标记
+            if idx > 0 and (idx - 1) in self.splits:
+                sep = ctk.CTkFrame(self.thumb_container, width=3,
+                                    height=self.TH + 16,
+                                    fg_color="#3B8ED0")
+                sep.pack(side="left", padx=4, pady=2)
+                sep.pack_propagate(False)
+
             frame = ctk.CTkFrame(self.thumb_container, fg_color="transparent")
             frame.pack(side="left", padx=2)
 
@@ -1379,9 +1437,15 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
             except Exception:
                 photo = None
 
+            gi = group_of_page.get(idx, 0)
+            group_label = self.group_names.get(gi, "")
+            display_text = f"{idx + 1}"
+            if group_label:
+                display_text = f"[{group_label}] {idx + 1}"
+
             btn = ctk.CTkButton(
-                frame, text=str(idx + 1), image=photo,
-                width=self.TW, height=self.TH + 16,
+                frame, text=display_text, image=photo,
+                width=self.TW + 20, height=self.TH + 16,
                 compound="top", font=ctk.CTkFont(size=10),
                 fg_color=("gray80", "gray30") if idx == self.selected_idx else "transparent",
                 command=lambda i=idx: self._select_page(i))
@@ -1409,9 +1473,77 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
             os.remove(self._cache_path(page_num))
         except OSError:
             pass
+        # 调整分割标记：删除当前页的分割，后续标记前移
+        new_splits = set()
+        for sp in self.splits:
+            if sp == idx:
+                continue  # 被删页上的分割移除
+            elif sp > idx:
+                new_splits.add(sp - 1)
+            else:
+                new_splits.add(sp)
+        self.splits = new_splits
         self.selected_idx = min(self.selected_idx, len(self.pages) - 1)
         self._refresh_thumbs()
         self._update_preview()
+
+    # ────────── 分组操作 ──────────
+    def _insert_split(self):
+        """在当前选中页之后插入分割标记"""
+        idx = self.selected_idx
+        if idx >= len(self.pages) - 1:
+            return  # 最后一页后不能分割
+        self.splits.add(idx)
+        self._refresh_thumbs()
+
+    def _remove_split(self):
+        """移除当前选中页之后的分割标记（如果存在）"""
+        idx = self.selected_idx
+        if idx in self.splits:
+            self.splits.discard(idx)
+            self._refresh_thumbs()
+
+    def _rename_group(self):
+        """重命名当前选中页所在分组"""
+        groups = self._get_groups()
+        gi = None
+        for i, g in enumerate(groups):
+            if self.selected_idx in g:
+                gi = i
+                break
+        if gi is None:
+            return
+
+        pop = ctk.CTkToplevel(self)
+        pop.title("重命名分组")
+        pop.geometry("300x140")
+        pop.resizable(False, False)
+        pop.transient(self)
+        pop.grab_set()
+
+        ctk.CTkLabel(pop, text=f"分组 {gi + 1} 名称",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(12, 4))
+        entry = ctk.CTkEntry(pop, width=260)
+        entry.pack(pady=4)
+        current_name = self.group_names.get(gi, "")
+        if current_name:
+            entry.insert(0, current_name)
+            entry.select_range(0, "end")
+        else:
+            entry.configure(placeholder_text=f"文档_{gi + 1}")
+        entry.focus_set()
+
+        def confirm():
+            name = entry.get().strip()
+            if name:
+                self.group_names[gi] = name
+            elif gi in self.group_names:
+                del self.group_names[gi]
+            pop.destroy()
+            self._refresh_thumbs()
+
+        ctk.CTkButton(pop, text="确认", command=confirm).pack(pady=4)
+        entry.bind("<Return>", lambda e: confirm())
 
     # ────────── 曝光控制 ──────────
     def _on_mode(self, value):
@@ -1455,6 +1587,15 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
     # ────────── 保存 ──────────
+    def _process_page(self, page_num, mode):
+        """从缓存加载并应用曝光，返回 PIL Image"""
+        img = Image.open(self._cache_path(page_num))
+        return apply_exposure(img, mode=mode,
+                              brightness=self.bri, contrast=self.con,
+                              gamma=self.gamma, shadows=self.shadows,
+                              highlights=self.highlights,
+                              mime=self.mime)
+
     def _confirm(self):
         mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
         mode = mode_map.get(self.exp_mode, "off")
@@ -1462,46 +1603,51 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
 
         out_ext = self.output_path.rsplit(".", 1)[-1].lower()
         base_path = self.output_path.rsplit(".", 1)[0]
+        groups = self._get_groups()
+        is_pdf = (out_ext == "pdf")
+        has_groups = len(groups) > 1
 
-        for i, page_num in enumerate(self.pages, 1):
-            try:
-                img = Image.open(self._cache_path(page_num))
-                img = apply_exposure(img, mode=mode,
-                                     brightness=self.bri, contrast=self.con,
-                                     gamma=self.gamma, shadows=self.shadows,
-                                     highlights=self.highlights,
-                                     mime=self.mime)
+        for gi, group_indices in enumerate(groups):
+            group_name = self.group_names.get(gi, "")
+            if has_groups:
+                # 多分组：用分组名或序号做前缀
+                prefix = group_name if group_name else f"文档_{gi + 1}"
+            else:
+                prefix = None
 
-                if out_ext == "pdf":
-                    # PDF: 合并所有页到单个文件
-                    continue  # 下面统一处理
-                else:
-                    fpath = f"{base_path}_{i:03d}.{self.ext}"
-                    fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
-                    img.save(fpath, fmt)
-                    saved_files.append(fpath)
-            except Exception as e:
-                logging.debug("保存第 %d 页失败: %s", i, e)
-
-        # PDF 合并
-        if out_ext == "pdf":
-            pdf_images = []
-            for i, page_num in enumerate(self.pages):
-                try:
-                    img = Image.open(self._cache_path(page_num))
-                    img = apply_exposure(img, mode=mode,
-                                         brightness=self.bri, contrast=self.con,
-                                         gamma=self.gamma, shadows=self.shadows,
-                                         highlights=self.highlights,
-                                         mime=self.mime)
-                    pdf_images.append(img.convert("RGB"))
-                except Exception:
-                    pass
-            if pdf_images:
-                pdf_path = f"{base_path}.pdf"
-                pdf_images[0].save(pdf_path, "PDF", save_all=True,
-                                    append_images=pdf_images[1:])
-                saved_files.append(pdf_path)
+            if is_pdf:
+                # PDF: 每个分组合并为一个多页PDF
+                pdf_images = []
+                for page_idx in group_indices:
+                    page_num = self.pages[page_idx]
+                    try:
+                        img = self._process_page(page_num, mode)
+                        pdf_images.append(img.convert("RGB"))
+                    except Exception:
+                        pass
+                if pdf_images:
+                    if prefix:
+                        pdf_path = f"{base_path}_{prefix}.pdf"
+                    else:
+                        pdf_path = f"{base_path}.pdf"
+                    pdf_images[0].save(pdf_path, "PDF", save_all=True,
+                                        append_images=pdf_images[1:])
+                    saved_files.append(pdf_path)
+            else:
+                # 非PDF: 每页独立文件
+                fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
+                for seq, page_idx in enumerate(group_indices, 1):
+                    page_num = self.pages[page_idx]
+                    try:
+                        img = self._process_page(page_num, mode)
+                        if prefix:
+                            fpath = f"{base_path}_{prefix}_{seq:03d}.{self.ext}"
+                        else:
+                            fpath = f"{base_path}_{seq:03d}.{self.ext}"
+                        img.save(fpath, fmt)
+                        saved_files.append(fpath)
+                    except Exception:
+                        pass
 
         # 清除缓存
         cache_manager.remove_job(self.job_id)
