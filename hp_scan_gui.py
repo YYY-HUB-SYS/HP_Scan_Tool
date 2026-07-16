@@ -73,8 +73,8 @@ class ScanApp(ctk.CTk):
         self.cfg = load_config()
 
         self.title("惠普集成扫描工具")
-        self.geometry("860x720")
-        self.minsize(740, 600)
+        self.geometry("840x620")
+        self.minsize(720, 500)
 
         saved_theme = self.cfg.get("theme", "dark")
         ctk.set_appearance_mode(saved_theme)
@@ -400,23 +400,27 @@ class ScanApp(ctk.CTk):
             threading.Thread(target=self._probe_saved, daemon=True).start()
 
     def _probe_saved(self):
-        """后台逐台探活已加载的打印机（构造新对象后原子替换，避免半更新状态）"""
-        for i, s in enumerate(list(self.scanners)):
-            url = probe_escl(s.ip, timeout=3.0)
+        """后台逐台探活已加载的打印机（只读快照，结果回主线程原子替换）"""
+        import copy
+        snapshot = list(self.scanners)  # 主线程已完成的快照，后台只读
+        results = {}
+        for s in snapshot:
+            url = probe_escl(s.ip, port=s.port, timeout=3.0)
             if url:
-                # 构造新的 ScannerInfo，复制所有字段后查询能力
-                import copy
                 new_s = copy.copy(s)
                 new_s.escl_url = url
                 fetch_capabilities(new_s, timeout=3.0)
-                # 原子替换列表中的引用
-                for j, sc in enumerate(self.scanners):
-                    if sc.ip == s.ip:
-                        self.scanners[j] = new_s
-                        if self.selected and self.selected.ip == s.ip:
-                            self.selected = new_s
-                        break
-            self.after(0, self._rebuild_cards)
+                results[s.ip] = new_s
+        self.after(0, lambda: self._apply_probe_results(results))
+        self.after(0, self._rebuild_cards)
+
+    def _apply_probe_results(self, results: dict):
+        """主线程：原子应用探活结果"""
+        for i, s in enumerate(self.scanners):
+            if s.ip in results:
+                self.scanners[i] = results[s.ip]
+                if self.selected and self.selected.ip == s.ip:
+                    self.selected = results[s.ip]
 
     def _auto_discover(self):
         # 已有历史打印机则跳过自动搜索，直接加载
@@ -435,20 +439,23 @@ class ScanApp(ctk.CTk):
 
     def _do_discover(self):
         discovered = discover_scanners(timeout=4.0)
-        existing_ips = {s.ip for s in self.scanners if s.ip}
+        existing_ips = {s.ip for s in self.scanners if s.ip}  # 快照读取
+        new_scanners = []
         new_count = 0
         for d in discovered:
             if d.ip not in existing_ips:
                 d.escl_url = probe_escl(d.ip, timeout=3.0) or ""
                 if d.escl_url:
                     fetch_capabilities(d, timeout=3.0)
-                self.scanners.append(d)
+                new_scanners.append(d)
                 existing_ips.add(d.ip)
                 new_count += 1
 
+        # 构建持久化数据（在后台线程完成，不回读 self.scanners）
+        all_for_save = list(self.scanners) + new_scanners
         nicknames = self.cfg.get("nicknames", {})
         ips = []
-        for s in self.scanners:
+        for s in all_for_save:
             if s.ip:
                 ips.append({"ip": s.ip, "model": s.model})
                 if s.custom_name:
@@ -457,9 +464,10 @@ class ScanApp(ctk.CTk):
         self.cfg["nicknames"] = nicknames
         save_config(self.cfg)
 
-        self.after(0, lambda: self._on_discover_done(new_count))
+        self.after(0, lambda: self._on_discover_done(new_count, new_scanners))
 
-    def _on_discover_done(self, new_count):
+    def _on_discover_done(self, new_count, new_scanners):
+        self.scanners.extend(new_scanners)  # 主线程写入，安全
         self._set_loading(False)
         self._rebuild_cards()
         n = len(self.scanners)
@@ -481,22 +489,24 @@ class ScanApp(ctk.CTk):
             self.progress.grid_remove()
             self.disc_btn.configure(state="normal", text="搜索局域网")
 
+    def _update_source_options(self, has_adf: bool):
+        """根据扫描仪能力更新来源下拉框"""
+        sources = ["平板"]
+        if has_adf:
+            sources.append("输稿器(ADF)")
+        self.src_cb.configure(values=sources)
+        if self.source_val in sources:
+            self.src_cb.set(self.source_val)
+        else:
+            self.src_cb.set(sources[0])
+            self.source_val = sources[0]
+
     # ────────── 选择 ──────────
     def select_scanner(self, idx: int):
         if 0 <= idx < len(self.scanners):
             self.selected = self.scanners[idx]
             self.selected_idx = idx
-
-            sources = ["平板"]
-            if self.selected.has_adf:
-                sources.append("输稿器(ADF)")
-            self.src_cb.configure(values=sources)
-            # 恢复上次选择，但仅在选项可用时
-            if self.source_val in sources:
-                self.src_cb.set(self.source_val)
-            else:
-                self.src_cb.set(sources[0])
-                self.source_val = sources[0]
+            self._update_source_options(self.selected.has_adf)
 
             label = _label_for(self.selected)
             self.status_bar.configure(text=f"已选择: {label}")
@@ -549,6 +559,9 @@ class ScanApp(ctk.CTk):
         ctk.CTkEntry(ip_frame, width=60, textvariable=port_var).pack(side="left")
 
         result_lbl = ctk.CTkLabel(dlg, text="")
+        result_lbl.pack()
+        add_btn = ctk.CTkButton(dlg, text="探测并添加", width=140)
+        add_btn.pack(pady=8)
 
         def probe():
             ip = ip_var.get().strip()
@@ -559,7 +572,6 @@ class ScanApp(ctk.CTk):
             except ValueError:
                 port = 80
             result_lbl.configure(text="探测中...", text_color=("gray45", "gray65"))
-            add_btn = dlg.winfo_children()[-1]  # 获取"探测并添加"按钮
             add_btn.configure(state="disabled")
 
             def do_probe():
@@ -585,8 +597,7 @@ class ScanApp(ctk.CTk):
 
             threading.Thread(target=do_probe, daemon=True).start()
 
-        result_lbl.pack()
-        ctk.CTkButton(dlg, text="探测并添加", width=140, command=probe).pack(pady=8)
+        add_btn.configure(command=probe)
 
     # ────────── 能力查询 ──────────
     def _query_caps(self):
@@ -602,27 +613,22 @@ class ScanApp(ctk.CTk):
 
         def do():
             s = fetch_capabilities(scanner_ref, timeout=5.0)
-            for i, sc in enumerate(self.scanners):
-                if sc.ip == s.ip:
-                    self.scanners[i] = s
-                    break
-            self.after(0, lambda: self._caps_done(s))
+            self.after(0, lambda: self._apply_caps(s))
 
         threading.Thread(target=do, daemon=True).start()
+
+    def _apply_caps(self, s):
+        """主线程：原子应用能力查询结果"""
+        for i, sc in enumerate(self.scanners):
+            if sc.ip == s.ip:
+                self.scanners[i] = s
+                break
+        self._caps_done(s)
 
     def _caps_done(self, s):
         self._set_loading(False)
         self._rebuild_cards()
-
-        sources = ["平板"]
-        if s.has_adf:
-            sources.append("输稿器(ADF)")
-        self.src_cb.configure(values=sources)
-        if self.source_val in sources:
-            self.src_cb.set(self.source_val)
-        else:
-            self.src_cb.set(sources[0])
-            self.source_val = sources[0]
+        self._update_source_options(s.has_adf)
 
         info = (
             f"型号: {s.model or '未知'}\n"
@@ -743,8 +749,9 @@ class ScanApp(ctk.CTk):
                         source_val = "Platen"
                         self.after(0, lambda: self.status_bar.configure(
                             text="输稿器为空，自动切换为平板扫描"))
-                except Exception:
-                    pass
+                except Exception as e:
+                    import logging
+                    logging.debug("ADF 状态检测失败，保持手动选择: %s", e)
 
             self.after(0, lambda: self.status_bar.configure(text="正在扫描..."))
             data, ext = execute_scan(

@@ -23,9 +23,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status",
-    "execute_scan", "scan_to_file", "auto_exposure",
+    "execute_scan", "scan_to_file", "auto_exposure", "manual_exposure",
     "FORMAT_MIME", "MIME_EXT",
 ]
+
+
+def _strip_ns(el) -> str:
+    """剥离 XML 元素的 namespace 前缀，返回本地标签名。"""
+    t = el.tag if hasattr(el, "tag") else str(el)
+    return t.split("}")[-1] if "}" in t else t
 
 
 # ==================== 数据结构 ====================
@@ -148,12 +154,9 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
             return scanner
         root = ET.fromstring(r.text)
 
-        def tag(el):
-            return el.tag.split("}")[-1] if "}" in el.tag else el.tag
-
         # 型号 / 序列号
         for el in root.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t == "Model" and el.text:
                 scanner.model = el.text.strip()
             if t == "SerialNumber" and el.text:
@@ -164,7 +167,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
         adf_sections = []
 
         for child in root:
-            t = tag(child)
+            t = _strip_ns(child)
             if t == "Platen":
                 platen_sections.append(child)
             elif t == "Adf":
@@ -181,7 +184,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
             scanner.has_adf = True
             # 检测双面
             for el in adf_sections[0].iter():
-                if tag(el) == "Duplex" and el.text and el.text.strip().lower() == "true":
+                if _strip_ns(el) == "Duplex" and el.text and el.text.strip().lower() == "true":
                     scanner.has_duplex = True
 
         if source_section is None:
@@ -189,7 +192,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
 
         # 最大尺寸
         for el in source_section.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t == "MaxWidth":
                 try:
                     scanner.max_width = int(el.text or "2550")
@@ -204,10 +207,10 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
         # 分辨率
         resolutions = []
         for el in source_section.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t in ("DiscreteResolutions", "SupportedResolutions"):
                 for child in el:
-                    if tag(child) == "Width":
+                    if _strip_ns(child) == "Width":
                         try:
                             dpi = int(child.text or "0")
                             if dpi > 0 and dpi not in resolutions:
@@ -220,7 +223,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
         # 颜色模式
         color_modes = []
         for el in source_section.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t in ("ColorModes", "SupportedColorModes"):
                 for child in el:
                     if child.text and child.text.strip():
@@ -231,7 +234,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
         # 格式
         formats = []
         for el in source_section.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t in ("DocumentFormats", "SupportedDocumentFormats"):
                 for child in el:
                     if child.text and child.text.strip():
@@ -257,11 +260,8 @@ def get_scanner_status(escl_url: str, timeout: float = 5.0) -> dict:
             return status
         root = ET.fromstring(r.text)
 
-        def tag(el):
-            return el.tag.split("}")[-1] if "}" in el.tag else el.tag
-
         for el in root.iter():
-            t = tag(el)
+            t = _strip_ns(el)
             if t == "State" and el.text:
                 status["state"] = el.text.strip()
             if t == "AdfState" and el.text:
@@ -326,6 +326,25 @@ MIME_EXT = {
 }
 
 
+def _stretch_channel(ch_img):
+    """对单通道做 1%-99% 直方图拉伸，返回拉伸后的通道图像。"""
+    hist = ch_img.histogram()
+    total = sum(hist)
+    lo, hi, acc = 0, 255, 0
+    for i, count in enumerate(hist):
+        acc += count
+        if acc >= total * 0.01 and lo == 0 and i > 0:
+            lo = i - 1
+        if acc >= total * 0.99:
+            hi = i
+            break
+    if hi <= lo:
+        return ch_img
+    scale = 255.0 / (hi - lo)
+    lut = [max(0, min(255, int((v - lo) * scale))) for v in range(256)]
+    return ch_img.point(lut)
+
+
 def auto_exposure(data: bytes, mime: str = "image/jpeg") -> bytes:
     """
     自动曝光后处理 — 直方图拉伸。
@@ -334,49 +353,12 @@ def auto_exposure(data: bytes, mime: str = "image/jpeg") -> bytes:
     """
     try:
         img = Image.open(io.BytesIO(data))
-        if img.mode not in ("RGB", "L"):
-            return data
-
         if img.mode == "RGB":
-            # 分通道处理
-            channels = img.split()
-            stretched = []
-            for ch in channels:
-                hist = ch.histogram()  # 256 个桶
-                total = sum(hist)
-                # 找 1% 和 99% 分位
-                lo, hi, acc = 0, 255, 0
-                for i, count in enumerate(hist):
-                    acc += count
-                    if acc >= total * 0.01 and lo == 0 and i > 0:
-                        lo = i - 1
-                    if acc >= total * 0.99:
-                        hi = i
-                        break
-                # 构建 LUT
-                if hi <= lo:
-                    stretched.append(ch)
-                else:
-                    scale = 255.0 / (hi - lo)
-                    lut = [max(0, min(255, int((v - lo) * scale))) for v in range(256)]
-                    stretched.append(ch.point(lut))
-            img = Image.merge("RGB", stretched)
+            img = Image.merge("RGB", tuple(_stretch_channel(ch) for ch in img.split()))
+        elif img.mode == "L":
+            img = _stretch_channel(img)
         else:
-            # 灰度图
-            hist = img.histogram()
-            total = sum(hist)
-            lo, hi, acc = 0, 255, 0
-            for i, count in enumerate(hist):
-                acc += count
-                if acc >= total * 0.01 and lo == 0 and i > 0:
-                    lo = i - 1
-                if acc >= total * 0.99:
-                    hi = i
-                    break
-            if hi > lo:
-                scale = 255.0 / (hi - lo)
-                lut = [max(0, min(255, int((v - lo) * scale))) for v in range(256)]
-                img = img.point(lut)
+            return data
 
         buf = io.BytesIO()
         fmt = "JPEG" if mime == "image/jpeg" else "PNG"
@@ -384,7 +366,7 @@ def auto_exposure(data: bytes, mime: str = "image/jpeg") -> bytes:
         return buf.getvalue()
     except Exception as e:
         logging.debug("自动曝光处理失败: %s", e)
-        return data  # 失败时返回原始数据
+        return data
 
 
 def manual_exposure(data: bytes, brightness: int = 0, contrast: int = 0,
@@ -455,49 +437,48 @@ def execute_scan(
     session = requests.Session()
     session.verify = False
 
-    # Step 1: 创建扫描任务
-    r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
-    if r.status_code not in (200, 201, 202):
-        raise RuntimeError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
+    try:
+        # Step 1: 创建扫描任务
+        r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
+        if r.status_code not in (200, 201, 202):
+            raise RuntimeError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
 
-    job_uri = r.headers.get("Location", "")
-    if not job_uri:
-        # 从响应体解析
-        try:
-            root = ET.fromstring(r.text)
-            for el in root.iter():
-                if "JobUri" in (el.tag.split("}")[-1] if "}" in el.tag else el.tag):
-                    job_uri = el.text or ""
-                    break
-        except Exception:
-            pass
+        job_uri = r.headers.get("Location", "")
+        if not job_uri:
+            try:
+                root = ET.fromstring(r.text)
+                for el in root.iter():
+                    if "JobUri" in (el.tag.split("}")[-1] if "}" in el.tag else el.tag):
+                        job_uri = el.text or ""
+                        break
+            except Exception:
+                pass
 
-    if not job_uri:
-        raise RuntimeError("无法获取 ScanJob URI")
+        if not job_uri:
+            raise RuntimeError("无法获取 ScanJob URI")
 
-    # 补全 URL
-    if not job_uri.startswith("http"):
-        host = base.split("://")[1].split("/")[0]
-        job_uri = f"http://{host}{job_uri}"
+        # 补全 URL
+        if not job_uri.startswith("http"):
+            host = base.split("://")[1].split("/")[0]
+            job_uri = f"http://{host}{job_uri}"
 
-    # Step 2: 轮询 NextDocument（部分 HP 机型不支持 job URI 轮询，永远 404）
-    start = time.time()
-    nd_url = job_uri.rstrip("/") + "/NextDocument"
-    while time.time() - start < timeout:
-        try:
-            r = session.get(nd_url, timeout=10)
-            if r.status_code == 200:
-                session.close()
-                return r.content, ext
-            elif r.status_code == 503:
-                pass  # 扫描进行中
-            # 404/其他: 继续等待
-        except requests.RequestException:
-            pass
-        time.sleep(0.5)
+        # Step 2: 轮询 NextDocument
+        start = time.time()
+        nd_url = job_uri.rstrip("/") + "/NextDocument"
+        while time.time() - start < timeout:
+            try:
+                r = session.get(nd_url, timeout=10)
+                if r.status_code == 200:
+                    return r.content, ext
+                elif r.status_code == 503:
+                    pass  # 扫描进行中
+            except requests.RequestException:
+                pass
+            time.sleep(0.5)
 
-    session.close()
-    raise TimeoutError(f"扫描超时（{timeout:.0f}s），请确认纸张已放入并重试")
+        raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
+    finally:
+        session.close()
 
 
 def scan_to_file(

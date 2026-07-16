@@ -5,7 +5,6 @@ WIA 扫描引擎 — 降级方案
 
 import logging
 import os
-import sys
 from typing import Optional
 
 __all__ = ["list_wia_scanners", "wia_scan_to_file", "try_wia_scan"]
