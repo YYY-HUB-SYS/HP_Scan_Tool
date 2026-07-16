@@ -780,7 +780,13 @@ class ScanApp(ctk.CTk):
                 source=source_val,
                 timeout=90.0,
             )
-            self.after(0, lambda: self._show_preview(data, ext, output_path))
+
+            # 写入磁盘缓存（不再将全分辨率数据保留在内存）
+            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            cache_path = cache_manager.write_page(job_id, 1, data, ext)
+            del data  # 释放内存
+
+            self.after(0, lambda: self._show_preview(cache_path, ext, output_path, job_id))
         except Exception as e:
             tb = traceback.format_exc()
             self.after(0, lambda: self._scan_error(f"{type(e).__name__}: {e}\n\n{tb}"))
@@ -810,7 +816,10 @@ class ScanApp(ctk.CTk):
             )
             if result:
                 data, ext = result
-                self.after(0, lambda: self._show_preview(data, ext, fpath))
+                job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                cache_path = cache_manager.write_page(job_id, 1, data, ext)
+                del data
+                self.after(0, lambda: self._show_preview(cache_path, ext, fpath, job_id))
             else:
                 self.after(0, lambda: self._scan_error("WIA 扫描失败，未找到可用扫描仪"))
 
@@ -829,10 +838,10 @@ class ScanApp(ctk.CTk):
                             "2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达\n"
                             "3. 防火墙未拦截")
 
-    def _show_preview(self, data, ext, output_path):
+    def _show_preview(self, cache_path, ext, output_path, job_id):
         self._reset_scan_ui()
         self.status_bar.configure(text="扫描完成 — 调整曝光效果后点击保存")
-        PreviewDialog(self, data, ext, output_path)
+        PreviewDialog(self, cache_path, ext, output_path, job_id)
 
 
 # ================================================
@@ -845,7 +854,7 @@ class PreviewDialog(ctk.CTkToplevel):
     PW, PH = 420, 320  # 预览区域尺寸
     HW, HH = 420, 80   # 直方图尺寸
 
-    def __init__(self, parent, raw_data: bytes, ext: str, output_path: str):
+    def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str):
         super().__init__(parent)
         self.title("扫描预览 — 调整曝光效果")
         self.geometry("540x820")
@@ -853,9 +862,10 @@ class PreviewDialog(ctk.CTkToplevel):
         self.transient(parent)
         self.grab_set()
 
-        self.raw = raw_data
+        self.cache_path = cache_path
         self.ext = ext
         self.output_path = output_path
+        self.job_id = job_id
         self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
 
         self.exp_mode = "关闭"
@@ -1015,9 +1025,9 @@ class PreviewDialog(ctk.CTkToplevel):
 
     # ────────── 预览渲染 ──────────
     def _update_preview(self):
-        """根据当前曝光设置实时刷新预览图（直接操作 PIL Image，无 bytes 往返）"""
+        """根据当前曝光设置实时刷新预览图（从缓存文件加载，无 bytes 往返）"""
         try:
-            img = Image.open(io.BytesIO(self.raw))
+            img = Image.open(self.cache_path)
 
             # 映射 UI 中文模式名 → 引擎模式名
             mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
@@ -1075,7 +1085,7 @@ class PreviewDialog(ctk.CTkToplevel):
 
     # ────────── 确认保存 ──────────
     def _confirm(self):
-        img = Image.open(io.BytesIO(self.raw))
+        img = Image.open(self.cache_path)
         mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
         mode = mode_map.get(self.exp_mode, "off")
         img = apply_exposure(img, mode=mode,
@@ -1099,11 +1109,14 @@ class PreviewDialog(ctk.CTkToplevel):
             img.save(final, fmt)
             saved = final
 
+        # 清除缓存
+        cache_manager.remove_job(self.job_id)
         self.destroy()
         if messagebox.askyesno("保存成功", f"已保存:\n{saved}\n\n打开所在文件夹？"):
             os.startfile(os.path.dirname(saved))
 
     def _cancel(self):
+        cache_manager.remove_job(self.job_id)
         self.destroy()
 
 
