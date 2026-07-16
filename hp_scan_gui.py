@@ -1,6 +1,6 @@
 """
-惠普集成扫描工具 v3.2 — CustomTkinter 重写版
-功能: 主题联动 / 高对比度配色 / 自定义名称 / 交互反馈 / 曝光控制(关闭·自动·手动)
+惠普集成扫描工具 v3.3 — CustomTkinter 重写版
+功能: 磁盘缓存 / 并发扫描 / 多页ADF / 曝光增强(直方图+预设) / WSD发现 / CLI
 """
 
 import io
@@ -22,6 +22,7 @@ from escl_engine import (
     get_scanner_status, execute_scan, apply_exposure,
     ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
+import cache_manager
 
 # ---------- 配置 ----------
 def _app_dir():
@@ -71,6 +72,12 @@ class ScanApp(ctk.CTk):
         super().__init__()
 
         self.cfg = load_config()
+
+        # 启动时清理过期缓存（防崩溃遗留）
+        try:
+            cache_manager.cleanup_stale()
+        except Exception:
+            pass
 
         self.title("惠普集成扫描工具")
         self.geometry("840x620")
