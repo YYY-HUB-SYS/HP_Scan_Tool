@@ -92,7 +92,8 @@ class ScanApp(ctk.CTk):
 
         self.scanners: list[ScannerInfo] = []
         self.selected: ScannerInfo | None = None
-        self.scanning = False
+        self._active_scans = 0  # 并发扫描计数
+        self._scan_lock = threading.Lock()  # 保护计数器
         self.selected_idx: int = -1
         self._scan_cancel = threading.Event()
 
@@ -688,8 +689,6 @@ class ScanApp(ctk.CTk):
 
     # ────────── 扫描 ──────────
     def _start_scan(self):
-        if self.scanning:
-            return
         if not self.selected:
             messagebox.showwarning("提示", "请先选择一台打印机")
             return
@@ -718,12 +717,12 @@ class ScanApp(ctk.CTk):
             messagebox.showerror("错误", "保存路径不是目录，请重新选择")
             return
 
-        self.scanning = True
-        self.scan_btn.configure(text="扫描中...", state="disabled")
-        self._set_loading(True)
+        # 捕获当前选中的扫描仪和参数（避免并发时 self.selected 被切换）
+        scanner = self.selected
+        source_val = "Platen" if "平板" in self.src_cb.get() else "Feeder"
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_tag = self.selected.model.replace(" ", "_") if self.selected.model else "scan"
+        model_tag = scanner.model.replace(" ", "_") if scanner.model else "scan"
         fname = f"HP_{model_tag}_{ts}.{self.output_format_val}"
         fpath = os.path.join(out_dir, fname)
 
@@ -739,11 +738,15 @@ class ScanApp(ctk.CTk):
         })
         save_config(self.cfg)
 
-        source_val = "Platen" if "平板" in self.src_cb.get() else "Feeder"
-        self.source_val = self.src_cb.get()
+        # 增加活跃扫描计数
+        with self._scan_lock:
+            self._active_scans += 1
+            count = self._active_scans
+        self.scan_btn.configure(text=f"扫描中 ({count})...")
+        self.status_bar.configure(text=f"活跃扫描任务: {count}")
 
         threading.Thread(target=self._do_capture, args=(
-            self.selected, fpath, source_val,
+            scanner, fpath, source_val,
         ), daemon=True).start()
 
     def _do_capture(self, scanner, output_path, source_val):
@@ -827,12 +830,15 @@ class ScanApp(ctk.CTk):
             except Exception:
                 pass
 
-        self.scanning = True
-        self.scan_btn.configure(text="WIA...", state="disabled")
-        self._set_loading(True)
+        scanner = self.selected
+        with self._scan_lock:
+            self._active_scans += 1
+            count = self._active_scans
+        self.scan_btn.configure(text=f"扫描中 ({count})...")
+        self.status_bar.configure(text=f"活跃扫描任务: {count}")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_tag = self.selected.model.replace(" ", "_") if self.selected.model else "scan"
+        model_tag = scanner.model.replace(" ", "_") if scanner.model else "scan"
         fpath = os.path.join(out_dir, f"WIA_{model_tag}_{ts}.{self.output_format_val}")
 
         def do():
@@ -854,13 +860,21 @@ class ScanApp(ctk.CTk):
         threading.Thread(target=do, daemon=True).start()
 
     def _reset_scan_ui(self):
-        self.scanning = False
-        self.scan_btn.configure(text="扫描", state="normal")
-        self._set_loading(False)
+        """完成一个扫描任务后调用，递减计数"""
+        with self._scan_lock:
+            self._active_scans = max(0, self._active_scans - 1)
+            count = self._active_scans
+        if count == 0:
+            self.scan_btn.configure(text="扫描", state="normal")
+            self._set_loading(False)
+        else:
+            self.scan_btn.configure(text=f"扫描中 ({count})...")
 
     def _scan_error(self, msg):
         self._reset_scan_ui()
-        self.status_bar.configure(text="扫描失败")
+        with self._scan_lock:
+            count = self._active_scans
+        self.status_bar.configure(text=f"扫描失败 (活跃任务: {count})")
         messagebox.showerror("扫描失败", f"{msg}\n\n如果 eSCL 不通，请确认:\n"
                             "1. 打印机已启用 eSCL/AirScan\n"
                             "2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达\n"
@@ -868,12 +882,16 @@ class ScanApp(ctk.CTk):
 
     def _show_preview(self, cache_path, ext, output_path, job_id):
         self._reset_scan_ui()
-        self.status_bar.configure(text="扫描完成 — 调整曝光效果后点击保存")
+        with self._scan_lock:
+            count = self._active_scans
+        self.status_bar.configure(text=f"扫描完成 — 调整曝光效果后点击保存 (活跃: {count})")
         PreviewDialog(self, cache_path, ext, output_path, job_id)
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count):
         self._reset_scan_ui()
-        self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存")
+        with self._scan_lock:
+            count = self._active_scans
+        self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存 (活跃: {count})")
         MultiPagePreviewDialog(self, job_id, ext, output_path, page_count)
 
 
