@@ -283,9 +283,12 @@ class ScanApp(ctk.CTk):
         self._param(params, "来源", ["平板"], self.source_val, 0, 3)
         self.src_cb = params.grid_slaves(row=1, column=3)[0]
 
-        # 曝光控制面板
+        # 曝光控制面板（初始隐藏，扫描后才显示——有预览才能确定曝光）
+        self._exp_visible = False
         exp_frame = ctk.CTkFrame(right)
+        self.exp_frame = exp_frame
         exp_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 2))
+        exp_frame.grid_remove()  # 初始隐藏
         exp_frame.grid_columnconfigure(0, weight=1)
 
         exp_hdr = ctk.CTkFrame(exp_frame, fg_color="transparent")
@@ -953,8 +956,15 @@ class ScanApp(ctk.CTk):
                             "2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达\n"
                             "3. 防火墙未拦截")
 
+    def _show_exposure_panel(self):
+        """扫描完成后显示曝光调整面板（首次扫描后展开）"""
+        if not self._exp_visible:
+            self._exp_visible = True
+            self.exp_frame.grid()
+
     def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         self._reset_scan_ui()
+        self._show_exposure_panel()
         count = self.coordinator.active_scan_count()
         self.status_bar.configure(text=f"扫描完成 — 调整曝光效果后点击保存 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
@@ -964,6 +974,7 @@ class ScanApp(ctk.CTk):
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
         self._reset_scan_ui()
+        self._show_exposure_panel()
         count = self.coordinator.active_scan_count()
         self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
