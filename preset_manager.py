@@ -122,3 +122,57 @@ def _load_user_presets() -> list[dict]:
         except Exception:
             pass
     return []
+
+
+def export_preset(name: str, output_path: str) -> bool:
+    """
+    导出指定预设为独立 JSON 文件（用于分享）。
+    返回 True 表示成功。
+    """
+    presets = load_presets()
+    target = None
+    for p in presets:
+        if p["name"] == name:
+            target = p
+            break
+    if not target:
+        return False
+
+    export_data = {
+        "version": 1,
+        "preset": {k: v for k, v in target.items() if k != "builtin"},
+    }
+    try:
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logger.debug("预设导出失败: %s", e)
+        return False
+
+
+def import_preset(file_path: str) -> str | None:
+    """
+    从 JSON 文件导入预设。
+    返回导入的预设名称，失败返回 None。
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.debug("预设导入读取失败: %s", e)
+        return None
+
+    if not isinstance(data, dict) or "preset" not in data:
+        logger.debug("预设文件格式无效")
+        return None
+
+    preset = data["preset"]
+    required_keys = {"name", "mode"}
+    if not required_keys.issubset(preset.keys()):
+        logger.debug("预设文件缺少必要字段")
+        return None
+
+    name = preset["name"]
+    save_user_preset(preset)
+    return name

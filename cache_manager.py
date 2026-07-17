@@ -11,13 +11,17 @@
 
 清理策略:
   - 上限可配置（默认 1024MB）
-  - 达到 95% 触发线时自动 FIFO 清除 150MB
+  - 写入前检查，达到 95% 触发线时自动 FIFO 清除 150MB
+  - FIFO 按任务目录创建时间排序，整目录删除
+  - 活跃任务受保护，不会被清理
   - 启动时清理超过 24 小时的残留缓存
 """
 
 import json
 import logging
 import os
+import shutil
+import threading
 import time
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,17 @@ _DEFAULTS = {
     "cleanup_mb": 150,
     "stale_hours": 24,
 }
+
+# ── 线程安全 ──
+_lock = threading.Lock()
+
+# ── 活跃任务集合：注册后不会被 eviction 清理 ──
+_active_jobs: set[str] = set()
+
+# ── 配置缓存：避免每次调用重读 JSON ──
+_config_cache: dict | None = None
+_config_cache_time: float = 0
+_CONFIG_CACHE_TTL = 5.0  # 5 秒内复用
 
 
 def _cache_config_path():
@@ -43,7 +58,12 @@ def _default_cache_root():
 
 
 def load_cache_config() -> dict:
-    """加载缓存配置，缺失字段用默认值填充"""
+    """加载缓存配置，缺失字段用默认值填充（带 5 秒缓存）"""
+    global _config_cache, _config_cache_time
+    now = time.time()
+    if _config_cache is not None and (now - _config_cache_time) < _CONFIG_CACHE_TTL:
+        return dict(_config_cache)
+
     path = _cache_config_path()
     cfg = dict(_DEFAULTS)
     if os.path.exists(path):
@@ -53,17 +73,24 @@ def load_cache_config() -> dict:
             cfg.update(user_cfg)
         except Exception as e:
             logger.debug("缓存配置加载失败，使用默认值: %s", e)
-    return cfg
+
+    _config_cache = cfg
+    _config_cache_time = now
+    return dict(cfg)
 
 
 def save_cache_config(cfg: dict):
     """保存缓存配置"""
+    global _config_cache, _config_cache_time
     path = _cache_config_path()
     try:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
+        # 更新缓存
+        _config_cache = cfg
+        _config_cache_time = time.time()
     except Exception as e:
         logger.debug("缓存配置保存失败: %s", e)
 
@@ -83,19 +110,36 @@ def job_dir(job_id: str) -> str:
     return d
 
 
+# ── 活跃任务管理 ──
+
+def register_job(job_id: str):
+    """注册活跃任务，保护其缓存不被 eviction 清理"""
+    with _lock:
+        _active_jobs.add(job_id)
+
+
+def unregister_job(job_id: str):
+    """取消注册活跃任务"""
+    with _lock:
+        _active_jobs.discard(job_id)
+
+
+# ── 核心操作 ──
+
 def write_page(job_id: str, page_num: int, data: bytes, ext: str) -> str:
     """
-    将扫描页写入缓存。
+    将扫描页写入缓存。写入前检查是否需要清理。
     返回缓存文件路径。
     """
+    # 写入前检查清理（而非写入后）
+    with _lock:
+        _maybe_evict_locked()
+
     d = job_dir(job_id)
     path = os.path.join(d, f"page_{page_num:03d}.{ext}")
     with open(path, "wb") as f:
         f.write(data)
     logger.debug("缓存写入: %s (%d bytes)", path, len(data))
-
-    # 写入后检查是否需要清理
-    _maybe_evict()
 
     return path
 
@@ -132,11 +176,12 @@ def list_pages(job_id: str) -> list[tuple[int, str, str]]:
 
 def remove_job(job_id: str):
     """删除指定 job 的全部缓存"""
-    import shutil
-    d = os.path.join(cache_root(), job_id)
-    if os.path.isdir(d):
-        shutil.rmtree(d, ignore_errors=True)
-        logger.debug("缓存清除: %s", d)
+    with _lock:
+        d = os.path.join(cache_root(), job_id)
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            logger.debug("缓存清除: %s", d)
+        _active_jobs.discard(job_id)
 
 
 def cache_size_bytes() -> int:
@@ -158,8 +203,10 @@ def cache_size_mb() -> float:
     return cache_size_bytes() / (1024 * 1024)
 
 
-def _maybe_evict():
-    """检查缓存大小，接近触发线时执行 FIFO 清理"""
+# ── 清理逻辑（内部，调用者须持有 _lock）──
+
+def _maybe_evict_locked():
+    """检查缓存大小，接近触发线时执行 FIFO 清理。调用者须持有 _lock。"""
     cfg = load_cache_config()
     limit_bytes = cfg["cache_limit_mb"] * 1024 * 1024
     trigger_bytes = limit_bytes * cfg["trigger_ratio"]
@@ -171,41 +218,48 @@ def _maybe_evict():
 
     logger.info("缓存 %.1fMB 超过触发线 %.1fMB，开始清理...",
                 current / (1024 * 1024), trigger_bytes / (1024 * 1024))
-    _evict_oldest(cleanup_bytes)
+    _evict_oldest_jobs_locked(cleanup_bytes)
 
 
-def _evict_oldest(target_bytes: int):
-    """FIFO 清理：按文件修改时间从旧到新删除，直到释放 target_bytes"""
+def _evict_oldest_jobs_locked(target_bytes: int):
+    """
+    FIFO 清理：按任务目录创建时间从旧到新删除整个目录。
+    活跃任务（_active_jobs 中注册的）受保护不被清理。
+    调用者须持有 _lock。
+    """
     root = cache_root()
-    files = []
-    for dirpath, _, filenames in os.walk(root):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            try:
-                files.append((os.path.getmtime(fp), os.path.getsize(fp), fp))
-            except OSError:
-                pass
+    jobs = []
 
-    files.sort()  # 最旧的在前
+    for entry in os.listdir(root):
+        d = os.path.join(root, entry)
+        if not os.path.isdir(d):
+            continue
+        # 跳过活跃任务
+        if entry in _active_jobs:
+            continue
+        try:
+            ctime = os.path.getctime(d)
+            size = sum(
+                os.path.getsize(os.path.join(d, f))
+                for f in os.listdir(d)
+                if os.path.isfile(os.path.join(d, f))
+            )
+            jobs.append((ctime, size, entry, d))
+        except OSError:
+            continue
+
+    jobs.sort()  # 最旧的在前
 
     freed = 0
-    for mtime, size, fp in files:
+    for ctime, size, job_id, d in jobs:
         if freed >= target_bytes:
             break
         try:
-            os.remove(fp)
+            shutil.rmtree(d, ignore_errors=True)
             freed += size
-            logger.debug("清理缓存文件: %s (%.1fMB)", fp, size / (1024 * 1024))
+            logger.debug("清理缓存任务: %s (%.1fMB)", job_id, size / (1024 * 1024))
         except OSError as e:
-            logger.debug("清理失败: %s: %s", fp, e)
-
-    # 清理空目录
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-        if not filenames and not dirnames and dirpath != root:
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
+            logger.debug("清理失败: %s: %s", d, e)
 
     logger.info("缓存清理完成，释放 %.1fMB", freed / (1024 * 1024))
 
@@ -224,7 +278,6 @@ def cleanup_stale():
         try:
             mtime = os.path.getmtime(d)
             if now - mtime > stale_seconds:
-                import shutil
                 shutil.rmtree(d, ignore_errors=True)
                 logger.debug("清理过期缓存: %s (age: %.1fh)", entry,
                              (now - mtime) / 3600)

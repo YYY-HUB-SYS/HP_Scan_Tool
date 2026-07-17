@@ -93,6 +93,7 @@ class ScanApp(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
 
         self.scanners: list[ScannerInfo] = []
+        self._scanners_lock = threading.Lock()  # 保护 scanners 列表
         self.selected: ScannerInfo | None = None
         self._active_scans = 0  # 并发扫描计数
         self._scan_lock = threading.Lock()  # 保护计数器
@@ -427,7 +428,7 @@ class ScanApp(ctk.CTk):
             if url:
                 new_s = copy.copy(s)
                 new_s.escl_url = url
-                fetch_capabilities(new_s, timeout=3.0)
+                new_s = fetch_capabilities(new_s, timeout=3.0)
                 results[s.ip] = new_s
         self.after(0, lambda: self._apply_probe_results(results))
         self.after(0, self._rebuild_cards)
@@ -457,20 +458,22 @@ class ScanApp(ctk.CTk):
 
     def _do_discover(self):
         discovered = discover_all_scanners(timeout=4.0)
-        existing_ips = {s.ip for s in self.scanners if s.ip}  # 快照读取
+        with self._scanners_lock:
+            existing_ips = {s.ip for s in self.scanners if s.ip}  # 快照读取
         new_scanners = []
         new_count = 0
         for d in discovered:
             if d.ip not in existing_ips:
                 d.escl_url = probe_escl(d.ip, timeout=3.0) or ""
                 if d.escl_url:
-                    fetch_capabilities(d, timeout=3.0)
+                    d = fetch_capabilities(d, timeout=3.0)
                 new_scanners.append(d)
                 existing_ips.add(d.ip)
                 new_count += 1
 
         # 构建持久化数据（在后台线程完成，不回读 self.scanners）
-        all_for_save = list(self.scanners) + new_scanners
+        with self._scanners_lock:
+            all_for_save = list(self.scanners) + new_scanners
         nicknames = self.cfg.get("nicknames", {})
         ips = []
         for s in all_for_save:
@@ -787,6 +790,7 @@ class ScanApp(ctk.CTk):
             self.after(0, lambda: self.status_bar.configure(text="正在扫描..."))
 
             job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            cache_manager.register_job(job_id)
             use_adf = source_val == "Feeder"
 
             if use_adf:
@@ -861,6 +865,7 @@ class ScanApp(ctk.CTk):
             if result:
                 data, ext = result
                 job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                cache_manager.register_job(job_id)
                 cache_path = cache_manager.write_page(job_id, 1, data, ext)
                 del data
                 self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, fpath, job_id, scanner=s))
@@ -1273,6 +1278,10 @@ class PreviewDialog(ctk.CTkToplevel):
             "page_count": 1,
             "format": self.ext,
             "file_path": saved,
+            "exposure_mode": self.exp_mode,
+            "brightness": self.bri,
+            "contrast": self.con,
+            "gamma": self.gamma,
         })
 
         self.destroy()
@@ -1298,7 +1307,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                  device_name: str = "", device_ip: str = ""):
         super().__init__(parent)
         self.title(f"扫描预览 — {page_count} 页")
-        self.geometry("600x780")
+        self.geometry("600x900")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -1336,7 +1345,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         # 居中
         self.update_idletasks()
         x = parent.winfo_x() + (parent.winfo_width() - 600) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 780) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 900) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
@@ -1426,6 +1435,30 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.con_s.configure(state="disabled")
         self.con_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
         self.con_v.grid(row=1, column=2, padx=(4, 8), pady=(4, 0))
+
+        ctk.CTkLabel(mf, text="Gamma", font=ctk.CTkFont(size=10)).grid(row=2, column=0, padx=(0, 4), pady=(4, 0))
+        self.gam_s = ctk.CTkSlider(mf, from_=0.1, to=3.0, number_of_steps=290,
+                                    command=self._on_gamma)
+        self.gam_s.grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.gam_s.configure(state="disabled")
+        self.gam_v = ctk.CTkLabel(mf, text="1.0", width=28, font=ctk.CTkFont(size=10))
+        self.gam_v.grid(row=2, column=2, padx=(4, 8), pady=(4, 0))
+
+        ctk.CTkLabel(mf, text="阴影", font=ctk.CTkFont(size=10)).grid(row=3, column=0, padx=(0, 4), pady=(4, 0))
+        self.shd_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_shadows)
+        self.shd_s.grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.shd_s.configure(state="disabled")
+        self.shd_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
+        self.shd_v.grid(row=3, column=2, padx=(4, 8), pady=(4, 0))
+
+        ctk.CTkLabel(mf, text="高光", font=ctk.CTkFont(size=10)).grid(row=4, column=0, padx=(0, 4), pady=(4, 0))
+        self.hgl_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
+                                    command=self._on_highlights)
+        self.hgl_s.grid(row=4, column=1, sticky="ew", padx=4, pady=(4, 0))
+        self.hgl_s.configure(state="disabled")
+        self.hgl_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
+        self.hgl_v.grid(row=4, column=2, padx=(4, 8), pady=(4, 0))
 
         # 按钮行
         bf = ctk.CTkFrame(self, fg_color="transparent")
@@ -1602,8 +1635,8 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
     def _on_mode(self, value):
         self.exp_mode = value
         state = "normal" if value == "手动" else "disabled"
-        self.bri_s.configure(state=state)
-        self.con_s.configure(state=state)
+        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hgl_s):
+            s.configure(state=state)
         self._update_preview()
 
     def _on_bri(self, val):
@@ -1614,6 +1647,21 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
     def _on_con(self, val):
         self.con = int(val)
         self.con_v.configure(text=str(self.con))
+        self._update_preview()
+
+    def _on_gamma(self, val):
+        self.gamma = round(float(val), 2)
+        self.gam_v.configure(text=f"{self.gamma:.1f}")
+        self._update_preview()
+
+    def _on_shadows(self, val):
+        self.shadows = int(val)
+        self.shd_v.configure(text=str(self.shadows))
+        self._update_preview()
+
+    def _on_highlights(self, val):
+        self.highlights = int(val)
+        self.hgl_v.configure(text=str(self.highlights))
         self._update_preview()
 
     # ────────── 预览渲染 ──────────
@@ -1712,8 +1760,12 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 "device_ip": self.device_ip,
                 "page_count": len(self.pages),
                 "format": self.ext,
-                "file_path": saved_files[0],  # 首个文件代表此次扫描
+                "file_path": saved_files[0],
                 "file_count": len(saved_files),
+                "exposure_mode": self.exp_mode,
+                "brightness": self.bri,
+                "contrast": self.con,
+                "gamma": self.gamma,
             })
 
         self.destroy()

@@ -5,6 +5,7 @@ CLI 命令行模式 — argparse 子命令入口
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -60,6 +61,20 @@ def cmd_scan(args):
         timeout=90.0,
     )
 
+    # 应用曝光处理
+    exposure_mode = getattr(args, "exposure", "off")
+    if exposure_mode != "off":
+        from PIL import Image as PILImage
+        from escl_engine import apply_exposure, FORMAT_MIME
+        mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
+        img = PILImage.open(io.BytesIO(data))
+        img = apply_exposure(img, mode=exposure_mode, mime=mime)
+        buf = io.BytesIO()
+        pil_fmt = "JPEG" if mime == "image/jpeg" else "PNG"
+        img.save(buf, pil_fmt)
+        data = buf.getvalue()
+        print(f"已应用曝光模式: {exposure_mode}")
+
     # 保存文件
     os.makedirs(output, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -79,6 +94,11 @@ def cmd_scan(args):
         "format": ext,
         "file_path": fpath,
         "source": "cli",
+        "resolution": resolution,
+        "color_mode": color_mode,
+        "output_format": fmt,
+        "scan_source": source,
+        "exposure_mode": exposure_mode,
     })
 
     return 0
@@ -212,6 +232,8 @@ def main():
                         help="颜色模式 (默认 color)")
     p_scan.add_argument("--source", default="Platen", choices=["Platen", "Feeder"],
                         help="扫描来源 (默认 Platen)")
+    p_scan.add_argument("--exposure", default="off", choices=["off", "auto", "manual"],
+                        help="曝光模式 (默认 off)")
     p_scan.add_argument("--output", help="输出目录 (默认 ~/Documents/HP_Scans)")
 
     # discover 子命令
