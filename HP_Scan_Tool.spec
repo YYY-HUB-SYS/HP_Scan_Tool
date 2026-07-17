@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+# SOP 2.2 Spec 文件规范 / 7.5.5 字体嵌入方案A
 
 import os
-block_cipher = None
 
 a = Analysis(
     ['hp_scan_gui.py'],
-    pathex=[],
+    pathex=['.'],
     binaries=[],
     datas=[
         ('fonts/NotoSansSC-Regular.ttf', 'fonts'),
@@ -19,7 +19,7 @@ a = Analysis(
         'xml.etree.ElementTree',
         'json', 'threading', 'io', 'copy', 'shutil',
         'tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox', 'tkinter.simpledialog',
-        # 项目内模块（PyInstaller 通常能自动发现，显式声明保险）
+        # 项目内模块
         'escl_engine', 'wia_engine', 'wsd_engine',
         'exposure', 'scan_coordinator',
         'cache_manager', 'preset_manager', 'history_manager',
@@ -27,11 +27,14 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'tkinter.test',
+        'unittest',
+        'pydoc',
+    ],
     noarchive=False,
-    optimize=0,
 )
-pyz = PYZ(a.pure, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,

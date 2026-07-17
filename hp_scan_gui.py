@@ -32,7 +32,17 @@ from scan_coordinator import (
     save_multipage_result, delete_cached_page, COLOR_MODE_MAP,
 )
 
-# ---------- 嵌入式字体加载 ----------
+# ---------- 资源路径（SOP 7.5.1） ----------
+def get_resource_path(relative_path):
+    """打包后 __file__ 不可靠，必须使用 sys._MEIPASS 定位资源"""
+    if getattr(sys, 'frozen', False):
+        base_path = sys._MEIPASS
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+
+# ---------- 嵌入式字体加载（SOP 7.5.5 方案A） ----------
 _FONT_FAMILY = "Microsoft YaHei UI"
 _FONT_SIZE = 13
 
@@ -40,13 +50,7 @@ def _load_embedded_font():
     """加载打包的思源黑体作为备选字体（主字体为系统 Microsoft YaHei UI）"""
     import ctypes
 
-    # 定位字体文件路径（兼容 PyInstaller 单文件 EXE 与开发环境）
-    if getattr(sys, 'frozen', False):
-        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    font_path = os.path.join(base, "fonts", "NotoSansSC-Regular.ttf")
-
+    font_path = get_resource_path(os.path.join("fonts", "NotoSansSC-Regular.ttf"))
     if not os.path.isfile(font_path):
         return  # 字体文件不存在，回退到系统字体
 
