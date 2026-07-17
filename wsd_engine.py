@@ -25,7 +25,7 @@ def discover_wsd(timeout: float = 4.0) -> list[ScannerInfo]:
     WSDiscovery 不可用时返回空列表。
     """
     try:
-        from WSDiscovery import WSDiscovery
+        from wsdiscovery import WSDiscovery
     except ImportError:
         logger.debug("WSDiscovery 库未安装，跳过 WSD 发现")
         return []
