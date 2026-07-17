@@ -32,6 +32,35 @@ from scan_coordinator import (
     save_multipage_result, delete_cached_page, COLOR_MODE_MAP,
 )
 
+# ---------- 嵌入式字体加载 ----------
+_FONT_FAMILY = "Noto Sans SC"
+_FONT_SIZE = 13
+
+def _load_embedded_font():
+    """加载打包的思源黑体（Noto Sans SC），解决系统字体渲染模糊问题"""
+    import ctypes
+
+    # 定位字体文件路径（兼容 PyInstaller 单文件 EXE 与开发环境）
+    if getattr(sys, 'frozen', False):
+        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    font_path = os.path.join(base, "fonts", "NotoSansSC-Regular.ttf")
+
+    if not os.path.isfile(font_path):
+        return  # 字体文件不存在，回退到系统字体
+
+    gdi32 = ctypes.windll.gdi32
+    # FR_PRIVATE=0x10, FR_NOT_ENUM=0x20：仅本进程可用，不污染系统字体列表
+    ret = gdi32.AddFontResourceExW(font_path, 0x10 | 0x20, 0)
+    if ret:
+        # 通知系统字体已变更
+        HWND_BROADCAST = 0xFFFF
+        WM_FONTCHANGE = 0x001D
+        user32 = ctypes.windll.user32
+        user32.SendMessageTimeoutW(HWND_BROADCAST, WM_FONTCHANGE, 0, 0, 0x0002, 1000, None)
+
+
 # ---------- 配置 ----------
 def _app_dir():
     # PyInstaller 单文件 EXE：用 EXE 所在目录，避免 tmp 被清理
@@ -77,10 +106,13 @@ class ScanApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        # 加载嵌入式思源黑体（仅本进程生效，不污染系统字体）
+        _load_embedded_font()
+
         # 全局字体：使用 ClearType 优化的中文字体，消除模糊
         # CTkFont 默认 Roboto 在本机未安装，回退到系统字体导致渲染模糊
-        self.option_add("*Font", ("Microsoft YaHei UI", 13))
-        ctk.ThemeManager.theme["CTkFont"]["family"] = "Microsoft YaHei UI"
+        self.option_add("*Font", (_FONT_FAMILY, _FONT_SIZE))
+        ctk.ThemeManager.theme["CTkFont"]["family"] = _FONT_FAMILY
 
         # 业务逻辑层
         self.coordinator = ScanCoordinator()
