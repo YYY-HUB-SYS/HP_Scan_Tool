@@ -288,42 +288,46 @@ class ScanApp(ctk.CTk):
                       border_color=("gray40", "gray60"),
                       command=self._browse).pack(side="left")
 
-        # 操作按钮行
+        # 操作按钮行（网格布局，等比例自适应窗口宽度）
         action = ctk.CTkFrame(right, fg_color="transparent")
         action.grid(row=5, column=0, sticky="ew", padx=10, pady=(8, 10))
+        action.grid_columnconfigure(0, weight=1)
+        action.grid_columnconfigure(1, weight=1)
+        action.grid_columnconfigure(2, weight=1)
+        action.grid_columnconfigure(3, weight=2)  # 扫描按钮占 2 份宽度
 
         self.caps_btn = ctk.CTkButton(action, text="查询能力",
-                                       height=32, border_width=1,
+                                       height=36, border_width=1,
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
                                        hover_color=("gray82", "gray25"),
                                        command=self._query_caps)
-        self.caps_btn.pack(side="left", padx=3)
+        self.caps_btn.grid(row=0, column=0, sticky="ew", padx=2)
 
         self.stat_btn = ctk.CTkButton(action, text="预览状态",
-                                       height=32, border_width=1,
+                                       height=36, border_width=1,
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
                                        hover_color=("gray82", "gray25"),
                                        command=self._check_status)
-        self.stat_btn.pack(side="left", padx=3)
+        self.stat_btn.grid(row=0, column=1, sticky="ew", padx=2)
 
         ctk.CTkButton(action, text="扫描历史",
-                      height=32, border_width=1,
+                      height=36, border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       fg_color="transparent",
                       hover_color=("gray82", "gray25"),
-                      command=self._show_history).pack(side="left", padx=3)
+                      command=self._show_history).grid(row=0, column=2, sticky="ew", padx=2)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
-                                       height=40, width=180,
+                                       height=40,
                                        font=ctk.CTkFont(size=15, weight="bold"),
                                        corner_radius=8,
                                        command=self._start_scan)
-        self.scan_btn.pack(side="right", padx=3)
+        self.scan_btn.grid(row=0, column=3, sticky="ew", padx=2)
 
     def _param(self, parent, label, values, default, row, col, command=None):
         ctk.CTkLabel(parent, text=label,
