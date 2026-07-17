@@ -323,9 +323,9 @@ class ScanApp(ctk.CTk):
                       command=self._show_history).grid(row=0, column=2, sticky="ew", padx=2)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
-                                       height=40,
-                                       font=ctk.CTkFont(size=15, weight="bold"),
-                                       corner_radius=8,
+                                       height=36,
+                                       font=ctk.CTkFont(size=13),
+                                       corner_radius=6,
                                        command=self._start_scan)
         self.scan_btn.grid(row=0, column=3, sticky="ew", padx=2)
 
