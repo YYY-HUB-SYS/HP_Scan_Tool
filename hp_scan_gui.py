@@ -1335,6 +1335,10 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.shadows = 0
         self.highlights = 0
 
+        # 逐页曝光覆盖：page_idx → {bri, con, gamma, shadows, highlights}
+        self._per_page_overrides = {}
+        self._per_page_mode = False  # 是否处于逐页编辑模式
+
         self._preview_photo = None
         self._thumb_photos = {}
 
@@ -1414,6 +1418,14 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
             variable=self.exp_var,
             command=self._on_mode, height=28,
         ).grid(row=0, column=1, columnspan=2, padx=8, pady=(8, 2), sticky="w")
+
+        self.per_page_btn = ctk.CTkButton(
+            ef, text="逐页编辑", width=70, height=26,
+            font=ctk.CTkFont(size=10),
+            fg_color=("gray75", "gray35"),
+            hover_color=("gray65", "gray45"),
+            command=self._toggle_per_page)
+        self.per_page_btn.grid(row=0, column=3, padx=8, pady=(8, 2), sticky="e")
 
         # 手动滑块行
         mf = ctk.CTkFrame(ef, fg_color="transparent")
@@ -1547,9 +1559,70 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 ).place(relx=1.0, rely=0.0, anchor="ne")
 
     def _select_page(self, idx):
+        # 切页前，如果在逐页模式，保存当前页的滑块状态
+        if self._per_page_mode and self.exp_mode == "手动":
+            self._save_current_as_override()
         self.selected_idx = idx
+        # 切页后，如果在逐页模式，加载该页的覆盖参数
+        if self._per_page_mode:
+            self._load_override_for_selected()
         self._refresh_thumbs()
         self._update_preview()
+
+    def _toggle_per_page(self):
+        """切换逐页编辑模式"""
+        self._per_page_mode = not self._per_page_mode
+        if self._per_page_mode:
+            self.per_page_btn.configure(fg_color=("#3B8ED0", "#1F6AA5"),
+                                         text_color="white")
+            # 确保手动模式
+            if self.exp_mode != "手动":
+                self.exp_var.set("手动")
+                self._on_mode("手动")
+            # 加载当前页的覆盖
+            self._load_override_for_selected()
+        else:
+            self.per_page_btn.configure(fg_color=("gray75", "gray35"),
+                                         text_color=("gray30", "gray80"))
+            # 恢复全局参数到滑块
+            self._sync_sliders_from_global()
+
+    def _save_current_as_override(self):
+        """将当前滑块状态保存为选中页的覆盖"""
+        idx = self.selected_idx
+        self._per_page_overrides[idx] = {
+            "bri": self.bri, "con": self.con,
+            "gamma": self.gamma, "shadows": self.shadows,
+            "highlights": self.highlights,
+        }
+
+    def _load_override_for_selected(self):
+        """加载选中页的覆盖参数到滑块（无覆盖则用全局）"""
+        idx = self.selected_idx
+        if idx in self._per_page_overrides:
+            ov = self._per_page_overrides[idx]
+            self.bri = ov["bri"]
+            self.con = ov["con"]
+            self.gamma = ov["gamma"]
+            self.shadows = ov["shadows"]
+            self.highlights = ov["highlights"]
+        else:
+            # 无覆盖，用全局值
+            pass  # 全局值已在 self.bri 等中
+        self._sync_sliders_from_global()
+
+    def _sync_sliders_from_global(self):
+        """将 self.bri/con/gamma/shadows/highlights 同步到滑块 UI"""
+        self.bri_s.set(self.bri)
+        self.bri_v.configure(text=str(self.bri))
+        self.con_s.set(self.con)
+        self.con_v.configure(text=str(self.con))
+        self.gam_s.set(self.gamma)
+        self.gam_v.configure(text=f"{self.gamma:.1f}")
+        self.shd_s.set(self.shadows)
+        self.shd_v.configure(text=str(self.shadows))
+        self.hgl_s.set(self.highlights)
+        self.hgl_v.configure(text=str(self.highlights))
 
     def _delete_page(self, idx):
         page_num = self.pages[idx]
@@ -1642,26 +1715,36 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
     def _on_bri(self, val):
         self.bri = int(val)
         self.bri_v.configure(text=str(self.bri))
+        if self._per_page_mode:
+            self._save_current_as_override()
         self._update_preview()
 
     def _on_con(self, val):
         self.con = int(val)
         self.con_v.configure(text=str(self.con))
+        if self._per_page_mode:
+            self._save_current_as_override()
         self._update_preview()
 
     def _on_gamma(self, val):
         self.gamma = round(float(val), 2)
         self.gam_v.configure(text=f"{self.gamma:.1f}")
+        if self._per_page_mode:
+            self._save_current_as_override()
         self._update_preview()
 
     def _on_shadows(self, val):
         self.shadows = int(val)
         self.shd_v.configure(text=str(self.shadows))
+        if self._per_page_mode:
+            self._save_current_as_override()
         self._update_preview()
 
     def _on_highlights(self, val):
         self.highlights = int(val)
         self.hgl_v.configure(text=str(self.highlights))
+        if self._per_page_mode:
+            self._save_current_as_override()
         self._update_preview()
 
     # ────────── 预览渲染 ──────────
@@ -1688,13 +1771,22 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
     # ────────── 保存 ──────────
-    def _process_page(self, page_num, mode):
-        """从缓存加载并应用曝光，返回 PIL Image"""
+    def _process_page(self, page_num, mode, page_idx=None):
+        """从缓存加载并应用曝光，返回 PIL Image。支持逐页覆盖。"""
         img = Image.open(self._cache_path(page_num))
+        # 检查是否有逐页覆盖
+        bri, con, gamma, shadows, highlights = self.bri, self.con, self.gamma, self.shadows, self.highlights
+        if page_idx is not None and page_idx in self._per_page_overrides:
+            ov = self._per_page_overrides[page_idx]
+            bri = ov["bri"]
+            con = ov["con"]
+            gamma = ov["gamma"]
+            shadows = ov["shadows"]
+            highlights = ov["highlights"]
         return apply_exposure(img, mode=mode,
-                              brightness=self.bri, contrast=self.con,
-                              gamma=self.gamma, shadows=self.shadows,
-                              highlights=self.highlights,
+                              brightness=bri, contrast=con,
+                              gamma=gamma, shadows=shadows,
+                              highlights=highlights,
                               mime=self.mime)
 
     def _confirm(self):
@@ -1722,7 +1814,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 for page_idx in group_indices:
                     page_num = self.pages[page_idx]
                     try:
-                        img = self._process_page(page_num, mode)
+                        img = self._process_page(page_num, mode, page_idx=page_idx)
                         pdf_images.append(img.convert("RGB"))
                     except Exception:
                         pass
@@ -1740,7 +1832,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 for seq, page_idx in enumerate(group_indices, 1):
                     page_num = self.pages[page_idx]
                     try:
-                        img = self._process_page(page_num, mode)
+                        img = self._process_page(page_num, mode, page_idx=page_idx)
                         if prefix:
                             fpath = f"{base_path}_{prefix}_{seq:03d}.{self.ext}"
                         else:
