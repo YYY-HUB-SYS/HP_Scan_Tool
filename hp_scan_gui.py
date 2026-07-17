@@ -20,11 +20,17 @@ import customtkinter as ctk
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
     get_scanner_status, execute_scan, execute_multipage_scan,
-    apply_exposure, ScannerInfo, FORMAT_MIME, MIME_EXT,
+    ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
+from exposure import apply_exposure
 from wsd_engine import discover_all_scanners
 import cache_manager
 import history_manager
+from scan_coordinator import (
+    ScanCoordinator, process_image_with_exposure, save_scan_result,
+    record_scan_history, cleanup_cache_job, compute_page_groups,
+    save_multipage_result, delete_cached_page, COLOR_MODE_MAP,
+)
 
 # ---------- 配置 ----------
 def _app_dir():
@@ -35,8 +41,6 @@ def _app_dir():
 
 CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
-
-COLOR_MODE_MAP = {"彩色": "RGB24", "灰度": "Grayscale8", "黑白": "BlackAndWhite1"}
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -73,11 +77,14 @@ class ScanApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.cfg = load_config()
+        # 业务逻辑层
+        self.coordinator = ScanCoordinator()
+        self.coordinator.load_config()
+        self.cfg = self.coordinator.cfg
 
         # 启动时清理过期缓存（防崩溃遗留）
         try:
-            cache_manager.cleanup_stale()
+            self.coordinator.cleanup_stale_cache()
         except Exception:
             pass
 
@@ -92,13 +99,8 @@ class ScanApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
-        self.scanners: list[ScannerInfo] = []
-        self._scanners_lock = threading.Lock()  # 保护 scanners 列表
         self.selected: ScannerInfo | None = None
-        self._active_scans = 0  # 并发扫描计数
-        self._scan_lock = threading.Lock()  # 保护计数器
         self.selected_idx: int = -1
-        self._scan_cancel = threading.Event()
 
         self.output_dir = self.cfg.get("output_dir", DEFAULT_OUT_DIR)
         self.resolution_val = self.cfg.get("resolution", 300)
@@ -354,7 +356,7 @@ class ScanApp(ctk.CTk):
 
     # ────────── 窗口关闭清理 ──────────
     def destroy(self):
-        self._scan_cancel.set()
+        self.coordinator.cancel_scan()
         if hasattr(self, 'progress'):
             try:
                 self.progress.stop()
@@ -380,7 +382,7 @@ class ScanApp(ctk.CTk):
             c.destroy()
         self.cards.clear()
 
-        for i, s in enumerate(self.scanners):
+        for i, s in enumerate(self.coordinator.scanners):
             card = ScannerCard(self.card_container, s, i, self)
             card.grid(row=i, column=0, sticky="ew", pady=3)
             self.cards.append(card)
@@ -390,7 +392,7 @@ class ScanApp(ctk.CTk):
             self.cards[self.selected_idx].set_selected(True)
 
         # 更新设备计数
-        n = len(self.scanners)
+        n = len(self.coordinator.scanners)
         self.device_count_lbl.configure(text=f"{n} 台" if n else "")
 
     # ────────── 发现 ──────────
@@ -410,18 +412,18 @@ class ScanApp(ctk.CTk):
             )
             si.escl_url = ""  # 启动时不同步探活，后台再补
             si.custom_name = nicknames.get(ip, "")
-            self.scanners.append(si)
+            self.coordinator.scanners.append(si)
 
         self._rebuild_cards()
-        if self.scanners:
-            self.status_bar.configure(text=f"已加载 {len(self.scanners)} 台历史打印机")
+        if self.coordinator.scanners:
+            self.status_bar.configure(text=f"已加载 {len(self.coordinator.scanners)} 台历史打印机")
             # 后台异步探活，不阻塞 UI
             threading.Thread(target=self._probe_saved, daemon=True).start()
 
     def _probe_saved(self):
         """后台逐台探活已加载的打印机（只读快照，结果回主线程原子替换）"""
         import copy
-        snapshot = list(self.scanners)  # 主线程已完成的快照，后台只读
+        snapshot = list(self.coordinator.scanners)  # 主线程已完成的快照，后台只读
         results = {}
         for s in snapshot:
             url = probe_escl(s.ip, port=s.port, timeout=3.0)
@@ -435,16 +437,16 @@ class ScanApp(ctk.CTk):
 
     def _apply_probe_results(self, results: dict):
         """主线程：原子应用探活结果"""
-        for i, s in enumerate(self.scanners):
+        for i, s in enumerate(self.coordinator.scanners):
             if s.ip in results:
-                self.scanners[i] = results[s.ip]
+                self.coordinator.scanners[i] = results[s.ip]
                 if self.selected and self.selected.ip == s.ip:
                     self.selected = results[s.ip]
 
     def _auto_discover(self):
         # 已有历史打印机则跳过自动搜索，直接加载
-        if self.scanners:
-            n = len(self.scanners)
+        if self.coordinator.scanners:
+            n = len(self.coordinator.scanners)
             self.status_bar.configure(
                 text=f"已加载 {n} 台历史打印机 — 单击选中后按「扫描」")
             return
@@ -458,8 +460,8 @@ class ScanApp(ctk.CTk):
 
     def _do_discover(self):
         discovered = discover_all_scanners(timeout=4.0)
-        with self._scanners_lock:
-            existing_ips = {s.ip for s in self.scanners if s.ip}  # 快照读取
+        with self.coordinator._scanners_lock:
+            existing_ips = {s.ip for s in self.coordinator.scanners if s.ip}  # 快照读取
         new_scanners = []
         new_count = 0
         for d in discovered:
@@ -471,9 +473,9 @@ class ScanApp(ctk.CTk):
                 existing_ips.add(d.ip)
                 new_count += 1
 
-        # 构建持久化数据（在后台线程完成，不回读 self.scanners）
-        with self._scanners_lock:
-            all_for_save = list(self.scanners) + new_scanners
+        # 构建持久化数据（在后台线程完成，不回读 self.coordinator.scanners）
+        with self.coordinator._scanners_lock:
+            all_for_save = list(self.coordinator.scanners) + new_scanners
         nicknames = self.cfg.get("nicknames", {})
         ips = []
         for s in all_for_save:
@@ -488,10 +490,10 @@ class ScanApp(ctk.CTk):
         self.after(0, lambda: self._on_discover_done(new_count, new_scanners))
 
     def _on_discover_done(self, new_count, new_scanners):
-        self.scanners.extend(new_scanners)  # 主线程写入，安全
+        self.coordinator.scanners.extend(new_scanners)  # 主线程写入，安全
         self._set_loading(False)
         self._rebuild_cards()
-        n = len(self.scanners)
+        n = len(self.coordinator.scanners)
         self.status_bar.configure(
             text=f"发现 {n} 台打印机 (+{new_count} 新增) — 单击选中后按「扫描」" if n
             else "未发现打印机，请确认电源和网络，或手动添加 IP")
@@ -524,8 +526,8 @@ class ScanApp(ctk.CTk):
 
     # ────────── 选择 ──────────
     def select_scanner(self, idx: int):
-        if 0 <= idx < len(self.scanners):
-            self.selected = self.scanners[idx]
+        if 0 <= idx < len(self.coordinator.scanners):
+            self.selected = self.coordinator.scanners[idx]
             self.selected_idx = idx
             self._update_source_options(self.selected.has_adf)
 
@@ -537,12 +539,12 @@ class ScanApp(ctk.CTk):
 
     # ────────── 自定义名称 ──────────
     def set_custom_name(self, idx: int, name: str):
-        if 0 <= idx < len(self.scanners):
-            self.scanners[idx].custom_name = name.strip() or ""
+        if 0 <= idx < len(self.coordinator.scanners):
+            self.coordinator.scanners[idx].custom_name = name.strip() or ""
             nicknames = self.cfg.get("nicknames", {})
-            ip = self.scanners[idx].ip
-            if self.scanners[idx].custom_name:
-                nicknames[ip] = self.scanners[idx].custom_name
+            ip = self.coordinator.scanners[idx].ip
+            if self.coordinator.scanners[idx].custom_name:
+                nicknames[ip] = self.coordinator.scanners[idx].custom_name
             else:
                 nicknames.pop(ip, None)
             self.cfg["nicknames"] = nicknames
@@ -550,7 +552,7 @@ class ScanApp(ctk.CTk):
 
             self._rebuild_cards()
             if self.selected_idx == idx:
-                label = _label_for(self.scanners[idx])
+                label = _label_for(self.coordinator.scanners[idx])
                 self.status_bar.configure(text=f"已选择: {label}")
 
     # ────────── 手动添加 ──────────
@@ -607,7 +609,7 @@ class ScanApp(ctk.CTk):
                 if url:
                     s = ScannerInfo(name="手动添加的打印机", ip=ip, port=port, escl_url=url)
                     s = fetch_capabilities(s, timeout=4.0)
-                    self.scanners.append(s)
+                    self.coordinator.scanners.append(s)
                     self._rebuild_cards()
                     self.status_bar.configure(text=f"已添加 {_label_for(s)}")
                     result_lbl.configure(text="成功 — eSCL 可用", text_color="#2a9d8f")
@@ -653,9 +655,9 @@ class ScanApp(ctk.CTk):
 
     def _apply_caps(self, s):
         """主线程：原子应用能力查询结果"""
-        for i, sc in enumerate(self.scanners):
+        for i, sc in enumerate(self.coordinator.scanners):
             if sc.ip == s.ip:
-                self.scanners[i] = s
+                self.coordinator.scanners[i] = s
                 break
         self._caps_done(s)
 
@@ -706,7 +708,7 @@ class ScanApp(ctk.CTk):
             messagebox.showwarning("提示", "请先选择一台打印机")
             return
 
-        self._scan_cancel.clear()  # 重置取消标志
+        self.coordinator._scan_cancel.clear()  # 重置取消标志
         if not self.selected.escl_url:
             messagebox.showinfo("提示",
                 "该打印机未探测到 eSCL，将尝试 WIA 扫描。\n如失败请确认打印机已连接并安装驱动。")
@@ -752,9 +754,7 @@ class ScanApp(ctk.CTk):
         save_config(self.cfg)
 
         # 增加活跃扫描计数
-        with self._scan_lock:
-            self._active_scans += 1
-            count = self._active_scans
+        count = self.coordinator.begin_scan()
         self.scan_btn.configure(text=f"扫描中 ({count})...")
         self.status_bar.configure(text=f"活跃扫描任务: {count}")
 
@@ -765,7 +765,7 @@ class ScanApp(ctk.CTk):
     def _do_capture(self, scanner, output_path, source_val):
         """扫描到内存，然后弹出预览对话框"""
         try:
-            if self._scan_cancel.is_set():
+            if self.coordinator.is_cancelled():
                 self.after(0, lambda: self._reset_scan_ui())
                 return
 
@@ -817,7 +817,7 @@ class ScanApp(ctk.CTk):
                 if len(pages) > 1:
                     self.after(0, lambda s=scanner: self._show_multi_preview(job_id, ext, output_path, len(pages), scanner=s))
                 else:
-                    cache_path = cache_manager.job_dir(job_id) + f"/page_001.{ext}"
+                    cache_path = cache_manager._job_dir(job_id) + f"/page_001.{ext}"
                     self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, output_path, job_id, scanner=s))
             else:
                 # 单页平板扫描
@@ -845,9 +845,7 @@ class ScanApp(ctk.CTk):
                 pass
 
         scanner = self.selected
-        with self._scan_lock:
-            self._active_scans += 1
-            count = self._active_scans
+        count = self.coordinator.begin_scan()
         self.scan_btn.configure(text=f"扫描中 ({count})...")
         self.status_bar.configure(text=f"活跃扫描任务: {count}")
 
@@ -876,9 +874,7 @@ class ScanApp(ctk.CTk):
 
     def _reset_scan_ui(self):
         """完成一个扫描任务后调用，递减计数"""
-        with self._scan_lock:
-            self._active_scans = max(0, self._active_scans - 1)
-            count = self._active_scans
+        count = self.coordinator.end_scan()
         if count == 0:
             self.scan_btn.configure(text="扫描", state="normal")
             self._set_loading(False)
@@ -887,8 +883,7 @@ class ScanApp(ctk.CTk):
 
     def _scan_error(self, msg):
         self._reset_scan_ui()
-        with self._scan_lock:
-            count = self._active_scans
+        count = self.coordinator.active_scan_count()
         self.status_bar.configure(text=f"扫描失败 (活跃任务: {count})")
         messagebox.showerror("扫描失败", f"{msg}\n\n如果 eSCL 不通，请确认:\n"
                             "1. 打印机已启用 eSCL/AirScan\n"
@@ -897,8 +892,7 @@ class ScanApp(ctk.CTk):
 
     def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         self._reset_scan_ui()
-        with self._scan_lock:
-            count = self._active_scans
+        count = self.coordinator.active_scan_count()
         self.status_bar.configure(text=f"扫描完成 — 调整曝光效果后点击保存 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
@@ -907,8 +901,7 @@ class ScanApp(ctk.CTk):
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
         self._reset_scan_ui()
-        with self._scan_lock:
-            count = self._active_scans
+        count = self.coordinator.active_scan_count()
         self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
@@ -1355,7 +1348,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _cache_path(self, page_num):
-        return os.path.join(cache_manager.job_dir(self.job_id),
+        return os.path.join(cache_manager._job_dir(self.job_id),
                             f"page_{page_num:03d}.{self.ext}")
 
     def _build(self):

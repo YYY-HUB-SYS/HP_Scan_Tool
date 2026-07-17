@@ -74,20 +74,20 @@ class TestRemoveJob:
 
 class TestCacheSize:
     def test_empty_cache_is_zero(self, isolated_cache):
-        assert cache_manager.cache_size_bytes() == 0
+        assert cache_manager._cache_size_bytes() == 0
 
     def test_reflects_written_data(self, isolated_cache):
         cache_manager.write_page("job1", 1, b"x" * 100, "jpg")
-        assert cache_manager.cache_size_bytes() == 100
+        assert cache_manager._cache_size_bytes() == 100
 
     def test_mb_conversion(self, isolated_cache):
         cache_manager.write_page("job1", 1, b"x" * 1048576, "jpg")
-        assert cache_manager.cache_size_mb() == 1.0
+        assert cache_manager._cache_size_mb() == 1.0
 
     def test_size_decreases_after_remove(self, isolated_cache):
         cache_manager.write_page("job1", 1, b"x" * 100, "jpg")
         cache_manager.remove_job("job1")
-        assert cache_manager.cache_size_bytes() == 0
+        assert cache_manager._cache_size_bytes() == 0
 
 
 # ── 活跃任务保护 ──────────────────────────────────────────

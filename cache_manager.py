@@ -95,7 +95,7 @@ def save_cache_config(cfg: dict):
         logger.debug("缓存配置保存失败: %s", e)
 
 
-def cache_root() -> str:
+def _cache_root() -> str:
     """获取缓存根目录（从配置读取，不存在则创建）"""
     cfg = load_cache_config()
     root = cfg.get("cache_root", _default_cache_root())
@@ -103,9 +103,9 @@ def cache_root() -> str:
     return root
 
 
-def job_dir(job_id: str) -> str:
+def _job_dir(job_id: str) -> str:
     """获取指定 job 的缓存目录（不存在则创建）"""
-    d = os.path.join(cache_root(), job_id)
+    d = os.path.join(_cache_root(), job_id)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -135,7 +135,7 @@ def write_page(job_id: str, page_num: int, data: bytes, ext: str) -> str:
     with _lock:
         _maybe_evict_locked()
 
-    d = job_dir(job_id)
+    d = _job_dir(job_id)
     path = os.path.join(d, f"page_{page_num:03d}.{ext}")
     with open(path, "wb") as f:
         f.write(data)
@@ -146,7 +146,7 @@ def write_page(job_id: str, page_num: int, data: bytes, ext: str) -> str:
 
 def read_page(job_id: str, page_num: int, ext: str) -> bytes:
     """从缓存读取指定页的数据"""
-    d = os.path.join(cache_root(), job_id)
+    d = os.path.join(_cache_root(), job_id)
     path = os.path.join(d, f"page_{page_num:03d}.{ext}")
     with open(path, "rb") as f:
         return f.read()
@@ -157,7 +157,7 @@ def list_pages(job_id: str) -> list[tuple[int, str, str]]:
     列出指定 job 的所有缓存页。
     返回 [(page_num, ext, path), ...] 按页码排序。
     """
-    d = os.path.join(cache_root(), job_id)
+    d = os.path.join(_cache_root(), job_id)
     if not os.path.isdir(d):
         return []
 
@@ -177,16 +177,16 @@ def list_pages(job_id: str) -> list[tuple[int, str, str]]:
 def remove_job(job_id: str):
     """删除指定 job 的全部缓存"""
     with _lock:
-        d = os.path.join(cache_root(), job_id)
+        d = os.path.join(_cache_root(), job_id)
         if os.path.isdir(d):
             shutil.rmtree(d, ignore_errors=True)
             logger.debug("缓存清除: %s", d)
         _active_jobs.discard(job_id)
 
 
-def cache_size_bytes() -> int:
+def _cache_size_bytes() -> int:
     """计算当前缓存总大小（字节）"""
-    root = cache_root()
+    root = _cache_root()
     total = 0
     for dirpath, _, filenames in os.walk(root):
         for f in filenames:
@@ -198,9 +198,9 @@ def cache_size_bytes() -> int:
     return total
 
 
-def cache_size_mb() -> float:
+def _cache_size_mb() -> float:
     """当前缓存大小（MB）"""
-    return cache_size_bytes() / (1024 * 1024)
+    return _cache_size_bytes() / (1024 * 1024)
 
 
 # ── 清理逻辑（内部，调用者须持有 _lock）──
@@ -212,7 +212,7 @@ def _maybe_evict_locked():
     trigger_bytes = limit_bytes * cfg["trigger_ratio"]
     cleanup_bytes = cfg["cleanup_mb"] * 1024 * 1024
 
-    current = cache_size_bytes()
+    current = _cache_size_bytes()
     if current < trigger_bytes:
         return
 
@@ -227,7 +227,7 @@ def _evict_oldest_jobs_locked(target_bytes: int):
     活跃任务（_active_jobs 中注册的）受保护不被清理。
     调用者须持有 _lock。
     """
-    root = cache_root()
+    root = _cache_root()
     jobs = []
 
     for entry in os.listdir(root):
@@ -268,7 +268,7 @@ def cleanup_stale():
     """启动时清理超过 stale_hours 的残留缓存（防崩溃遗留）"""
     cfg = load_cache_config()
     stale_seconds = cfg["stale_hours"] * 3600
-    root = cache_root()
+    root = _cache_root()
     now = time.time()
 
     for entry in os.listdir(root):

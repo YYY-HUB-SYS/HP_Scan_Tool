@@ -65,7 +65,8 @@ def cmd_scan(args):
     exposure_mode = getattr(args, "exposure", "off")
     if exposure_mode != "off":
         from PIL import Image as PILImage
-        from escl_engine import apply_exposure, FORMAT_MIME
+        from exposure import apply_exposure
+        from escl_engine import FORMAT_MIME
         mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
         img = PILImage.open(io.BytesIO(data))
         img = apply_exposure(img, mode=exposure_mode, mime=mime)
