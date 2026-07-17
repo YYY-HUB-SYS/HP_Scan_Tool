@@ -215,7 +215,7 @@ def cmd_history(args):
     return 0
 
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hp_scan",
         description="惠普集成扫描工具 v3.3 — CLI 模式",
@@ -256,6 +256,11 @@ def main():
     p_history.add_argument("--format", default="text", choices=["json", "text"],
                            help="输出格式 (默认 text)")
 
+    return parser
+
+
+def main():
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.command is None:
