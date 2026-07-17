@@ -77,6 +77,11 @@ class ScanApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        # 全局字体：使用 ClearType 优化的中文字体，消除模糊
+        # CTkFont 默认 Roboto 在本机未安装，回退到系统字体导致渲染模糊
+        self.option_add("*Font", "Microsoft YaHei UI 13")
+        ctk.ThemeManager.theme["CTkFont"]["family"] = "Microsoft YaHei UI"
+
         # 业务逻辑层
         self.coordinator = ScanCoordinator()
         self.coordinator.load_config()
