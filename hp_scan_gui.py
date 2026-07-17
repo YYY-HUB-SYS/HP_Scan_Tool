@@ -255,22 +255,23 @@ class ScanApp(ctk.CTk):
         right.grid(row=0, column=1, sticky="nsew")
         right.grid_columnconfigure(0, weight=1)
 
-        # 状态条
+        # 状态条（低调显示，不抢视觉焦点）
         self.status_bar = ctk.CTkLabel(
             right, text="就绪 — 正在搜索打印机...",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            fg_color=("gray90", "gray17"),
-            corner_radius=8, anchor="w", padx=12, pady=8)
-        self.status_bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            text_color=("gray35", "gray70"),
+            anchor="w", padx=4, pady=2)
+        self.status_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(8, 2))
 
         # 参数区标题
         ctk.CTkLabel(right, text="扫描参数",
                      font=ctk.CTkFont(size=12, weight="bold")).grid(
-            row=1, column=0, sticky="w", padx=12, pady=(4, 0))
+            row=1, column=0, sticky="w", padx=12, pady=(8, 4))
 
-        # 参数区
+        # 参数区（卡片式包裹，紧凑布局）
         params = ctk.CTkFrame(right)
-        params.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        params.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
         params.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self._param(params, "分辨率", ["75", "150", "200", "300", "600", "1200"],
@@ -336,30 +337,33 @@ class ScanApp(ctk.CTk):
         # 初始滑块状态
         self._set_manual_sliders(self.exposure_mode == "手动")
 
-        # 保存目录
-        save_row = ctk.CTkFrame(right, fg_color="transparent")
-        save_row.grid(row=4, column=0, sticky="ew", padx=10, pady=6)
+        # 保存目录（卡片式，与参数区视觉分隔）
+        save_row = ctk.CTkFrame(right)
+        save_row.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 8))
         ctk.CTkLabel(save_row, text="保存到",
-                     font=ctk.CTkFont(size=12)).pack(side="left")
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 6))
         self.dir_entry = ctk.CTkEntry(save_row)
-        self.dir_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self.dir_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
         self.dir_entry.insert(0, self.output_dir)
-        ctk.CTkButton(save_row, text="浏览", width=56, height=28,
+        ctk.CTkButton(save_row, text="浏览", width=50, height=28,
+                      font=ctk.CTkFont(size=11),
                       fg_color="transparent", border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
-                      command=self._browse).pack(side="left")
+                      hover_color=("gray82", "gray25"),
+                      command=self._browse).pack(side="right", padx=(0, 8))
 
-        # 操作按钮行（网格布局，等比例自适应窗口宽度）
+        # 操作按钮行（扫描为主操作，占更多宽度）
         action = ctk.CTkFrame(right, fg_color="transparent")
-        action.grid(row=5, column=0, sticky="ew", padx=10, pady=(8, 10))
+        action.grid(row=5, column=0, sticky="ew", padx=12, pady=(4, 12))
         action.grid_columnconfigure(0, weight=1)
         action.grid_columnconfigure(1, weight=1)
         action.grid_columnconfigure(2, weight=1)
-        action.grid_columnconfigure(3, weight=2)  # 扫描按钮占 2 份宽度
+        action.grid_columnconfigure(3, weight=3)  # 扫描按钮占 3 份宽度，视觉主导
 
         self.caps_btn = ctk.CTkButton(action, text="查询能力",
-                                       height=36, border_width=1,
+                                       height=32, border_width=1,
+                                       font=ctk.CTkFont(size=11),
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
@@ -368,7 +372,8 @@ class ScanApp(ctk.CTk):
         self.caps_btn.grid(row=0, column=0, sticky="ew", padx=2)
 
         self.stat_btn = ctk.CTkButton(action, text="预览状态",
-                                       height=36, border_width=1,
+                                       height=32, border_width=1,
+                                       font=ctk.CTkFont(size=11),
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
@@ -377,7 +382,8 @@ class ScanApp(ctk.CTk):
         self.stat_btn.grid(row=0, column=1, sticky="ew", padx=2)
 
         ctk.CTkButton(action, text="扫描历史",
-                      height=36, border_width=1,
+                      height=32, border_width=1,
+                      font=ctk.CTkFont(size=11),
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       fg_color="transparent",
@@ -385,18 +391,18 @@ class ScanApp(ctk.CTk):
                       command=self._show_history).grid(row=0, column=2, sticky="ew", padx=2)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
-                                       height=36,
-                                       font=ctk.CTkFont(size=13),
+                                       height=38,
+                                       font=ctk.CTkFont(size=14, weight="bold"),
                                        corner_radius=6,
                                        command=self._start_scan)
         self.scan_btn.grid(row=0, column=3, sticky="ew", padx=2)
 
     def _param(self, parent, label, values, default, row, col, command=None):
         ctk.CTkLabel(parent, text=label,
-                     font=ctk.CTkFont(size=12)).grid(row=0, column=col, padx=8, pady=(10, 0), sticky="w")
-        cb = ctk.CTkComboBox(parent, values=values, state="readonly", width=110, command=command)
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=col, padx=8, pady=(8, 0), sticky="w")
+        cb = ctk.CTkComboBox(parent, values=values, state="readonly", width=100, command=command)
         cb.set(default)
-        cb.grid(row=1, column=col, padx=8, pady=(2, 10))
+        cb.grid(row=1, column=col, padx=8, pady=(2, 8))
 
     # ────────── 曝光控制 ──────────
     def _on_exposure_mode(self, value):
