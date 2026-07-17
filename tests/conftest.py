@@ -41,9 +41,10 @@ def tmp_config_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(history_manager, "_history_file",
                         lambda: str(config_dir / "history.json"))
 
-    # 重置 cache_manager 的配置缓存
+    # 重置 cache_manager 的配置缓存和 history_manager 的路径缓存
     monkeypatch.setattr(cache_manager, "_config_cache", None)
     monkeypatch.setattr(cache_manager, "_config_cache_time", 0)
+    monkeypatch.setattr(history_manager, "HISTORY_FILE", None)
 
     return str(config_dir)
 

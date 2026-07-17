@@ -319,7 +319,7 @@ class ScanApp(ctk.CTk):
                       command=self._show_history).pack(side="left", padx=3)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
-                                       height=40, width=160,
+                                       height=40, width=180,
                                        font=ctk.CTkFont(size=15, weight="bold"),
                                        corner_radius=8,
                                        command=self._start_scan)
@@ -1888,13 +1888,26 @@ class ScannerCard(ctk.CTkFrame):
     def _build(self):
         s = self.scanner
 
-        # 名称行
+        # 名称行 + 重命名按钮
+        name_frame = ctk.CTkFrame(self, fg_color="transparent")
+        name_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 0))
+        name_frame.grid_columnconfigure(0, weight=1)
+
         name_text = _label_for(s)
         self.name_lbl = ctk.CTkLabel(
-            self, text=name_text,
+            name_frame, text=name_text,
             font=ctk.CTkFont(size=13, weight="bold"),
-            anchor="w", wraplength=260)
-        self.name_lbl.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+            anchor="w", wraplength=220)
+        self.name_lbl.grid(row=0, column=0, sticky="w")
+
+        self.rename_btn = ctk.CTkButton(
+            name_frame, text="✏", width=28, height=24,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            text_color=("gray45", "gray65"),
+            hover_color=("gray80", "gray30"),
+            command=self._show_rename_popup)
+        self.rename_btn.grid(row=0, column=1, padx=(4, 0))
 
         # 信息行
         info_parts = [f"IP {s.ip}"]
@@ -1984,7 +1997,7 @@ class ScannerCard(ctk.CTkFrame):
         pop.title("重命名")
         pop.geometry("320x150")
         pop.resizable(False, False)
-        pop.transient(self)
+        pop.transient(self.app)
         pop.grab_set()
 
         ctk.CTkLabel(pop, text="自定义打印机名称",
@@ -2008,6 +2021,15 @@ class ScannerCard(ctk.CTkFrame):
             pop.destroy()
 
         ctk.CTkButton(pop, text="确认", command=confirm).pack(pady=4)
+
+        # 居中到主窗口
+        pop.update_idletasks()
+        pw = self.app.winfo_width()
+        ph = self.app.winfo_height()
+        px = self.app.winfo_x()
+        py = self.app.winfo_y()
+        pop.geometry(f"+{px + (pw - 320) // 2}+{py + (ph - 150) // 2}")
+
         entry.focus_set()
         entry.bind("<Return>", lambda e: confirm())
 
