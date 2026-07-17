@@ -33,11 +33,11 @@ from scan_coordinator import (
 )
 
 # ---------- 嵌入式字体加载 ----------
-_FONT_FAMILY = "Noto Sans SC"
+_FONT_FAMILY = "Microsoft YaHei UI"
 _FONT_SIZE = 13
 
 def _load_embedded_font():
-    """加载打包的思源黑体（Noto Sans SC），解决系统字体渲染模糊问题"""
+    """加载打包的思源黑体作为备选字体（主字体为系统 Microsoft YaHei UI）"""
     import ctypes
 
     # 定位字体文件路径（兼容 PyInstaller 单文件 EXE 与开发环境）
