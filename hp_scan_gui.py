@@ -98,6 +98,25 @@ def _label_for(s: ScannerInfo) -> str:
     return s.display_name
 
 
+# ---------- ClearType 渲染修复 ----------
+# CustomTkinter 默认使用负数字号（像素尺寸），Windows 下会禁用 ClearType 子像素渲染，
+# 退化为灰阶抗锯齿，导致文字发糊。改为正数（点尺寸）以启用 ClearType。
+def _patch_ctk_font_scaling():
+    """修补 CustomTkinter 字号符号，启用 ClearType 子像素渲染"""
+    from customtkinter.windows.widgets.core_widget_classes import CTkBaseClass
+
+    original = CTkBaseClass._apply_font_scaling
+
+    def _patched(self, font):
+        result = original(self, font)
+        # 将负数（像素尺寸）翻转为正数（点尺寸），启用 ClearType
+        if isinstance(result, tuple) and len(result) >= 2 and isinstance(result[1], int) and result[1] < 0:
+            result = (result[0], abs(result[1])) + tuple(result[2:])
+        return result
+
+    CTkBaseClass._apply_font_scaling = _patched
+
+
 # ================================================
 #  主窗口
 # ================================================
@@ -108,6 +127,9 @@ class ScanApp(ctk.CTk):
 
         # 加载嵌入式思源黑体（仅本进程生效，不污染系统字体）
         _load_embedded_font()
+
+        # 修补 CustomTkinter 字号符号，启用 ClearType 子像素渲染
+        _patch_ctk_font_scaling()
 
         # 全局字体：使用 ClearType 优化的中文字体，消除模糊
         # CTkFont 默认 Roboto 在本机未安装，回退到系统字体导致渲染模糊
