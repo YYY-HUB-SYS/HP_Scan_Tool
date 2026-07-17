@@ -919,7 +919,7 @@ class ScanApp(ctk.CTk):
 class PreviewDialog(ctk.CTkToplevel):
     """扫描后预览：实时调整曝光效果，确认后保存"""
 
-    PW, PH = 420, 320  # 预览区域尺寸
+    PW, PH = 420, 320  # 预览区域最大尺寸
     HW, HH = 420, 80   # 直方图尺寸
 
     def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str,
@@ -927,7 +927,8 @@ class PreviewDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.title("扫描预览 — 调整曝光效果")
         self.geometry("540x820")
-        self.resizable(False, False)
+        self.minsize(460, 600)
+        self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
 
@@ -963,14 +964,17 @@ class PreviewDialog(ctk.CTkToplevel):
 
     # ────────── 构建 UI ──────────
     def _build(self):
-        # 图片预览区
+        # 图片预览区（可伸缩）
         pf = ctk.CTkFrame(self)
-        pf.pack(fill="x", padx=14, pady=(14, 6))
+        pf.pack(fill="both", expand=True, padx=14, pady=(14, 6))
         self.img_lbl = ctk.CTkLabel(pf, text="正在加载预览...",
-                                    width=self.PW, height=self.PH,
                                     fg_color=("gray85", "gray25"),
                                     corner_radius=6)
-        self.img_lbl.pack(padx=6, pady=6)
+        self.img_lbl.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # 窗口大小变化时重新渲染预览
+        self.bind("<Configure>", self._on_resize)
+        self._last_size = (0, 0)
 
         # 直方图区域
         from tkinter import Canvas
@@ -1176,6 +1180,23 @@ class PreviewDialog(ctk.CTkToplevel):
         self._preset_combo.set(name)
 
     # ────────── 预览渲染 ──────────
+
+    def _on_resize(self, event=None):
+        """窗口大小变化时重新渲染预览（避免频繁触发）"""
+        if event is None:
+            return
+        w, h = event.width, event.height
+        if abs(w - self._last_size[0]) < 30 and abs(h - self._last_size[1]) < 30:
+            return
+        self._last_size = (w, h)
+        self._update_preview()
+
+    def _preview_size(self):
+        """根据当前窗口大小计算预览图最大尺寸"""
+        w = max(200, self.winfo_width() - 60)
+        h = max(150, self.winfo_height() - 380)
+        return (w, h)
+
     def _update_preview(self):
         """根据当前曝光设置实时刷新预览图（从缓存文件加载，无 bytes 往返）"""
         try:
@@ -1194,8 +1215,8 @@ class PreviewDialog(ctk.CTkToplevel):
             # 更新直方图（在缩放前，用全分辨率数据）
             self._update_histogram(img)
 
-            # 缩放到预览尺寸
-            img.thumbnail((self.PW, self.PH), Image.LANCZOS)
+            # 缩放到预览尺寸（根据窗口大小动态计算）
+            img.thumbnail(self._preview_size(), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo
             self.img_lbl.configure(image=photo, text="")
@@ -1301,7 +1322,8 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         super().__init__(parent)
         self.title(f"扫描预览 — {page_count} 页")
         self.geometry("600x900")
-        self.resizable(False, False)
+        self.minsize(500, 700)
+        self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
 
@@ -1352,14 +1374,17 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                             f"page_{page_num:03d}.{self.ext}")
 
     def _build(self):
-        # 主预览区
+        # 主预览区（可伸缩）
         pf = ctk.CTkFrame(self)
-        pf.pack(fill="x", padx=14, pady=(14, 4))
+        pf.pack(fill="both", expand=True, padx=14, pady=(14, 4))
         self.img_lbl = ctk.CTkLabel(pf, text="加载中...",
-                                    width=self.PW, height=self.PH,
                                     fg_color=("gray85", "gray25"),
                                     corner_radius=6)
-        self.img_lbl.pack(padx=6, pady=6)
+        self.img_lbl.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # 窗口大小变化时重新渲染预览
+        self.bind("<Configure>", self._on_resize)
+        self._last_size = (0, 0)
 
         self.page_info_lbl = ctk.CTkLabel(pf, text="",
                                            font=ctk.CTkFont(size=11),
@@ -1741,6 +1766,22 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self._update_preview()
 
     # ────────── 预览渲染 ──────────
+    def _on_resize(self, event=None):
+        """窗口大小变化时重新渲染预览（避免频繁触发）"""
+        if event is None:
+            return
+        w, h = event.width, event.height
+        if abs(w - self._last_size[0]) < 30 and abs(h - self._last_size[1]) < 30:
+            return
+        self._last_size = (w, h)
+        self._update_preview()
+
+    def _preview_size(self):
+        """根据当前窗口大小计算预览图最大尺寸"""
+        w = max(200, self.winfo_width() - 60)
+        h = max(150, self.winfo_height() - 480)
+        return (w, h)
+
     def _update_preview(self):
         try:
             page_num = self.pages[self.selected_idx]
@@ -1754,7 +1795,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                                  highlights=self.highlights,
                                  mime=self.mime)
 
-            img.thumbnail((self.PW, self.PH), Image.LANCZOS)
+            img.thumbnail(self._preview_size(), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo
             self.img_lbl.configure(image=photo, text="")

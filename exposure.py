@@ -69,8 +69,12 @@ def apply_exposure(img: Image.Image, mode: str = "off",
     处理顺序: channel_gains → shadows/highlights → gamma → brightness/contrast → auto stretch
     直接操作 PIL Image 对象，避免 bytes 序列化往返。
     """
-    if mode == "off" or img.mode not in ("RGB", "L"):
+    if mode == "off":
         return img
+
+    # 确保图像模式为 RGB 或 L（扫描仪可能产出 P/PA 等非标准模式）
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
 
     # auto 模式：只做直方图拉伸
     if mode == "auto":
