@@ -5,7 +5,6 @@ Phase 1: 仅发现，复用 escl_engine.probe_escl 获取 eSCL URL
 """
 
 import logging
-import re
 from typing import Optional
 from urllib.parse import urlparse
 

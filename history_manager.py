@@ -5,6 +5,7 @@
 
 import json
 import os
+import sys
 import threading
 from datetime import datetime
 
@@ -14,7 +15,6 @@ _app_dir = None
 def _get_app_dir():
     global _app_dir
     if _app_dir is None:
-        import sys
         if getattr(sys, 'frozen', False):
             _app_dir = os.path.dirname(sys.executable)
         else:

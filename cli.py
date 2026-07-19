@@ -5,7 +5,6 @@ CLI 命令行模式 — argparse 子命令入口
 """
 
 import argparse
-import io
 import json
 import os
 import sys
@@ -16,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
-    get_scanner_status, execute_scan, ScannerInfo, FORMAT_MIME,
+    get_scanner_status, execute_scan, ScannerInfo,
 )
 from wsd_engine import discover_all_scanners
 import history_manager

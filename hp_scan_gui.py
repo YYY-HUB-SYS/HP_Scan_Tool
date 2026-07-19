@@ -1,14 +1,20 @@
 """
 惠普集成扫描工具 v3.3 — CustomTkinter 重写版
-功能: 磁盘缓存 / 并发扫描 / 多页ADF / 曝光增强(直方图+预设) / WSD发现 / CLI
+功能: 磁盘缓存 / 并发扫描 / 多页ADF / WSD发现 / CLI
 """
 
+import copy
+import ctypes
 import io
 import json
+import logging
 import os
+import shutil
 import sys
 import threading
 import traceback
+import tkinter as tk
+import tkinter.ttk as ttk
 from datetime import datetime
 from tkinter import filedialog, messagebox
 
@@ -46,8 +52,6 @@ _FONT_SIZE = 13
 
 def _load_embedded_font():
     """加载打包的思源黑体作为备选字体（主字体为系统 Microsoft YaHei UI）"""
-    import ctypes
-
     font_path = get_resource_path(os.path.join("fonts", "NotoSansSC-Regular.ttf"))
     if not os.path.isfile(font_path):
         return  # 字体文件不存在，回退到系统字体
@@ -132,7 +136,6 @@ class ScanApp(ctk.CTk):
         self.minsize(720, 500)
         # ★ 设置窗口图标：用 iconphoto + PNG（比 iconbitmap + ICO 更清晰）
         try:
-            import tkinter as tk
             _icon32 = get_resource_path("icon_32.png")
             _icon64 = get_resource_path("icon_64.png")
             _photo32 = tk.PhotoImage(file=_icon32)
@@ -149,7 +152,6 @@ class ScanApp(ctk.CTk):
             except Exception:
                 pass
 
-        saved_theme = self.cfg if hasattr(self, '_cfg_pre') else {}
         # 先读配置决定主题（在 build 之前）
         _pre_cfg = load_config()
         ctk.set_appearance_mode(_pre_cfg.get("theme", "dark"))
@@ -419,7 +421,6 @@ class ScanApp(ctk.CTk):
     def _set_taskbar_icon(self):
         """用 Windows API 设置任务栏图标（精确尺寸，避免缩放模糊）"""
         try:
-            import ctypes
             # 获取窗口句柄（需要 GetParent 获取真正的顶层窗口）
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
             if not hwnd:
@@ -488,7 +489,6 @@ class ScanApp(ctk.CTk):
 
     def _probe_saved(self):
         """后台逐台探活已加载的打印机（只读快照，结果回主线程原子替换）"""
-        import copy
         snapshot = list(self.coordinator.scanners)  # 主线程已完成的快照，后台只读
         results = {}
         for s in snapshot:
@@ -898,7 +898,6 @@ class ScanApp(ctk.CTk):
                         self.after(0, lambda: self.status_bar.configure(
                             text="输稿器为空，自动切换为平板扫描"))
                 except Exception as e:
-                    import logging
                     logging.debug("ADF 状态检测失败，保持手动选择: %s", e)
 
             self.after(0, lambda: self.status_bar.configure(text="正在扫描..."))
@@ -1058,7 +1057,6 @@ class PreviewDialog(ctk.CTkToplevel):
         self.resizable(True, True)
         self.transient(parent)
         try:
-            import tkinter as tk
             _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
             self.iconphoto(True, _p)
             self._icon_photo = _p
@@ -1166,7 +1164,6 @@ class PreviewDialog(ctk.CTkToplevel):
             saved = pdf_path
         else:
             # 直接复制缓存文件（避免重新编码损失质量）
-            import shutil
             final = save_path
             if not final.lower().endswith(f".{out_ext}"):
                 final = f"{final.rsplit('.', 1)[0]}.{out_ext}"
@@ -1221,7 +1218,6 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.resizable(True, True)
         self.transient(parent)
         try:
-            import tkinter as tk
             _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
             self.iconphoto(True, _p)
             self._icon_photo = _p
@@ -1553,7 +1549,6 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                         else:
                             fpath = f"{base_path}_{seq:03d}.{out_ext}"
                         if out_ext in ("jpg", "jpeg"):
-                            import shutil
                             shutil.copy2(cache_file, fpath)
                         else:
                             img = Image.open(cache_file)
@@ -1797,7 +1792,6 @@ class HistoryDialog(ctk.CTkToplevel):
         self.transient(parent)
         self.grab_set()
         try:
-            import tkinter as tk
             _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
             self.iconphoto(True, _p)
             self._icon_photo = _p
@@ -1826,7 +1820,6 @@ class HistoryDialog(ctk.CTkToplevel):
         list_frame.pack(fill="both", expand=True, padx=14, pady=4)
 
         # 使用 Treeview 显示列表
-        import tkinter.ttk as ttk
         columns = ("time", "device", "pages", "format", "path")
         self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=15)
         self.tree.heading("time", text="时间")
@@ -1916,8 +1909,6 @@ class HistoryDialog(ctk.CTkToplevel):
 # ================================================
 
 def main():
-    import ctypes
-    
     # ★ 高 DPI 感知：防止 Windows 对窗口图标做位图拉伸导致模糊
     # 这是任务栏图标模糊的根本原因（CPython issue #119174）
     try:

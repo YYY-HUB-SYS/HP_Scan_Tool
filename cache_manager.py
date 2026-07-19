@@ -46,10 +46,16 @@ _config_cache_time: float = 0
 _CONFIG_CACHE_TTL = 5.0  # 5 秒内复用
 
 
+def _app_dir():
+    """应用目录（PyInstaller 兼容）"""
+    if getattr(os.sys, 'frozen', False):
+        return os.path.dirname(os.sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _cache_config_path():
     """缓存配置文件路径（与 scan_config.json 同级）"""
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(app_dir, "cache_config.json")
+    return os.path.join(_app_dir(), "cache_config.json")
 
 
 def _default_cache_root():

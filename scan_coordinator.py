@@ -10,7 +10,6 @@ import json
 import logging
 import os
 import threading
-import traceback
 from datetime import datetime
 
 import cache_manager
@@ -18,7 +17,7 @@ import history_manager
 from escl_engine import (
     probe_escl, fetch_capabilities,
     get_scanner_status, execute_scan, execute_multipage_scan,
-    ScannerInfo, FORMAT_MIME,
+    ScannerInfo,
 )
 from wsd_engine import discover_all_scanners
 
