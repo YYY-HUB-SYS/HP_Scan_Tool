@@ -443,6 +443,7 @@ def execute_scan(
     source: str = "Platen",
     duplex: bool = False,
     timeout: float = 120.0,
+    cancel_event=None,
 ) -> tuple[bytes, str]:
     """
     执行一次完整扫描，返回 (数据, 实际扩展名)。
@@ -461,6 +462,10 @@ def execute_scan(
         start = time.time()
         nd_url = job_uri.rstrip("/") + "/NextDocument"
         while time.time() - start < timeout:
+            # 检查取消
+            if cancel_event and cancel_event.is_set():
+                return None, ext
+
             try:
                 r = session.get(nd_url, timeout=10)
                 if r.status_code == 200:
@@ -469,7 +474,12 @@ def execute_scan(
                     pass  # 扫描进行中
             except requests.RequestException:
                 pass
-            time.sleep(0.5)
+
+            # 分段睡眠以便及时响应取消
+            for _ in range(5):
+                if cancel_event and cancel_event.is_set():
+                    return None, ext
+                time.sleep(0.1)
 
         raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
     finally:
@@ -486,6 +496,7 @@ def execute_multipage_scan(
     timeout: float = 300.0,
     page_timeout: float = 60.0,
     progress_callback=None,
+    cancel_event=None,
 ) -> list[tuple[bytes, str]]:
     """
     执行多页 ADF 扫描，返回 [(数据, 扩展名), ...]。
@@ -507,9 +518,16 @@ def execute_multipage_scan(
         overall_start = time.time()
 
         while time.time() - overall_start < timeout:
+            # 检查取消
+            if cancel_event and cancel_event.is_set():
+                return pages if pages else []
+
             # 等待当前页面就绪
             page_start = time.time()
             while time.time() - page_start < page_timeout:
+                if cancel_event and cancel_event.is_set():
+                    return pages if pages else []
+
                 try:
                     r = session.get(nd_url, timeout=10)
                     if r.status_code == 200:
@@ -525,7 +543,12 @@ def execute_multipage_scan(
                         pass  # 扫描进行中，继续等待
                 except requests.RequestException:
                     pass
-                time.sleep(0.5)
+
+                # 分段睡眠以便及时响应取消
+                for _ in range(5):
+                    if cancel_event and cancel_event.is_set():
+                        return pages if pages else []
+                    time.sleep(0.1)
             else:
                 # 单页超时
                 if pages:

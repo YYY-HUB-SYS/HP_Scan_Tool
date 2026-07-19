@@ -1058,20 +1058,36 @@ class ScanApp(QMainWindow):
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
 
+        # 取消标志
+        self._scan_cancel_event = threading.Event()
+
+        # 添加取消按钮
+        self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
+        self.cancel_scan_btn.clicked.connect(self._cancel_scan)
+        self.status_bar.addPermanentWidget(self.cancel_scan_btn)
+
         def _scan_thread():
             try:
                 if use_adf:
-                    self._do_multipage_scan(scanner, out_dir, source_val)
+                    self._do_multipage_scan(scanner, out_dir, source_val, cancel_event=self._scan_cancel_event)
                 else:
-                    self._do_single_scan(scanner, out_dir, source_val)
+                    self._do_single_scan(scanner, out_dir, source_val, cancel_event=self._scan_cancel_event)
             except Exception as e:
-                QTimer.singleShot(0, lambda: self._scan_error(f"{type(e).__name__}: {e}"))
+                if not self._scan_cancel_event.is_set():
+                    QTimer.singleShot(0, lambda: self._scan_error(f"{type(e).__name__}: {e}"))
             finally:
                 QTimer.singleShot(0, self._reset_scan_ui)
 
         threading.Thread(target=_scan_thread, daemon=True).start()
 
-    def _do_single_scan(self, scanner, out_dir, source_val):
+    def _cancel_scan(self):
+        """取消扫描"""
+        if hasattr(self, '_scan_cancel_event'):
+            self._scan_cancel_event.set()
+        self.status_bar.showMessage("扫描已取消")
+        self._reset_scan_ui()
+
+    def _do_single_scan(self, scanner, out_dir, source_val, cancel_event=None):
         """单页扫描"""
         from escl_engine import execute_scan
 
@@ -1085,7 +1101,13 @@ class ScanApp(QMainWindow):
             output_format=self.output_format_val,
             source=source_val,
             duplex=self.duplex_val,
+            cancel_event=cancel_event,
         )
+
+        # 检查是否已取消
+        if cancel_event and cancel_event.is_set():
+            cache_manager.remove_job(job_id)
+            return
 
         cache_path = cache_manager.write_page(job_id, 1, data, ext)
         del data
@@ -1101,7 +1123,7 @@ class ScanApp(QMainWindow):
         else:
             QTimer.singleShot(0, lambda: self._show_preview(cache_path, ext, output_path, job_id, scanner))
 
-    def _do_multipage_scan(self, scanner, out_dir, source_val):
+    def _do_multipage_scan(self, scanner, out_dir, source_val, cancel_event=None):
         """多页扫描"""
         from escl_engine import execute_multipage_scan
 
@@ -1115,7 +1137,13 @@ class ScanApp(QMainWindow):
             output_format=self.output_format_val,
             source=source_val,
             duplex=self.duplex_val,
+            cancel_event=cancel_event,
         )
+
+        # 检查是否已取消
+        if cancel_event and cancel_event.is_set():
+            cache_manager.remove_job(job_id)
+            return
 
         ext = pages[0][1] if pages else self.output_format_val
         for i, (data, ext) in enumerate(pages, 1):
@@ -1133,6 +1161,19 @@ class ScanApp(QMainWindow):
         else:
             QTimer.singleShot(0, lambda: self._show_multi_preview(
                 job_id, ext, output_path, len(pages), scanner))
+
+    def _safe_copy_file(self, src, dst, retries=3, delay=0.5):
+        """安全复制文件，带重试机制"""
+        for attempt in range(retries):
+            try:
+                shutil.copy2(src, dst)
+                return True
+            except (IOError, OSError) as e:
+                if attempt < retries - 1:
+                    time.sleep(delay)
+                else:
+                    raise
+        return False
 
     def _direct_save(self, cache_path, ext, output_path, job_id, scanner=None):
         """直接保存（跳过预览）"""
@@ -1161,7 +1202,7 @@ class ScanApp(QMainWindow):
                     os.makedirs(extra_dir, exist_ok=True)
                     extra_path = os.path.join(extra_dir, os.path.basename(saved))
                     if extra_path != saved:
-                        shutil.copy2(saved, extra_path)
+                        self._safe_copy_file(saved, extra_path)
                 except Exception:
                     pass
 
@@ -1294,6 +1335,11 @@ class ScanApp(QMainWindow):
             self.status_bar.removeWidget(self.cancel_listen_btn)
             self.cancel_listen_btn.deleteLater()
             self.cancel_listen_btn = None
+        # 移除取消扫描按钮
+        if hasattr(self, 'cancel_scan_btn') and self.cancel_scan_btn:
+            self.status_bar.removeWidget(self.cancel_scan_btn)
+            self.cancel_scan_btn.deleteLater()
+            self.cancel_scan_btn = None
 
     def _scan_error(self, msg):
         """扫描错误"""
