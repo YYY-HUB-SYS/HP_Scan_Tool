@@ -31,6 +31,7 @@ from escl_engine import (
 from wsd_engine import discover_all_scanners
 import cache_manager
 import history_manager
+import profile_manager
 from scan_coordinator import (
     ScanCoordinator, record_scan_history, cleanup_cache_job,
     compute_page_groups, delete_cached_page, COLOR_MODE_MAP,
@@ -199,6 +200,7 @@ class ScanApp(ctk.CTk):
         self.color_mode_val = self.cfg.get("color_mode_ui", "彩色")
         self.output_format_val = self.cfg.get("output_format", "jpg")
         self.source_val = self.cfg.get("source", "平板")
+        self.duplex_val = False
 
         self._build_topbar()
         self._build_main()
@@ -324,6 +326,16 @@ class ScanApp(ctk.CTk):
         self._param(params, "来源", ["平板"], self.source_val, 0, 3)
         self.src_cb = params.grid_slaves(row=1, column=3)[0]
 
+        # 双面扫描复选框（仅当扫描仪支持双面且来源为 ADF 时显示）
+        self.duplex_frame = ctk.CTkFrame(params, fg_color="transparent")
+        self.duplex_frame.grid(row=2, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
+        self.duplex_cb = ctk.CTkCheckBox(
+            self.duplex_frame, text="双面扫描",
+            command=lambda: setattr(self, 'duplex_val', self.duplex_cb.get()),
+        )
+        self.duplex_cb.pack(side="left")
+        self.duplex_frame.grid_remove()  # 默认隐藏
+
         # 保存目录（卡片式，与参数区视觉分隔）
         save_row = ctk.CTkFrame(right)
         save_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
@@ -339,6 +351,23 @@ class ScanApp(ctk.CTk):
                       border_color=("gray40", "gray60"),
                       hover_color=("gray82", "gray25"),
                       command=self._browse).pack(side="right", padx=(0, 8))
+
+        # 额外输出目标（多目标同时输出）
+        extra_row = ctk.CTkFrame(right)
+        extra_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 4))
+        extra_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(extra_row, text="额外输出",
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w", padx=(10, 6))
+        self.extra_dirs = []  # 额外输出目录列表
+        self.extra_dir_frame = ctk.CTkFrame(extra_row, fg_color="transparent")
+        self.extra_dir_frame.grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(extra_row, text="+", width=30, height=28,
+                      font=ctk.CTkFont(size=14),
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      hover_color=("gray82", "gray25"),
+                      command=self._add_extra_dir).grid(row=0, column=2, padx=(4, 8))
 
         # 操作按钮行（四个按钮等高等宽，扫描按钮用实心蓝色区分主操作）
         action = ctk.CTkFrame(right, fg_color="transparent")
@@ -376,6 +405,16 @@ class ScanApp(ctk.CTk):
                       fg_color="transparent",
                       hover_color=("gray82", "gray25"),
                       command=self._show_history).grid(row=0, column=2, sticky="ew", padx=2)
+
+        ctk.CTkButton(action, text="监听模式",
+                      height=36,
+                      font=ctk.CTkFont(size=12),
+                      border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      fg_color="transparent",
+                      hover_color=("gray82", "gray25"),
+                      command=self._start_listen).grid(row=0, column=3, sticky="ew", padx=2)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
                                        height=36,
@@ -594,24 +633,42 @@ class ScanApp(ctk.CTk):
             self.progress.grid_remove()
             self.disc_btn.configure(state="normal", text="搜索局域网")
 
-    def _update_source_options(self, has_adf: bool):
-        """根据扫描仪能力更新来源下拉框"""
+    def _update_source_options(self, has_adf: bool, has_duplex: bool = False):
+        """根据扫描仪能力更新来源下拉框和双面复选框"""
         sources = ["平板"]
         if has_adf:
             sources.append("输稿器(ADF)")
-        self.src_cb.configure(values=sources)
+        self.src_cb.configure(values=sources, command=self._on_source_changed)
         if self.source_val in sources:
             self.src_cb.set(self.source_val)
         else:
             self.src_cb.set(sources[0])
             self.source_val = sources[0]
+        # 更新双面复选框状态
+        self._update_duplex_visibility(has_duplex)
+
+    def _on_source_changed(self, value):
+        """来源改变时更新双面复选框可见性"""
+        self.source_val = value
+        if self.selected:
+            self._update_duplex_visibility(self.selected.has_duplex)
+
+    def _update_duplex_visibility(self, has_duplex: bool):
+        """更新双面复选框可见性（仅 ADF + 支持双面时显示）"""
+        is_adf = "输稿器" in self.src_cb.get() or "ADF" in self.src_cb.get()
+        if has_duplex and is_adf:
+            self.duplex_frame.grid()
+        else:
+            self.duplex_frame.grid_remove()
+            self.duplex_val = False
+            self.duplex_cb.deselect()
 
     # ────────── 选择 ──────────
     def select_scanner(self, idx: int):
         if 0 <= idx < len(self.coordinator.scanners):
             self.selected = self.coordinator.scanners[idx]
             self.selected_idx = idx
-            self._update_source_options(self.selected.has_adf)
+            self._update_source_options(self.selected.has_adf, self.selected.has_duplex)
 
             label = _label_for(self.selected)
             self.status_bar.configure(text=f"已选择: {label}")
@@ -623,6 +680,43 @@ class ScanApp(ctk.CTk):
             if self.selected.ip:
                 self.cfg["selected_scanner_ip"] = self.selected.ip
                 save_config(self.cfg)
+
+            # 加载该设备的配置文件
+            self._load_profile()
+
+    def _load_profile(self):
+        """加载当前设备的配置文件"""
+        if not self.selected or not self.selected.ip:
+            return
+        profile = profile_manager.get_profile(self.selected.ip)
+        if not profile:
+            return
+
+        # 应用配置文件中的参数
+        if "resolution" in profile:
+            self.resolution_val = profile["resolution"]
+        if "color_mode" in profile:
+            self.color_mode_val = profile["color_mode"]
+        if "output_format" in profile:
+            self.output_format_val = profile["output_format"]
+        if "source" in profile:
+            self.source_val = profile["source"]
+            self.src_cb.set(self.source_val)
+
+        self.status_bar.configure(
+            text=f"已加载 {self.selected.display_name} 的配置文件")
+
+    def _save_profile(self):
+        """保存当前设备的配置文件"""
+        if not self.selected or not self.selected.ip:
+            return
+        profile = {
+            "resolution": self.resolution_val,
+            "color_mode": self.color_mode_val,
+            "output_format": self.output_format_val,
+            "source": self.src_cb.get(),
+        }
+        profile_manager.save_profile(self.selected.ip, profile)
 
     # ────────── 自定义名称 ──────────
     def set_custom_name(self, idx: int, name: str):
@@ -778,7 +872,7 @@ class ScanApp(ctk.CTk):
     def _caps_done(self, s):
         self._set_loading(False)
         self._rebuild_cards()
-        self._update_source_options(s.has_adf)
+        self._update_source_options(s.has_adf, s.has_duplex)
 
         info = (
             f"型号: {s.model or '未知'}\n"
@@ -816,6 +910,45 @@ class ScanApp(ctk.CTk):
             self.cfg["output_dir"] = p
             save_config(self.cfg)
 
+    def _add_extra_dir(self):
+        """添加额外输出目录"""
+        p = filedialog.askdirectory(title="选择额外输出目录")
+        if p and p not in self.extra_dirs:
+            self.extra_dirs.append(p)
+            self._refresh_extra_dirs()
+
+    def _remove_extra_dir(self, p):
+        """移除额外输出目录"""
+        if p in self.extra_dirs:
+            self.extra_dirs.remove(p)
+            self._refresh_extra_dirs()
+
+    def _refresh_extra_dirs(self):
+        """刷新额外输出目录显示"""
+        for w in self.extra_dir_frame.winfo_children():
+            w.destroy()
+        for i, p in enumerate(self.extra_dirs):
+            row = ctk.CTkFrame(self.extra_dir_frame, fg_color="transparent")
+            row.pack(fill="x", pady=1)
+            ctk.CTkLabel(row, text=p, font=ctk.CTkFont(size=10),
+                         text_color=("gray40", "gray60")).pack(side="left")
+            ctk.CTkButton(row, text="x", width=20, height=20,
+                          font=ctk.CTkFont(size=10),
+                          fg_color="transparent", border_width=1,
+                          text_color=("gray40", "gray60"),
+                          border_color=("gray40", "gray60"),
+                          hover_color=("gray82", "gray25"),
+                          command=lambda p=p: self._remove_extra_dir(p)).pack(side="right")
+
+    def _get_all_output_dirs(self):
+        """获取所有输出目录（主目录 + 额外目录）"""
+        main_dir = self.dir_entry.get() or self.output_dir
+        dirs = [main_dir]
+        for d in self.extra_dirs:
+            if d != main_dir:
+                dirs.append(d)
+        return dirs
+
     # ────────── 扫描 ──────────
     def _start_scan(self):
         if not self.selected:
@@ -846,6 +979,9 @@ class ScanApp(ctk.CTk):
             messagebox.showerror("错误", "保存路径不是目录，请重新选择")
             return
 
+        # 保存当前设备的配置文件
+        self._save_profile()
+
         # 捕获当前选中的扫描仪和参数（避免并发时 self.selected 被切换）
         scanner = self.selected
         source_val = "Platen" if "平板" in self.src_cb.get() else "Feeder"
@@ -873,10 +1009,100 @@ class ScanApp(ctk.CTk):
         self.scan_progress.set(0)
 
         threading.Thread(target=self._do_capture, args=(
-            scanner, fpath, source_val,
+            scanner, fpath, source_val, self.duplex_val,
         ), daemon=True).start()
 
-    def _do_capture(self, scanner, output_path, source_val):
+    def _start_listen(self):
+        """启动监听模式，等待打印机面板触发扫描"""
+        if not self.selected:
+            messagebox.showwarning("提示", "请先选择一台打印机")
+            return
+
+        if not self.selected.escl_url:
+            messagebox.showinfo("提示", "监听模式需要 eSCL 支持，请先探测打印机能力")
+            return
+
+        from listen_engine import listen_for_scan, listen_for_multipage_scan
+
+        out_dir = self.dir_entry.get() or self.output_dir
+        try:
+            out_dir = os.path.abspath(out_dir)
+        except (ValueError, OSError):
+            messagebox.showerror("错误", "保存路径无效")
+            return
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        scanner = self.selected
+        source_val = "Platen" if "平板" in self.src_cb.get() else "Feeder"
+        use_adf = source_val == "Feeder"
+
+        self.scan_btn.configure(text="监听中...", state="disabled")
+        self.status_bar.configure(text="监听模式：等待打印机面板触发扫描...")
+        self.scan_progress.grid()
+        self.scan_progress.set(0)
+
+        def _progress(msg, page=0):
+            self.after(0, lambda: self.status_bar.configure(text=f"监听模式：{msg}"))
+
+        def _listen_thread():
+            try:
+                if use_adf:
+                    pages = listen_for_multipage_scan(
+                        scanner=scanner,
+                        resolution=self.resolution_val,
+                        color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+                        output_format=self.output_format_val,
+                        source=source_val,
+                        duplex=self.duplex_val,
+                        wait_timeout=600.0,
+                        progress_callback=_progress,
+                    )
+                    if pages:
+                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        cache_manager.register_job(job_id)
+                        ext = pages[0][1] if pages else self.output_format_val
+                        for i, (data, ext) in enumerate(pages, 1):
+                            cache_manager.write_page(job_id, i, data, ext)
+                            del data
+                        self.after(0, lambda: self.scan_progress.set(1.0))
+                        self.after(0, lambda: self._show_multi_preview(
+                            job_id, ext, os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"),
+                            len(pages), scanner=scanner))
+                    else:
+                        self.after(0, lambda: self.status_bar.configure(text="监听模式：超时或已取消"))
+                else:
+                    result = listen_for_scan(
+                        scanner=scanner,
+                        resolution=self.resolution_val,
+                        color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+                        output_format=self.output_format_val,
+                        source=source_val,
+                        duplex=self.duplex_val,
+                        wait_timeout=300.0,
+                        progress_callback=_progress,
+                    )
+                    if result:
+                        data, ext = result
+                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        cache_manager.register_job(job_id)
+                        cache_path = cache_manager.write_page(job_id, 1, data, ext)
+                        del data
+                        self.after(0, lambda: self.scan_progress.set(1.0))
+                        self.after(0, lambda: self._show_preview(
+                            cache_path, ext,
+                            os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"),
+                            job_id, scanner=scanner))
+                    else:
+                        self.after(0, lambda: self.status_bar.configure(text="监听模式：超时或已取消"))
+            except Exception as e:
+                self.after(0, lambda: self._scan_error(f"监听模式错误: {e}"))
+            finally:
+                self.after(0, lambda: self._reset_scan_ui())
+
+        threading.Thread(target=_listen_thread, daemon=True).start()
+
+    def _do_capture(self, scanner, output_path, source_val, duplex=False):
         """扫描到内存，然后弹出预览对话框"""
         try:
             if self.coordinator.is_cancelled():
@@ -920,6 +1146,7 @@ class ScanApp(ctk.CTk):
                     color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
                     output_format=self.output_format_val,
                     source=source_val,
+                    duplex=duplex,
                     timeout=300.0,
                     progress_callback=_progress,
                 )
@@ -929,6 +1156,10 @@ class ScanApp(ctk.CTk):
                 for i, (data, ext) in enumerate(pages, 1):
                     cache_manager.write_page(job_id, i, data, ext)
                     del data
+
+                # 空白页检测（多页扫描时）
+                if len(pages) > 1:
+                    self._detect_blank_pages(job_id, len(pages), ext)
 
                 self.after(0, lambda: self.scan_progress.set(1.0))
                 if len(pages) > 1:
@@ -945,6 +1176,7 @@ class ScanApp(ctk.CTk):
                     color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
                     output_format=self.output_format_val,
                     source=source_val,
+                    duplex=duplex,
                     timeout=90.0,
                 )
                 self.after(0, lambda: self.scan_progress.set(0.8))
@@ -955,6 +1187,29 @@ class ScanApp(ctk.CTk):
         except Exception as e:
             tb = traceback.format_exc()
             self.after(0, lambda: self._scan_error(f"{type(e).__name__}: {e}\n\n{tb}"))
+
+    def _detect_blank_pages(self, job_id, page_count, ext):
+        """检测空白页并提示用户移除"""
+        from escl_engine import is_blank_page
+        blank_pages = []
+        for i in range(1, page_count + 1):
+            try:
+                cache_path = os.path.join(
+                    cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
+                if os.path.exists(cache_path):
+                    img = Image.open(cache_path)
+                    if is_blank_page(img):
+                        blank_pages.append(i)
+            except Exception:
+                pass
+
+        if blank_pages:
+            # 提示用户是否移除空白页
+            page_str = ", ".join(str(p) for p in blank_pages[:10])
+            if len(blank_pages) > 10:
+                page_str += f" ... 等共 {len(blank_pages)} 页"
+            self.after(0, lambda: self.status_bar.configure(
+                text=f"检测到 {len(blank_pages)} 页空白页: {page_str}"))
 
     def _wia_scan(self):
         out_dir = self.dir_entry.get() or self.output_dir
@@ -1026,7 +1281,8 @@ class ScanApp(ctk.CTk):
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
         PreviewDialog(self, cache_path, ext, output_path, job_id,
-                      device_name=dev_name, device_ip=dev_ip)
+                      device_name=dev_name, device_ip=dev_ip,
+                      extra_dirs=self.extra_dirs)
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
         self._reset_scan_ui()
@@ -1035,7 +1291,8 @@ class ScanApp(ctk.CTk):
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
         MultiPagePreviewDialog(self, job_id, ext, output_path, page_count,
-                               device_name=dev_name, device_ip=dev_ip)
+                               device_name=dev_name, device_ip=dev_ip,
+                               extra_dirs=self.extra_dirs)
 
     def _show_history(self):
         HistoryDialog(self)
@@ -1049,7 +1306,7 @@ class PreviewDialog(ctk.CTkToplevel):
     """扫描后预览：确认后保存"""
 
     def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str,
-                 device_name: str = "", device_ip: str = ""):
+                 device_name: str = "", device_ip: str = "", extra_dirs: list = None):
         super().__init__(parent)
         self.title("扫描预览")
         self.geometry("540x520")
@@ -1072,7 +1329,10 @@ class PreviewDialog(ctk.CTkToplevel):
         self.job_id = job_id
         self.device_name = device_name
         self.device_ip = device_ip
+        self.extra_dirs = extra_dirs or []
         self._preview_photo = None
+        self._rotation = 0  # 当前旋转角度（0/90/180/270）
+        self._cropped = False  # 是否已裁边
 
         self._build()
         self.grab_set()
@@ -1089,11 +1349,30 @@ class PreviewDialog(ctk.CTkToplevel):
         bf = ctk.CTkFrame(self, fg_color="transparent")
         bf.pack(side="bottom", fill="x", padx=14, pady=(4, 14))
 
-        ctk.CTkButton(bf, text="重新扫描", width=100, height=34,
+        # 左侧：旋转 + 裁边 + 重新扫描
+        left_frame = ctk.CTkFrame(bf, fg_color="transparent")
+        left_frame.pack(side="left")
+        ctk.CTkButton(left_frame, text="↺ 左转", width=60, height=34,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._rotate_left).pack(side="left", padx=(0, 3))
+        ctk.CTkButton(left_frame, text="↻ 右转", width=60, height=34,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._rotate_right).pack(side="left", padx=(0, 3))
+        ctk.CTkButton(left_frame, text="自动裁边", width=80, height=34,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._auto_crop).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(left_frame, text="重新扫描", width=80, height=34,
                       fg_color="transparent", border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       command=self._cancel).pack(side="left")
+        # 右侧：保存
         ctk.CTkButton(bf, text="保存", width=140, height=38,
                       font=ctk.CTkFont(size=14, weight="bold"),
                       command=self._confirm).pack(side="right")
@@ -1110,9 +1389,38 @@ class PreviewDialog(ctk.CTkToplevel):
         self.bind("<Configure>", self._on_resize)
         self._last_size = (0, 0)
 
+    def _rotate_left(self):
+        """逆时针旋转 90°"""
+        self._rotation = (self._rotation - 90) % 360
+        self._show_image()
+
+    def _rotate_right(self):
+        """顺时针旋转 90°"""
+        self._rotation = (self._rotation + 90) % 360
+        self._show_image()
+
+    def _auto_crop(self):
+        """自动裁边"""
+        from escl_engine import auto_crop
+        try:
+            img = Image.open(self.cache_path)
+            cropped = auto_crop(img)
+            if cropped is not img:
+                # 保存裁剪后的图像到临时路径
+                crop_path = self.cache_path + ".cropped"
+                cropped.save(crop_path, quality=95)
+                self.cache_path = crop_path
+                self._cropped = True
+                self._rotation = 0  # 重置旋转
+                self._show_image()
+        except Exception as e:
+            self.img_lbl.configure(image=None, text=f"裁边失败: {e}")
+
     def _show_image(self):
         try:
             img = Image.open(self.cache_path)
+            if self._rotation:
+                img = img.rotate(self._rotation, expand=True)
             w = max(200, self.winfo_width() - 60)
             h = max(150, self.winfo_height() - 120)
             img.thumbnail((w, h), Image.LANCZOS)
@@ -1156,31 +1464,40 @@ class PreviewDialog(ctk.CTkToplevel):
         out_ext = save_path.rsplit(".", 1)[-1].lower()
 
         # 直接从缓存读取原始数据保存（不做曝光处理）
+        img = Image.open(self.cache_path)
+        if self._rotation:
+            img = img.rotate(self._rotation, expand=True)
+
         if out_ext == "pdf":
-            img = Image.open(self.cache_path)
             pdf_path = save_path if save_path.lower().endswith(".pdf") \
                        else save_path.rsplit(".", 1)[0] + ".pdf"
             img.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
             saved = pdf_path
         else:
-            # 直接复制缓存文件（避免重新编码损失质量）
             final = save_path
             if not final.lower().endswith(f".{out_ext}"):
                 final = f"{final.rsplit('.', 1)[0]}.{out_ext}"
-            cache_src = self.cache_path
-            if out_ext == "jpg" or out_ext == "jpeg":
-                shutil.copy2(cache_src, final)
-            else:
-                img = Image.open(cache_src)
-                if out_ext == "png":
-                    img.save(final, "PNG")
-                elif out_ext == "tiff" or out_ext == "tif":
-                    img.save(final, "TIFF")
+            if out_ext in ("jpg", "jpeg"):
+                img.convert("RGB").save(final, "JPEG", quality=95)
+            elif out_ext == "png":
+                img.save(final, "PNG")
+            elif out_ext in ("tiff", "tif"):
+                img.save(final, "TIFF")
                 else:
                     if img.mode != "RGB":
                         img = img.convert("RGB")
                     img.save(final, "JPEG", quality=95)
             saved = final
+
+        # 复制到额外输出目录
+        for extra_dir in self.extra_dirs:
+            try:
+                os.makedirs(extra_dir, exist_ok=True)
+                extra_path = os.path.join(extra_dir, os.path.basename(saved))
+                if extra_path != saved:
+                    shutil.copy2(saved, extra_path)
+            except Exception:
+                pass
 
         cache_manager.remove_job(self.job_id)
 
@@ -1210,7 +1527,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
     TW, TH = 80, 100
 
     def __init__(self, parent, job_id: str, ext: str, output_path: str, page_count: int,
-                 device_name: str = "", device_ip: str = ""):
+                 device_name: str = "", device_ip: str = "", extra_dirs: list = None):
         super().__init__(parent)
         self.title(f"扫描预览 — {page_count} 页")
         self.geometry("600x700")
@@ -1232,6 +1549,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.output_path = output_path
         self.device_name = device_name
         self.device_ip = device_ip
+        self.extra_dirs = extra_dirs or []
 
         self.pages = list(range(1, page_count + 1))
         self.selected_idx = 0
@@ -1239,6 +1557,8 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self.group_names = {}
         self._preview_photo = None
         self._thumb_photos = {}
+        self._rotations = {}  # {页码: 旋转角度}
+        self._cropped = set()  # 已裁边的页码
 
         self._build()
         self.grab_set()
@@ -1259,11 +1579,35 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         bf = ctk.CTkFrame(self, fg_color="transparent")
         bf.pack(side="bottom", fill="x", padx=14, pady=(4, 14))
 
-        ctk.CTkButton(bf, text="重新扫描", width=90, height=32,
+        # 左侧：旋转 + 裁边 + 重新扫描
+        left_frame = ctk.CTkFrame(bf, fg_color="transparent")
+        left_frame.pack(side="left")
+        ctk.CTkButton(left_frame, text="↺ 左转", width=50, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._rotate_left).pack(side="left", padx=(0, 2))
+        ctk.CTkButton(left_frame, text="↻ 右转", width=50, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._rotate_right).pack(side="left", padx=(0, 2))
+        ctk.CTkButton(left_frame, text="裁边", width=50, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._auto_crop).pack(side="left", padx=(0, 2))
+        ctk.CTkButton(left_frame, text="全部裁边", width=70, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._auto_crop_all).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(left_frame, text="重新扫描", width=70, height=32,
                       fg_color="transparent", border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       command=self._cancel).pack(side="left")
+        # 右侧：保存
         self.save_btn = ctk.CTkButton(bf, text="保存全部", width=140, height=36,
                                        font=ctk.CTkFont(size=14, weight="bold"),
                                        command=self._confirm)
@@ -1352,6 +1696,9 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
 
             try:
                 img = Image.open(self._cache_path(page_num))
+                rotation = self._get_rotation(page_num)
+                if rotation:
+                    img = img.rotate(rotation, expand=True)
                 img.thumbnail((self.TW, self.TH), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self._thumb_photos[idx] = photo
@@ -1468,18 +1815,77 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self._last_size = (w, h)
         self._update_preview()
 
+    def _rotate_left(self):
+        """当前页逆时针旋转 90°"""
+        page_num = self.pages[self.selected_idx]
+        self._rotations[page_num] = (self._rotations.get(page_num, 0) - 90) % 360
+        self._update_preview()
+        self._refresh_thumbs()
+
+    def _rotate_right(self):
+        """当前页顺时针旋转 90°"""
+        page_num = self.pages[self.selected_idx]
+        self._rotations[page_num] = (self._rotations.get(page_num, 0) + 90) % 360
+        self._update_preview()
+        self._refresh_thumbs()
+
+    def _auto_crop(self):
+        """当前页自动裁边"""
+        from escl_engine import auto_crop
+        page_num = self.pages[self.selected_idx]
+        try:
+            img = Image.open(self._cache_path(page_num))
+            cropped = auto_crop(img)
+            if cropped is not img:
+                crop_path = self._cache_path(page_num) + ".cropped"
+                cropped.save(crop_path, quality=95)
+                # 更新缓存路径中的页码文件
+                orig_path = self._cache_path(page_num)
+                shutil.move(crop_path, orig_path)
+                self._cropped.add(page_num)
+                self._rotations.pop(page_num, None)
+                self._update_preview()
+                self._refresh_thumbs()
+        except Exception as e:
+            self.img_lbl.configure(image=None, text=f"裁边失败: {e}")
+
+    def _auto_crop_all(self):
+        """全部页面自动裁边"""
+        from escl_engine import auto_crop
+        for page_num in self.pages:
+            try:
+                img = Image.open(self._cache_path(page_num))
+                cropped = auto_crop(img)
+                if cropped is not img:
+                    orig_path = self._cache_path(page_num)
+                    cropped.save(orig_path, quality=95)
+                    self._cropped.add(page_num)
+                    self._rotations.pop(page_num, None)
+            except Exception:
+                pass
+        self._update_preview()
+        self._refresh_thumbs()
+
+    def _get_rotation(self, page_num):
+        """获取指定页的旋转角度"""
+        return self._rotations.get(page_num, 0)
+
     def _update_preview(self):
         try:
             page_num = self.pages[self.selected_idx]
             img = Image.open(self._cache_path(page_num))
+            rotation = self._get_rotation(page_num)
+            if rotation:
+                img = img.rotate(rotation, expand=True)
             w = max(200, self.winfo_width() - 60)
             h = max(150, self.winfo_height() - 300)
             img.thumbnail((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo
             self.img_lbl.configure(image=photo, text="")
+            rot_text = f" (旋转 {rotation}°)" if rotation else ""
             self.page_info_lbl.configure(
-                text=f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页")
+                text=f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页{rot_text}")
         except Exception as e:
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
@@ -1528,6 +1934,9 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                     page_num = self.pages[page_idx]
                     try:
                         img = Image.open(self._cache_path(page_num))
+                        rotation = self._get_rotation(page_num)
+                        if rotation:
+                            img = img.rotate(rotation, expand=True)
                         pdf_images.append(img.convert("RGB"))
                     except Exception:
                         pass
@@ -1544,14 +1953,17 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                     page_num = self.pages[page_idx]
                     try:
                         cache_file = self._cache_path(page_num)
+                        rotation = self._get_rotation(page_num)
                         if prefix:
                             fpath = f"{base_path}_{prefix}_{seq:03d}.{out_ext}"
                         else:
                             fpath = f"{base_path}_{seq:03d}.{out_ext}"
-                        if out_ext in ("jpg", "jpeg"):
+                        if out_ext in ("jpg", "jpeg") and not rotation:
                             shutil.copy2(cache_file, fpath)
                         else:
                             img = Image.open(cache_file)
+                            if rotation:
+                                img = img.rotate(rotation, expand=True)
                             if out_ext == "png":
                                 img.save(fpath, "PNG")
                             elif out_ext in ("tiff", "tif"):
@@ -1563,6 +1975,17 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                         saved_files.append(fpath)
                     except Exception:
                         pass
+
+        # 复制到额外输出目录
+        for extra_dir in self.extra_dirs:
+            try:
+                os.makedirs(extra_dir, exist_ok=True)
+                for fpath in saved_files:
+                    extra_path = os.path.join(extra_dir, os.path.basename(fpath))
+                    if extra_path != fpath:
+                        shutil.copy2(fpath, extra_path)
+            except Exception:
+                pass
 
         cache_manager.remove_job(self.job_id)
 

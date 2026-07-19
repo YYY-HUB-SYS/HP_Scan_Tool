@@ -9,6 +9,7 @@ eSCL (AirScan) 扫描引擎 — 合并版
 import copy
 import io
 import logging
+import struct
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
-    "FORMAT_MIME", "MIME_EXT",
+    "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
 ]
 
 
@@ -33,6 +34,57 @@ def _strip_ns(el) -> str:
     """剥离 XML 元素的 namespace 前缀，返回本地标签名。"""
     t = el.tag if hasattr(el, "tag") else str(el)
     return t.split("}")[-1] if "}" in t else t
+
+
+def _fix_jpeg_header(data: bytes) -> bytes:
+    """
+    修复 HP 扫描仪 JPEG 头部高度元数据错误。
+
+    部分 HP 机型在 JPEG SOF 段中报告的高度值与实际图像数据不匹配，
+    导致图像底部被裁剪或显示异常。此函数检测并修复该问题。
+
+    参考: node-hp-scan-to 的 JpegUtil 实现。
+    """
+    # 检查是否为 JPEG（SOI 标记 FF D8）
+    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return data
+
+    # 从实际图像数据获取真实高度
+    try:
+        img = Image.open(io.BytesIO(data))
+        actual_height = img.height
+    except Exception:
+        return data
+
+    # 解析 JPEG 标记，查找 SOF0/SOF2 (Start of Frame)
+    pos = 2  # 跳过 SOI
+    while pos < len(data) - 1:
+        if data[pos] != 0xFF:
+            pos += 1
+            continue
+        marker = data[pos + 1]
+        # SOF0 (基线 DCT) 或 SOF2 (渐进 DCT)
+        if marker in (0xC0, 0xC2):
+            # SOF 段结构: FF C0 [长度2] [精度1] [高度2] [宽度2] ...
+            if pos + 9 < len(data):
+                header_height = struct.unpack(">H", data[pos + 5:pos + 7])[0]
+                if header_height != actual_height:
+                    # 修复高度值
+                    data = bytearray(data)
+                    data[pos + 5:pos + 7] = struct.pack(">H", actual_height)
+                    data = bytes(data)
+                    logging.debug(
+                        "JPEG 头部修复: 高度 %d → %d", header_height, actual_height
+                    )
+            break
+        # 跳过当前标记段
+        if pos + 3 < len(data):
+            seg_len = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+            pos += 2 + seg_len
+        else:
+            break
+
+    return data
 
 
 # ==================== 数据结构 ====================
@@ -405,7 +457,7 @@ def execute_scan(
             try:
                 r = session.get(nd_url, timeout=10)
                 if r.status_code == 200:
-                    return r.content, ext
+                    return _fix_jpeg_header(r.content), ext
                 elif r.status_code == 503:
                     pass  # 扫描进行中
             except requests.RequestException:
@@ -452,7 +504,7 @@ def execute_multipage_scan(
                 try:
                     r = session.get(nd_url, timeout=10)
                     if r.status_code == 200:
-                        pages.append((r.content, ext))
+                        pages.append((_fix_jpeg_header(r.content), ext))
                         if progress_callback:
                             progress_callback(len(pages), len(pages))
                         time.sleep(0.3)  # 短暂延迟，避免立即轰炸设备
@@ -513,3 +565,98 @@ def scan_to_file(
         f.write(data)
 
     return final_path
+
+
+def auto_crop(img: Image.Image, threshold: int = 240, padding: int = 5) -> Image.Image:
+    """
+    自动裁边：检测并裁剪图像周围的空白/黑边区域。
+
+    基于像素亮度方差检测边缘，适用于 ADF 扫描产生的黑边、
+    边缘杂色等常见场景。
+
+    Args:
+        img: 输入图像
+        threshold: 亮度阈值 (0-255)，高于此值视为空白
+        padding: 裁剪后保留的边距像素
+
+    Returns:
+        裁剪后的图像（无需裁剪则返回原图）
+    """
+    # 转为灰度图进行边缘检测
+    gray = img.convert("L")
+    pixels = gray.load()
+    width, height = gray.size
+
+    # 从四个方向检测边界
+    def is_row_blank(y):
+        """判断某行是否为空白"""
+        for x in range(width):
+            if pixels[x, y] < threshold:
+                return False
+        return True
+
+    def is_col_blank(x):
+        """判断某列是否为空白"""
+        for y in range(height):
+            if pixels[x, y] < threshold:
+                return False
+        return True
+
+    # 从上往下找第一行非空白
+    top = 0
+    while top < height and is_row_blank(top):
+        top += 1
+
+    # 从下往上找第一行非空白
+    bottom = height - 1
+    while bottom >= top and is_row_blank(bottom):
+        bottom -= 1
+
+    # 从左往右找第一列非空白
+    left = 0
+    while left < width and is_col_blank(left):
+        left += 1
+
+    # 从右往左找第一列非空白
+    right = width - 1
+    while right >= left and is_col_blank(right):
+        right -= 1
+
+    # 如果没有需要裁剪的边，返回原图
+    if top == 0 and bottom == height - 1 and left == 0 and right == width - 1:
+        return img
+
+    # 添加边距
+    top = max(0, top - padding)
+    bottom = min(height - 1, bottom + padding)
+    left = max(0, left - padding)
+    right = min(width - 1, right + padding)
+
+    return img.crop((left, top, right + 1, bottom + 1))
+
+
+def is_blank_page(img: Image.Image, threshold: float = 0.02) -> bool:
+    """
+    检测是否为空白页。
+
+    基于像素方差检测：将图像转为灰度后计算像素值的标准差，
+    标准差低于阈值视为空白页（页面内容极少）。
+
+    Args:
+        img: 输入图像
+        threshold: 方差阈值 (0-1)，低于此值视为空白，默认 0.02
+
+    Returns:
+        True 如果是空白页，False 否则
+    """
+    # 转为灰度图并缩小以加速计算
+    gray = img.convert("L")
+    # 缩小到 100x100 以加速
+    small = gray.resize((100, 100), Image.LANCZOS)
+    # 计算像素方差
+    pixels = list(small.getdata())
+    mean = sum(pixels) / len(pixels)
+    variance = sum((p - mean) ** 2 for p in pixels) / len(pixels)
+    # 归一化方差 (0-1)
+    normalized_variance = variance / (255.0 ** 2)
+    return normalized_variance < threshold

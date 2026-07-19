@@ -57,6 +57,7 @@ def cmd_scan(args):
         color_mode=color_mode,
         output_format=fmt,
         source=source,
+        duplex=args.duplex,
         timeout=90.0,
     )
 
@@ -216,6 +217,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="颜色模式 (默认 color)")
     p_scan.add_argument("--source", default="Platen", choices=["Platen", "Feeder"],
                         help="扫描来源 (默认 Platen)")
+    p_scan.add_argument("--duplex", action="store_true", help="启用双面扫描 (仅 ADF 支持)")
     p_scan.add_argument("--output", help="输出目录 (默认 ~/Documents/HP_Scans)")
 
     # discover 子命令
