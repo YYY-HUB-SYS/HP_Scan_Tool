@@ -109,6 +109,18 @@ class ScanCoordinator:
     def save_config(self):
         save_config(self.cfg)
 
+    def set_custom_name(self, ip: str, name: str):
+        """设置设备自定义名称"""
+        nicknames = self.cfg.get("nicknames", {})
+        nicknames[ip] = name
+        self.cfg["nicknames"] = nicknames
+        self.save_config()
+        # 更新内存中的扫描仪
+        for s in self.scanners:
+            if s.ip == ip:
+                s.custom_name = name
+                break
+
     # ── 扫描仪管理 ──
 
     def restore_saved_scanners(self) -> list[ScannerInfo]:

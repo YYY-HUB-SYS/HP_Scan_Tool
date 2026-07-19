@@ -166,6 +166,9 @@ def add_fade_animation(widget, duration=ANIM["normal"]):
 class ScannerCard(QFrame):
     """扫描仪卡片组件（带动画效果）"""
     clicked = Signal(int)
+    rename_requested = Signal(int)
+    move_up_requested = Signal(int)
+    move_down_requested = Signal(int)
 
     def __init__(self, idx: int, scanner: ScannerInfo, parent=None):
         super().__init__(parent)
@@ -174,7 +177,8 @@ class ScannerCard(QFrame):
         self._selected = False
         self._hovered = False
 
-        self.setFixedHeight(76)
+        self.setMinimumHeight(76)
+        self.setMaximumHeight(100)
         self.setCursor(Qt.PointingHandCursor)
         self.setFrameShape(QFrame.StyledPanel)
         self.setObjectName("scannerCard")
@@ -188,7 +192,7 @@ class ScannerCard(QFrame):
     def _setup_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
         # 状态指示器
         self.status_dot = QLabel("●")
@@ -204,12 +208,15 @@ class ScannerCard(QFrame):
         self.name_label = QLabel(name)
         self.name_label.setFont(QFont(_FONT_FAMILY, 11, QFont.Bold))
         self.name_label.setStyleSheet(f"color: {COLORS['text_primary']};")
+        self.name_label.setWordWrap(True)
+        self.name_label.setMinimumHeight(20)
         info_layout.addWidget(self.name_label)
 
         ip_text = _ip_label_for(self.scanner)
         self.ip_label = QLabel(ip_text)
         self.ip_label.setFont(QFont(_FONT_FAMILY, 9))
         self.ip_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.ip_label.setWordWrap(True)
         info_layout.addWidget(self.ip_label)
 
         layout.addLayout(info_layout, 1)
@@ -230,7 +237,45 @@ class ScannerCard(QFrame):
                 f"color: {COLORS['primary']}; background: {COLORS['primary_bg']};"
                 f"padding: 3px 8px; border-radius: {RADIUS['sm']}px;"
             )
+            tags_label.setWordWrap(False)
             layout.addWidget(tags_label)
+
+        # 上下移动按钮
+        move_layout = QVBoxLayout()
+        move_layout.setSpacing(2)
+        self.up_btn = QPushButton("▲")
+        self.up_btn.setFixedSize(20, 20)
+        self.up_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                font-size: 10px;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['primary']};
+            }}
+        """)
+        self.up_btn.clicked.connect(lambda: self.move_up_requested.emit(self.idx))
+        move_layout.addWidget(self.up_btn)
+
+        self.down_btn = QPushButton("▼")
+        self.down_btn.setFixedSize(20, 20)
+        self.down_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {COLORS['text_secondary']};
+                border: none;
+                font-size: 10px;
+            }}
+            QPushButton:hover {{
+                color: {COLORS['primary']};
+            }}
+        """)
+        self.down_btn.clicked.connect(lambda: self.move_down_requested.emit(self.idx))
+        move_layout.addWidget(self.down_btn)
+
+        layout.addLayout(move_layout)
 
     def _update_style(self):
         border_color = COLORS["primary"] if self._selected else COLORS["border"]
@@ -255,6 +300,10 @@ class ScannerCard(QFrame):
     def mousePressEvent(self, event):
         self.clicked.emit(self.idx)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.rename_requested.emit(self.idx)
+        super().mouseDoubleClickEvent(event)
 
     def enterEvent(self, event):
         self._hovered = True
@@ -831,6 +880,9 @@ class ScanApp(QMainWindow):
         for idx, scanner in enumerate(self.coordinator.scanners):
             card = ScannerCard(idx, scanner)
             card.clicked.connect(self._on_card_clicked)
+            card.rename_requested.connect(self._on_rename_requested)
+            card.move_up_requested.connect(self._on_move_up_requested)
+            card.move_down_requested.connect(self._on_move_down_requested)
             self.cards_layout.addWidget(card)
             self.cards.append(card)
 
@@ -854,6 +906,70 @@ class ScanApp(QMainWindow):
             if self.selected.ip:
                 self.cfg["selected_scanner_ip"] = self.selected.ip
                 save_config(self.cfg)
+
+    def _on_rename_requested(self, idx: int):
+        """重命名扫描仪"""
+        if 0 <= idx < len(self.coordinator.scanners):
+            scanner = self.coordinator.scanners[idx]
+            self._show_rename_dialog(scanner)
+
+    def _show_rename_dialog(self, scanner: ScannerInfo):
+        """显示重命名对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("重命名设备")
+        dialog.setMinimumWidth(300)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("设备名称:"))
+        name_input = QLineEdit(scanner.custom_name or scanner.display_name)
+        name_input.selectAll()
+        layout.addWidget(name_input)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        save_btn = AnimatedButton("保存", button_type="primary")
+        save_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(save_btn)
+
+        cancel_btn = AnimatedButton("取消", button_type="secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        if dialog.exec() == QDialog.Accepted:
+            new_name = name_input.text().strip()
+            if new_name:
+                scanner.custom_name = new_name
+                # 保存到配置
+                self.coordinator.set_custom_name(scanner.ip, new_name)
+                self._rebuild_cards()
+                self.status_bar.showMessage(f"已重命名为: {new_name}")
+
+    def _on_move_up_requested(self, idx: int):
+        """设备上移"""
+        if idx > 0 and idx < len(self.coordinator.scanners):
+            scanners = self.coordinator.scanners
+            scanners[idx], scanners[idx - 1] = scanners[idx - 1], scanners[idx]
+            self._rebuild_cards()
+            # 更新选中
+            self.selected_idx = idx - 1
+            self.selected = scanners[self.selected_idx]
+            for i, card in enumerate(self.cards):
+                card.set_selected(i == self.selected_idx)
+
+    def _on_move_down_requested(self, idx: int):
+        """设备下移"""
+        if idx >= 0 and idx < len(self.coordinator.scanners) - 1:
+            scanners = self.coordinator.scanners
+            scanners[idx], scanners[idx + 1] = scanners[idx + 1], scanners[idx]
+            self._rebuild_cards()
+            # 更新选中
+            self.selected_idx = idx + 1
+            self.selected = scanners[self.selected_idx]
+            for i, card in enumerate(self.cards):
+                card.set_selected(i == self.selected_idx)
 
     def _update_source_options(self, has_adf: bool, has_duplex: bool):
         """更新来源选项"""
