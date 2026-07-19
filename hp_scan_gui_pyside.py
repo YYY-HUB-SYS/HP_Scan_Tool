@@ -220,7 +220,7 @@ class ScannerCard(QFrame):
             tags.append("ADF")
         if self.scanner.has_duplex:
             tags.append("双面")
-        if self.scanner.is_escl:
+        if self.scanner.escl_url:
             tags.append("eSCL")
         if tags:
             tags_text = " · ".join(tags)
@@ -487,6 +487,12 @@ class ScanApp(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
+
+        # 恢复已保存的扫描仪
+        saved = self.coordinator.restore_saved_scanners()
+        if saved:
+            self._rebuild_cards()
+            self.status_bar.showMessage(f"已恢复 {len(saved)} 台扫描仪")
 
         # 进度条（嵌入状态栏）
         self.scan_progress = QProgressBar()

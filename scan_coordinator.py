@@ -171,9 +171,12 @@ class ScanCoordinator:
                     new_scanners.append(d)
                     existing_ips.add(d.ip)
 
-            # 持久化
+            # 添加到内存列表
             with self._scanners_lock:
-                all_for_save = list(self.scanners) + new_scanners
+                self.scanners.extend(new_scanners)
+                all_for_save = list(self.scanners)
+
+            # 持久化
             nicknames = self.cfg.get("nicknames", {})
             ips = []
             for s in all_for_save:
