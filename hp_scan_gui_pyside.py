@@ -1,5 +1,6 @@
 """
-惠普集成扫描工具 v4.0 — PySide6 重写版
+惠普集成扫描工具 v4.0 — PySide6 重写版（UI 优化）
+设计系统: Soft UI Evolution + Micro-interactions
 功能: 磁盘缓存 / 并发扫描 / 多页ADF / WSD发现 / CLI / 双面扫描 / 页面旋转 / 自动裁边 / 空白页检测 / 监听模式 / 多目标输出 / 配置文件
 """
 
@@ -24,22 +25,18 @@ from scan_coordinator import (
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
     COLOR_MODE_MAP, SOURCE_MAP,
 )
-
-# 确保 backward compatibility
-try:
-    from scan_coordinator import SOURCE_MAP
-except ImportError:
-    SOURCE_MAP = {"平板": "Platen", "ADF": "Feeder"}
 from escl_engine import auto_crop, is_blank_page
 
 # ────────── PySide6 导入 ──────────
 from PySide6.QtCore import (
     Qt, QThread, Signal, QTimer, QSize, QRectF, QPointF,
+    QPropertyAnimation, QEasingCurve, QParallelAnimationGroup,
+    QAbstractAnimation, QPoint, QRect,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
     QPainter, QColor, QPen, QBrush, QLinearGradient,
-    QAction, QKeySequence, QShortcut,
+    QAction, QKeySequence, QShortcut, QPalette,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -50,31 +47,60 @@ from PySide6.QtWidgets import (
     QSizePolicy, QSpacerItem, QFrame, QStatusBar,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
     QTabWidget, QTextEdit, QSplitter, QToolBar, QToolButton,
+    QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
 )
 
-# ────────── 常量 ──────────
+# ────────── 设计系统常量 ──────────
+# 配色方案 (Soft UI Evolution)
+COLORS = {
+    "primary": "#0D9488",
+    "primary_dark": "#0F766E",
+    "primary_light": "#14B8A6",
+    "primary_bg": "#F0FDFA",
+    "accent": "#EA580C",
+    "accent_dark": "#C2410C",
+    "accent_light": "#F97316",
+    "bg": "#F8FAFC",
+    "surface": "#FFFFFF",
+    "surface_hover": "#F1F5F9",
+    "text_primary": "#1E293B",
+    "text_secondary": "#64748B",
+    "text_muted": "#94A3B8",
+    "border": "#E2E8F0",
+    "border_focus": "#0D9488",
+    "success": "#10B981",
+    "warning": "#F59E0B",
+    "danger": "#DC2626",
+}
+
+# 间距规范 (8px 基准网格)
+SPACING = {
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "xxl": 32,
+}
+
+# 圆角
+RADIUS = {
+    "sm": 6,
+    "md": 8,
+    "lg": 12,
+    "xl": 16,
+    "pill": 999,
+}
+
+# 动画时长
+ANIM = {
+    "fast": 150,
+    "normal": 200,
+    "slow": 300,
+}
+
 _FONT_FAMILY = "Microsoft YaHei UI"
 _FONT_SIZE = 10
-
-# 颜色主题
-COLORS = {
-    "primary": "#1976D2",
-    "primary_hover": "#1565C0",
-    "primary_light": "#E3F2FD",
-    "success": "#4CAF50",
-    "warning": "#FF9800",
-    "danger": "#F44336",
-    "bg_light": "#FAFAFA",
-    "bg_card": "#FFFFFF",
-    "bg_hover": "#F5F5F5",
-    "border": "#E0E0E0",
-    "text_primary": "#212121",
-    "text_secondary": "#757575",
-    "text_hint": "#BDBDBD",
-    "scanner_selected": "#1976D2",
-    "scanner_unselected": "#FFFFFF",
-    "scanner_hover": "#F5F5F5",
-}
 
 
 def get_resource_path(relative_path):
@@ -84,6 +110,15 @@ def get_resource_path(relative_path):
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, relative_path)
+
+
+def load_stylesheet():
+    """加载 QSS 样式表"""
+    qss_path = get_resource_path(os.path.join("styles", "app.qss"))
+    if os.path.exists(qss_path):
+        with open(qss_path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
 
 def load_embedded_font():
@@ -105,9 +140,31 @@ def pil_to_qpixmap(img):
     return QPixmap.fromImage(qimg.copy())
 
 
+def add_shadow(widget, blur=20, offset=4, color=QColor(0, 0, 0, 30)):
+    """添加阴影效果"""
+    shadow = QGraphicsDropShadowEffect()
+    shadow.setBlurRadius(blur)
+    shadow.setOffset(offset, offset)
+    shadow.setColor(color)
+    widget.setGraphicsEffect(shadow)
+
+
+def add_fade_animation(widget, duration=ANIM["normal"]):
+    """添加淡入动画"""
+    effect = QGraphicsOpacityEffect()
+    widget.setGraphicsEffect(effect)
+    anim = QPropertyAnimation(effect, b"opacity")
+    anim.setDuration(duration)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setEasingCurve(QEasingCurve.OutCubic)
+    anim.start()
+    return anim
+
+
 # ────────── 自定义 Widget ──────────
 class ScannerCard(QFrame):
-    """扫描仪卡片组件"""
+    """扫描仪卡片组件（带动画效果）"""
     clicked = Signal(int)
 
     def __init__(self, idx: int, scanner: ScannerInfo, parent=None):
@@ -117,31 +174,39 @@ class ScannerCard(QFrame):
         self._selected = False
         self._hovered = False
 
-        self.setFixedHeight(72)
+        self.setFixedHeight(76)
         self.setCursor(Qt.PointingHandCursor)
         self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet(self._get_style())
+        self.setObjectName("scannerCard")
 
+        # 阴影
+        add_shadow(self, blur=16, offset=2, color=QColor(0, 0, 0, 20))
+
+        self._setup_ui()
+        self._update_style()
+
+    def _setup_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(12)
 
         # 状态指示器
         self.status_dot = QLabel("●")
         self.status_dot.setFixedWidth(16)
-        self.status_dot.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+        self.status_dot.setStyleSheet(f"color: {COLORS['success']}; font-size: 14px;")
         layout.addWidget(self.status_dot)
 
         # 名称和信息
         info_layout = QVBoxLayout()
-        info_layout.setSpacing(2)
-        name = _label_for(scanner)
+        info_layout.setSpacing(3)
+
+        name = _label_for(self.scanner)
         self.name_label = QLabel(name)
-        self.name_label.setFont(QFont(_FONT_FAMILY, 10, QFont.Bold))
+        self.name_label.setFont(QFont(_FONT_FAMILY, 11, QFont.Bold))
         self.name_label.setStyleSheet(f"color: {COLORS['text_primary']};")
         info_layout.addWidget(self.name_label)
 
-        ip_text = _ip_label_for(scanner)
+        ip_text = _ip_label_for(self.scanner)
         self.ip_label = QLabel(ip_text)
         self.ip_label.setFont(QFont(_FONT_FAMILY, 9))
         self.ip_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
@@ -151,35 +216,41 @@ class ScannerCard(QFrame):
 
         # 功能标签
         tags = []
-        if scanner.has_adf:
+        if self.scanner.has_adf:
             tags.append("ADF")
-        if scanner.has_duplex:
+        if self.scanner.has_duplex:
             tags.append("双面")
-        if scanner.is_escl:
+        if self.scanner.is_escl:
             tags.append("eSCL")
         if tags:
-            tags_label = QLabel(" | ".join(tags))
+            tags_text = " · ".join(tags)
+            tags_label = QLabel(tags_text)
             tags_label.setFont(QFont(_FONT_FAMILY, 8))
             tags_label.setStyleSheet(
-                f"color: {COLORS['primary']}; background: {COLORS['primary_light']};"
-                f"padding: 2px 6px; border-radius: 4px;"
+                f"color: {COLORS['primary']}; background: {COLORS['primary_bg']};"
+                f"padding: 3px 8px; border-radius: {RADIUS['sm']}px;"
             )
             layout.addWidget(tags_label)
 
-    def _get_style(self):
-        border_color = COLORS["scanner_selected"] if self._selected else COLORS["border"]
-        bg = COLORS["primary_light"] if self._selected else COLORS["scanner_unselected"]
-        return f"""
+    def _update_style(self):
+        border_color = COLORS["primary"] if self._selected else COLORS["border"]
+        bg = COLORS["primary_bg"] if self._selected else COLORS["surface"]
+        self.setStyleSheet(f"""
             ScannerCard {{
                 background: {bg};
                 border: 2px solid {border_color};
-                border-radius: 8px;
+                border-radius: {RADIUS['lg']}px;
             }}
-        """
+        """)
 
     def set_selected(self, selected: bool):
         self._selected = selected
-        self.setStyleSheet(self._get_style())
+        self._update_style()
+        # 选中时增加阴影
+        if selected:
+            add_shadow(self, blur=24, offset=4, color=QColor(13, 148, 136, 40))
+        else:
+            add_shadow(self, blur=16, offset=2, color=QColor(0, 0, 0, 20))
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.idx)
@@ -190,28 +261,28 @@ class ScannerCard(QFrame):
         if not self._selected:
             self.setStyleSheet(f"""
                 ScannerCard {{
-                    background: {COLORS['scanner_hover']};
-                    border: 2px solid {COLORS['border']};
-                    border-radius: 8px;
+                    background: {COLORS['surface_hover']};
+                    border: 2px solid {COLORS['primary_light']};
+                    border-radius: {RADIUS['lg']}px;
                 }}
             """)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
-        self.setStyleSheet(self._get_style())
+        self._update_style()
         super().leaveEvent(event)
 
 
 class ImageViewer(QWidget):
-    """图像预览组件（支持缩放）"""
+    """图像预览组件（支持缩放和旋转）"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap = None
         self._scaled_pixmap = None
         self._rotation = 0
         self.setMinimumSize(300, 200)
-        self.setStyleSheet(f"background: {COLORS['bg_light']}; border: 1px solid {COLORS['border']};")
+        self.setObjectName("imageViewer")
 
     def set_image(self, pixmap: QPixmap, rotation=0):
         self._pixmap = pixmap
@@ -222,12 +293,10 @@ class ImageViewer(QWidget):
     def _update_scaled(self):
         if self._pixmap is None:
             return
-        # 应用旋转
         transform =()
         if self._rotation:
             transform = transform.rotate(self._rotation)
         pm = self._pixmap.transformed(transform)
-        # 缩放适应窗口
         self._scaled_pixmap = pm.scaled(
             self.size() - QSize(20, 20),
             Qt.KeepAspectRatio,
@@ -242,7 +311,7 @@ class ImageViewer(QWidget):
             y = (self.height() - self._scaled_pixmap.height()) // 2
             painter.drawPixmap(x, y, self._scaled_pixmap)
         else:
-            painter.setPen(QColor(COLORS["text_hint"]))
+            painter.setPen(QColor(COLORS["text_muted"]))
             painter.drawText(self.rect(), Qt.AlignCenter, "无预览")
         painter.end()
 
@@ -264,9 +333,100 @@ class ImageViewer(QWidget):
         return self._rotation
 
 
+class AnimatedButton(QPushButton):
+    """带动画效果的按钮"""
+    def __init__(self, text, parent=None, button_type="primary"):
+        super().__init__(text, parent)
+        self.button_type = button_type
+        self.setCursor(Qt.PointingHandCursor)
+        self._update_style()
+
+    def _update_style(self):
+        if self.button_type == "primary":
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                                stop:0 {COLORS['primary']}, stop:1 {COLORS['primary_light']});
+                    color: white;
+                    border: none;
+                    padding: 10px 24px;
+                    border-radius: {RADIUS['md']}px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                                stop:0 {COLORS['primary_dark']}, stop:1 {COLORS['primary']});
+                }}
+                QPushButton:pressed {{
+                    background: {COLORS['primary_dark']};
+                }}
+                QPushButton:disabled {{
+                    background: {COLORS['text_muted']};
+                    color: {COLORS['border']};
+                }}
+            """)
+        elif self.button_type == "secondary":
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: {COLORS['surface']};
+                    color: {COLORS['text_primary']};
+                    border: 1.5px solid {COLORS['border']};
+                    padding: 8px 16px;
+                    border-radius: {RADIUS['md']}px;
+                    font-weight: 500;
+                }}
+                QPushButton:hover {{
+                    border-color: {COLORS['primary']};
+                    color: {COLORS['primary']};
+                    background: {COLORS['primary_bg']};
+                }}
+                QPushButton:pressed {{
+                    background: {COLORS['surface_hover']};
+                }}
+            """)
+        elif self.button_type == "accent":
+            self.setStyleSheet(f"""
+                QPushButton {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                                stop:0 {COLORS['accent']}, stop:1 {COLORS['accent_light']});
+                    color: white;
+                    border: none;
+                    padding: 8px 16px;
+                    border-radius: {RADIUS['md']}px;
+                    font-weight: 500;
+                }}
+                QPushButton:hover {{
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                                stop:0 {COLORS['accent_dark']}, stop:1 {COLORS['accent']});
+                }}
+            """)
+
+    def mousePressEvent(self, event):
+        # 点击缩放动画
+        self._anim = QPropertyAnimation(self, b"geometry")
+        self._anim.setDuration(ANIM["fast"])
+        self._anim.setStartValue(self.geometry())
+        rect = self.geometry()
+        self._anim.setEndValue(QRect(rect.x() + 1, rect.y() + 1, rect.width() - 2, rect.height() - 2))
+        self._anim.setEasingCurve(QEasingCurve.OutQuad)
+        self._anim.start()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._anim = QPropertyAnimation(self, b"geometry")
+        self._anim.setDuration(ANIM["fast"])
+        self._anim.setStartValue(self.geometry())
+        rect = self.geometry()
+        self._anim.setEndValue(QRect(rect.x() - 1, rect.y() - 1, rect.width() + 2, rect.height() + 2))
+        self._anim.setEasingCurve(QEasingCurve.OutQuad)
+        self._anim.start()
+        super().mouseReleaseEvent(event)
+
+
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow):
-    """主窗口"""
+    """主窗口（UI 优化版）"""
 
     def __init__(self):
         super().__init__()
@@ -299,15 +459,11 @@ class ScanApp(QMainWindow):
 
     def _setup_ui(self):
         self.setWindowTitle("HP Scan Tool v4.0")
-        self.setMinimumSize(900, 600)
-        self.resize(1000, 700)
+        self.setMinimumSize(900, 620)
+        self.resize(1050, 720)
 
         # 加载字体
         load_embedded_font()
-
-        # 设置应用字体
-        font = QFont(_FONT_FAMILY, _FONT_SIZE)
-        self.setFont(font)
 
         # 设置窗口图标
         icon_path = get_resource_path("icon_64.png")
@@ -339,41 +495,26 @@ class ScanApp(QMainWindow):
         self.scan_progress.setVisible(False)
         self.status_bar.addPermanentWidget(self.scan_progress)
 
+        # 淡入动画
+        add_fade_animation(self, ANIM["slow"])
+
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
         panel = QFrame()
         panel.setFixedWidth(280)
-        panel.setStyleSheet(f"""
-            QFrame {{
-                background: {COLORS['bg_light']};
-                border-right: 1px solid {COLORS['border']};
-            }}
-        """)
+        panel.setObjectName("scannerPanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(SPACING["md"], SPACING["md"], SPACING["md"], SPACING["md"])
+        layout.setSpacing(SPACING["sm"])
 
         # 标题
         title = QLabel("扫描仪")
-        title.setFont(QFont(_FONT_FAMILY, 12, QFont.Bold))
+        title.setFont(QFont(_FONT_FAMILY, 13, QFont.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
         layout.addWidget(title)
 
         # 刷新按钮
-        refresh_btn = QPushButton("刷新")
-        refresh_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['primary']};
-                color: white;
-                border: none;
-                padding: 6px 12px;
-                border-radius: 4px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['primary_hover']};
-            }}
-        """)
+        refresh_btn = AnimatedButton("刷新", button_type="secondary")
         refresh_btn.clicked.connect(self._auto_discover)
         layout.addWidget(refresh_btn)
 
@@ -386,7 +527,7 @@ class ScanApp(QMainWindow):
         self.cards_container = QWidget()
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(0, 0, 0, 0)
-        self.cards_layout.setSpacing(6)
+        self.cards_layout.setSpacing(SPACING["sm"])
         self.cards_layout.addStretch(1)
         scroll.setWidget(self.cards_container)
         layout.addWidget(scroll)
@@ -397,14 +538,14 @@ class ScanApp(QMainWindow):
         """构建右侧参数面板"""
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(SPACING["lg"], SPACING["lg"], SPACING["lg"], SPACING["lg"])
+        layout.setSpacing(SPACING["md"])
 
         # 参数组
         params_group = QGroupBox("扫描参数")
         params_group.setFont(QFont(_FONT_FAMILY, 10, QFont.Bold))
         params_layout = QGridLayout(params_group)
-        params_layout.setSpacing(10)
+        params_layout.setSpacing(SPACING["md"])
 
         # 分辨率
         params_layout.addWidget(QLabel("分辨率:"), 0, 0)
@@ -452,7 +593,7 @@ class ScanApp(QMainWindow):
         self.dir_entry = QLineEdit(self.output_dir)
         self.dir_entry.setReadOnly(True)
         dir_layout.addWidget(self.dir_entry)
-        browse_btn = QPushButton("浏览")
+        browse_btn = AnimatedButton("浏览", button_type="secondary")
         browse_btn.clicked.connect(self._browse)
         dir_layout.addWidget(browse_btn)
         layout.addWidget(dir_group)
@@ -462,13 +603,13 @@ class ScanApp(QMainWindow):
         extra_group.setFont(QFont(_FONT_FAMILY, 10, QFont.Bold))
         extra_layout = QVBoxLayout(extra_group)
         self.extra_list_widget = QLabel("无额外输出目录")
-        self.extra_list_widget.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.extra_list_widget.setStyleSheet(f"color: {COLORS['text_muted']};")
         extra_layout.addWidget(self.extra_list_widget)
         extra_btn_layout = QHBoxLayout()
-        add_extra_btn = QPushButton("添加")
+        add_extra_btn = AnimatedButton("添加", button_type="secondary")
         add_extra_btn.clicked.connect(self._add_extra_dir)
         extra_btn_layout.addWidget(add_extra_btn)
-        clear_extra_btn = QPushButton("清空")
+        clear_extra_btn = AnimatedButton("清空", button_type="secondary")
         clear_extra_btn.clicked.connect(self._clear_extra_dirs)
         extra_btn_layout.addWidget(clear_extra_btn)
         extra_layout.addLayout(extra_btn_layout)
@@ -476,32 +617,17 @@ class ScanApp(QMainWindow):
 
         # 操作按钮
         btn_layout = QHBoxLayout()
-        self.scan_btn = QPushButton("扫描")
-        self.scan_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['primary']};
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 6px;
-                font-size: 14px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['primary_hover']};
-            }}
-            QPushButton:disabled {{
-                background: {COLORS['text_hint']};
-            }}
-        """)
+        btn_layout.setSpacing(SPACING["sm"])
+
+        self.scan_btn = AnimatedButton("扫描", button_type="primary")
         self.scan_btn.clicked.connect(self._start_scan)
         btn_layout.addWidget(self.scan_btn)
 
-        listen_btn = QPushButton("监听模式")
+        listen_btn = AnimatedButton("监听模式", button_type="accent")
         listen_btn.clicked.connect(self._start_listen)
         btn_layout.addWidget(listen_btn)
 
-        history_btn = QPushButton("扫描历史")
+        history_btn = AnimatedButton("扫描历史", button_type="secondary")
         history_btn.clicked.connect(self._show_history)
         btn_layout.addWidget(history_btn)
 
@@ -568,7 +694,7 @@ class ScanApp(QMainWindow):
             self.extra_list_widget.setStyleSheet(f"color: {COLORS['text_primary']};")
         else:
             self.extra_list_widget.setText("无额外输出目录")
-            self.extra_list_widget.setStyleSheet(f"color: {COLORS['text_secondary']};")
+            self.extra_list_widget.setStyleSheet(f"color: {COLORS['text_muted']};")
 
     # ────────── 扫描仪管理 ──────────
     def _auto_discover(self):
@@ -577,7 +703,6 @@ class ScanApp(QMainWindow):
 
         def _discover():
             self.coordinator.discover()
-            # 回到主线程更新 UI
             QTimer.singleShot(0, self._on_discover_finished)
 
         threading.Thread(target=_discover, daemon=True).start()
@@ -590,18 +715,15 @@ class ScanApp(QMainWindow):
 
     def _rebuild_cards(self):
         """重建扫描仪卡片列表"""
-        # 清除旧卡片
         for card in self.cards:
             card.deleteLater()
         self.cards.clear()
 
-        # 移除 stretch
         while self.cards_layout.count():
             item = self.cards_layout.takeAt(0)
             if item.spacerItem():
                 self.cards_layout.removeItem(item)
 
-        # 创建新卡片
         for idx, scanner in enumerate(self.coordinator.scanners):
             card = ScannerCard(idx, scanner)
             card.clicked.connect(self._on_card_clicked)
@@ -689,7 +811,6 @@ class ScanApp(QMainWindow):
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
 
-        # 保存配置文件
         self._save_profile()
 
         scanner = self.selected
@@ -700,7 +821,7 @@ class ScanApp(QMainWindow):
         self.scan_btn.setEnabled(False)
         self.status_bar.showMessage("正在扫描...")
         self.scan_progress.setVisible(True)
-        self.scan_progress.setRange(0, 0)  # 无限进度
+        self.scan_progress.setRange(0, 0)
 
         def _scan_thread():
             try:
@@ -734,13 +855,8 @@ class ScanApp(QMainWindow):
         cache_path = cache_manager.write_page(job_id, 1, data, ext)
         del data
 
-        # 空白页检测
-        try:
-            img = Image.open(cache_path)
-            if is_blank_page(img):
-                QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到空白页"))
-        except Exception:
-            pass
+        if is_blank_page(Image.open(cache_path)):
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到空白页"))
 
         output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
         QTimer.singleShot(0, lambda: self._show_preview(cache_path, ext, output_path, job_id, scanner))
@@ -766,7 +882,6 @@ class ScanApp(QMainWindow):
             cache_manager.write_page(job_id, i, data, ext)
             del data
 
-        # 空白页检测
         if len(pages) > 1:
             self._detect_blank_pages(job_id, len(pages), ext)
 
@@ -918,7 +1033,7 @@ class ScanApp(QMainWindow):
 
 # ────────── 预览对话框 ──────────
 class PreviewDialog(QDialog):
-    """单页预览对话框"""
+    """单页预览对话框（UI 优化版）"""
 
     def __init__(self, parent, cache_path, ext, output_path, job_id,
                  device_name="", device_ip="", extra_dirs=None):
@@ -934,14 +1049,16 @@ class PreviewDialog(QDialog):
         self._cropped = False
 
         self.setWindowTitle("扫描预览")
-        self.setMinimumSize(500, 400)
-        self.resize(600, 500)
+        self.setMinimumSize(520, 420)
+        self.resize(620, 520)
 
         self._setup_ui()
         self._show_image()
+        add_fade_animation(self, ANIM["normal"])
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING["md"])
 
         # 图像预览
         self.image_viewer = ImageViewer()
@@ -950,44 +1067,32 @@ class PreviewDialog(QDialog):
         # 信息标签
         self.info_label = QLabel()
         self.info_label.setAlignment(Qt.AlignCenter)
-        self.info_label.setStyleSheet("color: #757575;")
+        self.info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.info_label)
 
         # 按钮
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(SPACING["sm"])
 
-        rotate_left_btn = QPushButton("↺ 左转")
+        rotate_left_btn = AnimatedButton("↺ 左转", button_type="secondary")
         rotate_left_btn.clicked.connect(self._rotate_left)
         btn_layout.addWidget(rotate_left_btn)
 
-        rotate_right_btn = QPushButton("↻ 右转")
+        rotate_right_btn = AnimatedButton("↻ 右转", button_type="secondary")
         rotate_right_btn.clicked.connect(self._rotate_right)
         btn_layout.addWidget(rotate_right_btn)
 
-        crop_btn = QPushButton("自动裁边")
+        crop_btn = AnimatedButton("自动裁边", button_type="secondary")
         crop_btn.clicked.connect(self._auto_crop)
         btn_layout.addWidget(crop_btn)
 
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("重新扫描")
+        cancel_btn = AnimatedButton("重新扫描", button_type="secondary")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
-        save_btn = QPushButton("保存")
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['primary']};
-                color: white;
-                border: none;
-                padding: 8px 24px;
-                border-radius: 4px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['primary_hover']};
-            }}
-        """)
+        save_btn = AnimatedButton("保存", button_type="primary")
         save_btn.clicked.connect(self._confirm)
         btn_layout.addWidget(save_btn)
 
@@ -1055,7 +1160,6 @@ class PreviewDialog(QDialog):
                     img.save(final, "TIFF")
                 saved = final
 
-            # 复制到额外输出目录
             for extra_dir in self.extra_dirs:
                 try:
                     os.makedirs(extra_dir, exist_ok=True)
@@ -1076,8 +1180,6 @@ class PreviewDialog(QDialog):
             })
 
             self.accept()
-
-            # 打开文件夹
             try:
                 os.startfile(os.path.dirname(saved))
             except Exception:
@@ -1088,7 +1190,7 @@ class PreviewDialog(QDialog):
 
 
 class MultiPagePreviewDialog(QDialog):
-    """多页预览对话框"""
+    """多页预览对话框（UI 优化版）"""
 
     TW, TH = 80, 100
 
@@ -1110,20 +1212,20 @@ class MultiPagePreviewDialog(QDialog):
         self._cropped = set()
 
         self.setWindowTitle("多页预览")
-        self.setMinimumSize(700, 500)
-        self.resize(800, 600)
+        self.setMinimumSize(720, 520)
+        self.resize(820, 620)
 
         self._setup_ui()
         self._update_preview()
         self._refresh_thumbs()
+        add_fade_animation(self, ANIM["normal"])
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING["md"])
 
-        # 分割器
         splitter = QSplitter(Qt.Horizontal)
 
-        # 左侧缩略图
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1140,7 +1242,6 @@ class MultiPagePreviewDialog(QDialog):
 
         splitter.addWidget(left_panel)
 
-        # 右侧预览
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -1150,7 +1251,7 @@ class MultiPagePreviewDialog(QDialog):
 
         self.page_info_label = QLabel()
         self.page_info_label.setAlignment(Qt.AlignCenter)
-        self.page_info_label.setStyleSheet("color: #757575;")
+        self.page_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         right_layout.addWidget(self.page_info_label)
 
         splitter.addWidget(right_panel)
@@ -1159,45 +1260,32 @@ class MultiPagePreviewDialog(QDialog):
 
         layout.addWidget(splitter)
 
-        # 按钮
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(SPACING["sm"])
 
-        rotate_left_btn = QPushButton("↺ 左转")
+        rotate_left_btn = AnimatedButton("↺ 左转", button_type="secondary")
         rotate_left_btn.clicked.connect(self._rotate_left)
         btn_layout.addWidget(rotate_left_btn)
 
-        rotate_right_btn = QPushButton("↻ 右转")
+        rotate_right_btn = AnimatedButton("↻ 右转", button_type="secondary")
         rotate_right_btn.clicked.connect(self._rotate_right)
         btn_layout.addWidget(rotate_right_btn)
 
-        crop_btn = QPushButton("裁边")
+        crop_btn = AnimatedButton("裁边", button_type="secondary")
         crop_btn.clicked.connect(self._auto_crop)
         btn_layout.addWidget(crop_btn)
 
-        crop_all_btn = QPushButton("全部裁边")
+        crop_all_btn = AnimatedButton("全部裁边", button_type="secondary")
         crop_all_btn.clicked.connect(self._auto_crop_all)
         btn_layout.addWidget(crop_all_btn)
 
         btn_layout.addStretch()
 
-        cancel_btn = QPushButton("重新扫描")
+        cancel_btn = AnimatedButton("重新扫描", button_type="secondary")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
 
-        save_btn = QPushButton("保存全部")
-        save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {COLORS['primary']};
-                color: white;
-                border: none;
-                padding: 8px 24px;
-                border-radius: 4px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: {COLORS['primary_hover']};
-            }}
-        """)
+        save_btn = AnimatedButton("保存全部", button_type="primary")
         save_btn.clicked.connect(self._confirm)
         btn_layout.addWidget(save_btn)
 
@@ -1226,7 +1314,6 @@ class MultiPagePreviewDialog(QDialog):
             self.page_info_label.setText(f"预览失败: {e}")
 
     def _refresh_thumbs(self):
-        # 清除旧缩略图
         for i in reversed(range(self.thumbs_layout.count())):
             widget = self.thumbs_layout.itemAt(i).widget()
             if widget:
@@ -1245,12 +1332,13 @@ class MultiPagePreviewDialog(QDialog):
                 thumb_btn.setIcon(QIcon(pixmap))
                 thumb_btn.setIconSize(QSize(self.TW, self.TH))
                 thumb_btn.setFixedSize(self.TW + 8, self.TH + 8)
+                thumb_btn.setCursor(Qt.PointingHandCursor)
                 thumb_btn.clicked.connect(lambda checked=False, i=idx: self._on_thumb_clicked(i))
 
                 if idx == self.selected_idx:
-                    thumb_btn.setStyleSheet(f"border: 2px solid {COLORS['primary']};")
+                    thumb_btn.setStyleSheet(f"border: 2px solid {COLORS['primary']}; border-radius: 6px;")
                 else:
-                    thumb_btn.setStyleSheet("border: 1px solid #E0E0E0;")
+                    thumb_btn.setStyleSheet(f"border: 1px solid {COLORS['border']}; border-radius: 6px;")
 
                 self.thumbs_layout.addWidget(thumb_btn)
             except Exception:
@@ -1308,7 +1396,6 @@ class MultiPagePreviewDialog(QDialog):
     def _confirm(self):
         """保存全部"""
         try:
-            # 按分组保存
             groups = self._build_groups()
             saved_files = []
 
@@ -1358,7 +1445,6 @@ class MultiPagePreviewDialog(QDialog):
                         except Exception:
                             pass
 
-            # 复制到额外输出目录
             for extra_dir in self.extra_dirs:
                 try:
                     os.makedirs(extra_dir, exist_ok=True)
@@ -1382,7 +1468,6 @@ class MultiPagePreviewDialog(QDialog):
                 })
 
             self.accept()
-
             try:
                 os.startfile(os.path.dirname(saved_files[0]))
             except Exception:
@@ -1392,10 +1477,8 @@ class MultiPagePreviewDialog(QDialog):
             QMessageBox.critical(self, "保存失败", str(e))
 
     def _build_groups(self):
-        """构建分组"""
         if not self.splits:
             return [list(range(len(self.pages)))]
-
         sorted_splits = sorted(self.splits)
         groups = []
         start = 0
@@ -1409,17 +1492,16 @@ class MultiPagePreviewDialog(QDialog):
 
 
 class HistoryDialog(QDialog):
-    """扫描历史对话框"""
+    """扫描历史对话框（UI 优化版）"""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("扫描历史")
-        self.setMinimumSize(600, 400)
-        self.resize(700, 500)
+        self.setMinimumSize(620, 420)
+        self.resize(720, 520)
 
         layout = QVBoxLayout(self)
 
-        # 历史列表
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["时间", "设备", "页数", "格式", "路径"])
         self.tree.setColumnWidth(0, 150)
@@ -1429,19 +1511,19 @@ class HistoryDialog(QDialog):
         self.tree.setAlternatingRowColors(True)
         layout.addWidget(self.tree)
 
-        # 加载历史
         self._load_history()
 
-        # 按钮
         btn_layout = QHBoxLayout()
-        clear_btn = QPushButton("清空历史")
+        clear_btn = AnimatedButton("清空历史", button_type="secondary")
         clear_btn.clicked.connect(self._clear_history)
         btn_layout.addWidget(clear_btn)
         btn_layout.addStretch()
-        close_btn = QPushButton("关闭")
+        close_btn = AnimatedButton("关闭", button_type="primary")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
         layout.addLayout(btn_layout)
+
+        add_fade_animation(self, ANIM["normal"])
 
     def _load_history(self):
         history = history_manager.get_history()
@@ -1464,18 +1546,19 @@ class HistoryDialog(QDialog):
 
 # ────────── 主入口 ──────────
 def main():
-    # 高 DPI 感知
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
 
     app = QApplication(sys.argv)
-
-    # 设置全局样式
     app.setStyle("Fusion")
 
-    # 加载字体
+    # 加载样式表
+    qss = load_stylesheet()
+    if qss:
+        app.setStyleSheet(qss)
+
     load_embedded_font()
 
     window = ScanApp()
