@@ -2,3 +2,16 @@ __pycache__/
 *.pyc
 *.spec
 scan_config.json
+cache_config.json
+history.json
+build/
+dist/
+dist2/
+dist3/
+dist4/
+dist5/
+dist6/
+dist7/
+dist8/
+dist9/
+test_output/
