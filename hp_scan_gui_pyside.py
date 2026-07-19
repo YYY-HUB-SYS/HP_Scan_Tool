@@ -451,6 +451,7 @@ class ScanApp(QMainWindow):
         self.output_format_val = self.cfg.get("output_format", "jpg")
         self.source_val = self.cfg.get("source", "平板")
         self.duplex_val = False
+        self.direct_save_val = self.cfg.get("direct_save", False)
         self.extra_dirs = []
         self.cards = []
 
@@ -521,11 +522,19 @@ class ScanApp(QMainWindow):
         title.setMinimumHeight(28)
         layout.addWidget(title)
 
-        # 刷新按钮
+        # 按钮行
+        btn_row = QHBoxLayout()
         refresh_btn = AnimatedButton("刷新", button_type="secondary")
         refresh_btn.setMinimumHeight(32)
         refresh_btn.clicked.connect(self._auto_discover)
-        layout.addWidget(refresh_btn)
+        btn_row.addWidget(refresh_btn)
+
+        add_btn = AnimatedButton("手动添加", button_type="secondary")
+        add_btn.setMinimumHeight(32)
+        add_btn.clicked.connect(self._show_add_printer_dialog)
+        btn_row.addWidget(add_btn)
+
+        layout.addLayout(btn_row)
 
         # 扫描仪卡片滚动区
         scroll = QScrollArea()
@@ -592,6 +601,11 @@ class ScanApp(QMainWindow):
         self.duplex_check.stateChanged.connect(self._on_duplex_changed)
         params_layout.addWidget(self.duplex_check, 4, 0, 1, 2)
 
+        # 直接保存（跳过预览）
+        self.direct_save_check = QCheckBox("直接保存（跳过预览）")
+        self.direct_save_check.stateChanged.connect(self._on_direct_save_changed)
+        params_layout.addWidget(self.direct_save_check, 5, 0, 1, 2)
+
         layout.addWidget(params_group)
 
         # 保存目录
@@ -640,6 +654,27 @@ class ScanApp(QMainWindow):
         btn_layout.addWidget(history_btn)
 
         layout.addLayout(btn_layout)
+
+        # 第二行按钮
+        btn_row2 = QHBoxLayout()
+
+        wia_btn = AnimatedButton("USB 扫描", button_type="secondary")
+        wia_btn.clicked.connect(self._wia_scan)
+        btn_row2.addWidget(wia_btn)
+
+        status_btn = AnimatedButton("打印机状态", button_type="secondary")
+        status_btn.clicked.connect(self._show_scanner_status)
+        btn_row2.addWidget(status_btn)
+
+        cache_btn = AnimatedButton("缓存设置", button_type="secondary")
+        cache_btn.clicked.connect(self._show_cache_settings)
+        btn_row2.addWidget(cache_btn)
+
+        profile_btn = AnimatedButton("配置管理", button_type="secondary")
+        profile_btn.clicked.connect(self._show_profile_manager)
+        btn_row2.addWidget(profile_btn)
+
+        layout.addLayout(btn_row2)
         layout.addStretch(1)
 
         parent_layout.addWidget(panel)
@@ -725,6 +760,11 @@ class ScanApp(QMainWindow):
 
     def _on_duplex_changed(self, state):
         self.duplex_val = bool(state)
+
+    def _on_direct_save_changed(self, state):
+        self.direct_save_val = bool(state)
+        self.cfg["direct_save"] = self.direct_save_val
+        save_config(self.cfg)
 
     def _update_duplex_visibility(self):
         """根据来源更新双面复选框可见性"""
@@ -923,7 +963,12 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到空白页"))
 
         output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-        QTimer.singleShot(0, lambda: self._show_preview(cache_path, ext, output_path, job_id, scanner))
+
+        # 直接保存模式
+        if self.direct_save_val:
+            self._direct_save(cache_path, ext, output_path, job_id, scanner)
+        else:
+            QTimer.singleShot(0, lambda: self._show_preview(cache_path, ext, output_path, job_id, scanner))
 
     def _do_multipage_scan(self, scanner, out_dir, source_val):
         """多页扫描"""
@@ -950,8 +995,144 @@ class ScanApp(QMainWindow):
             self._detect_blank_pages(job_id, len(pages), ext)
 
         output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-        QTimer.singleShot(0, lambda: self._show_multi_preview(
-            job_id, ext, output_path, len(pages), scanner))
+
+        # 直接保存模式
+        if self.direct_save_val:
+            self._direct_save_multipage(job_id, ext, output_path, len(pages), scanner)
+        else:
+            QTimer.singleShot(0, lambda: self._show_multi_preview(
+                job_id, ext, output_path, len(pages), scanner))
+
+    def _direct_save(self, cache_path, ext, output_path, job_id, scanner=None):
+        """直接保存（跳过预览）"""
+        try:
+            img = Image.open(cache_path)
+            if ext == "pdf":
+                pdf_path = output_path if output_path.lower().endswith(".pdf") \
+                           else output_path.rsplit(".", 1)[0] + ".pdf"
+                img.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
+                saved = pdf_path
+            else:
+                final = output_path
+                if not final.lower().endswith(f".{ext}"):
+                    final = f"{final.rsplit('.', 1)[0]}.{ext}"
+                if ext in ("jpg", "jpeg"):
+                    img.convert("RGB").save(final, "JPEG", quality=95)
+                elif ext == "png":
+                    img.save(final, "PNG")
+                elif ext in ("tiff", "tif"):
+                    img.save(final, "TIFF")
+                saved = final
+
+            # 复制到额外输出目录
+            for extra_dir in self.extra_dirs:
+                try:
+                    os.makedirs(extra_dir, exist_ok=True)
+                    extra_path = os.path.join(extra_dir, os.path.basename(saved))
+                    if extra_path != saved:
+                        shutil.copy2(saved, extra_path)
+                except Exception:
+                    pass
+
+            cache_manager.remove_job(job_id)
+
+            history_manager.append({
+                "device_name": scanner.model if scanner else "",
+                "device_ip": scanner.ip if scanner else "",
+                "page_count": 1,
+                "format": ext,
+                "file_path": saved,
+            })
+
+            self.status_bar.showMessage(f"已保存: {os.path.basename(saved)}")
+            self._reset_scan_ui()
+
+            try:
+                os.startfile(os.path.dirname(saved))
+            except Exception:
+                pass
+
+        except Exception as e:
+            self._scan_error(f"保存失败: {e}")
+
+    def _direct_save_multipage(self, job_id, ext, output_path, page_count, scanner=None):
+        """多页直接保存（跳过预览）"""
+        try:
+            base_path = output_path.rsplit(".", 1)[0]
+            saved_files = []
+
+            if ext == "pdf":
+                pdf_images = []
+                for i in range(1, page_count + 1):
+                    try:
+                        cache_path = os.path.join(
+                            cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
+                        if os.path.exists(cache_path):
+                            img = Image.open(cache_path)
+                            pdf_images.append(img.convert("RGB"))
+                    except Exception:
+                        pass
+                if pdf_images:
+                    pdf_path = f"{base_path}.pdf"
+                    pdf_images[0].save(pdf_path, "PDF", save_all=True,
+                                        append_images=pdf_images[1:])
+                    saved_files.append(pdf_path)
+            else:
+                for i in range(1, page_count + 1):
+                    try:
+                        cache_path = os.path.join(
+                            cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
+                        if os.path.exists(cache_path):
+                            fpath = f"{base_path}_{i:03d}.{ext}"
+                            if ext in ("jpg", "jpeg"):
+                                shutil.copy2(cache_path, fpath)
+                            else:
+                                img = Image.open(cache_path)
+                                if ext == "png":
+                                    img.save(fpath, "PNG")
+                                elif ext in ("tiff", "tif"):
+                                    img.save(fpath, "TIFF")
+                                else:
+                                    if img.mode != "RGB":
+                                        img = img.convert("RGB")
+                                    img.save(fpath, "JPEG", quality=95)
+                            saved_files.append(fpath)
+                    except Exception:
+                        pass
+
+            # 复制到额外输出目录
+            for extra_dir in self.extra_dirs:
+                try:
+                    os.makedirs(extra_dir, exist_ok=True)
+                    for fpath in saved_files:
+                        extra_path = os.path.join(extra_dir, os.path.basename(fpath))
+                        if extra_path != fpath:
+                            shutil.copy2(fpath, extra_path)
+                except Exception:
+                    pass
+
+            cache_manager.remove_job(job_id)
+
+            if saved_files:
+                history_manager.append({
+                    "device_name": scanner.model if scanner else "",
+                    "device_ip": scanner.ip if scanner else "",
+                    "page_count": page_count,
+                    "format": ext,
+                    "file_path": saved_files[0],
+                    "file_count": len(saved_files),
+                })
+
+            self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
+            self._reset_scan_ui()
+
+            try:
+                os.startfile(os.path.dirname(saved_files[0]))
+            except Exception:
+                pass
+
+        except Exception as e:
+            self._scan_error(f"保存失败: {e}")
 
     def _detect_blank_pages(self, job_id, page_count, ext):
         """检测空白页"""
@@ -1116,6 +1297,355 @@ class ScanApp(QMainWindow):
     def _show_history(self):
         """显示扫描历史"""
         dialog = HistoryDialog(self)
+        dialog.exec()
+
+    # ────────── 手动添加打印机 ──────────
+    def _show_add_printer_dialog(self):
+        """显示手动添加打印机对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("手动添加打印机")
+        dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(dialog)
+
+        # IP 地址输入
+        ip_layout = QHBoxLayout()
+        ip_layout.addWidget(QLabel("IP 地址:"))
+        ip_input = QLineEdit()
+        ip_input.setPlaceholderText("例如: 192.168.1.100")
+        ip_layout.addWidget(ip_input)
+        layout.addLayout(ip_layout)
+
+        # 端口输入
+        port_layout = QHBoxLayout()
+        port_layout.addWidget(QLabel("端口:"))
+        port_input = QLineEdit("80")
+        port_input.setMaximumWidth(80)
+        port_layout.addWidget(port_input)
+        port_layout.addStretch()
+        layout.addLayout(port_layout)
+
+        # 状态标签
+        status_label = QLabel("")
+        status_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(status_label)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        probe_btn = AnimatedButton("探测", button_type="secondary")
+        btn_layout.addWidget(probe_btn)
+
+        add_btn = AnimatedButton("添加", button_type="primary")
+        btn_layout.addWidget(add_btn)
+
+        cancel_btn = AnimatedButton("取消", button_type="secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        def _probe():
+            ip = ip_input.text().strip()
+            if not ip:
+                status_label.setText("请输入 IP 地址")
+                return
+            status_label.setText("正在探测...")
+            probe_btn.setEnabled(False)
+
+            def _probe_thread():
+                from escl_engine import probe_escl
+                url = probe_escl(ip, int(port_input.text() or 80))
+                if url:
+                    QTimer.singleShot(0, lambda: status_label.setText(
+                        f"✓ 发现 eSCL 服务: {url}"))
+                    QTimer.singleShot(0, lambda: add_btn.setEnabled(True))
+                else:
+                    QTimer.singleShot(0, lambda: status_label.setText(
+                        "✗ 未发现 eSCL 服务"))
+                QTimer.singleShot(0, lambda: probe_btn.setEnabled(True))
+
+            threading.Thread(target=_probe_thread, daemon=True).start()
+
+        def _add():
+            ip = ip_input.text().strip()
+            if not ip:
+                return
+            # 添加到已保存列表
+            saved_ips = self.cfg.get("saved_ips", [])
+            if not any(item.get("ip") == ip for item in saved_ips):
+                saved_ips.append({"ip": ip, "model": "手动添加"})
+                self.cfg["saved_ips"] = saved_ips
+                save_config(self.cfg)
+            # 恢复扫描仪
+            self.coordinator.restore_saved_scanners()
+            self._rebuild_cards()
+            self.status_bar.showMessage(f"已添加打印机: {ip}")
+            dialog.accept()
+
+        probe_btn.clicked.connect(_probe)
+        add_btn.clicked.connect(_add)
+        add_btn.setEnabled(False)
+
+        dialog.exec()
+
+    # ────────── 扫描仪状态 ──────────
+    def _show_scanner_status(self):
+        """显示当前扫描仪状态"""
+        if not self.selected:
+            QMessageBox.warning(self, "提示", "请先选择一台打印机")
+            return
+
+        scanner = self.selected
+        if not scanner.escl_url:
+            QMessageBox.information(self, "提示", "该打印机不支持 eSCL 状态查询")
+            return
+
+        self.status_bar.showMessage("正在查询打印机状态...")
+
+        def _status_thread():
+            from escl_engine import get_scanner_status
+            status = get_scanner_status(scanner.escl_url)
+            QTimer.singleShot(0, lambda: self._on_status_received(status))
+
+        threading.Thread(target=_status_thread, daemon=True).start()
+
+    def _on_status_received(self, status):
+        """状态查询完成"""
+        if not status:
+            self.status_bar.showMessage("无法获取打印机状态")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("打印机状态")
+        dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(dialog)
+
+        # 状态信息
+        for key, value in status.items():
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f"{key}:"))
+            value_label = QLabel(str(value))
+            value_label.setWordWrap(True)
+            row.addWidget(value_label, 1)
+            layout.addLayout(row)
+
+        layout.addStretch()
+
+        close_btn = AnimatedButton("关闭", button_type="primary")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        dialog.exec()
+
+    # ────────── WIA/USB 扫描 ──────────
+    def _wia_scan(self):
+        """WIA USB 扫描"""
+        try:
+            from wia_engine import list_wia_scanners, try_wia_scan
+        except ImportError:
+            QMessageBox.warning(self, "提示", "WIA 引擎不可用（仅 Windows 支持）")
+            return
+
+        # 获取 WIA 扫描仪列表
+        wia_scanners = list_wia_scanners()
+        if not wia_scanners:
+            QMessageBox.information(self, "提示", "未发现 WIA/USB 扫描仪")
+            return
+
+        # 选择扫描仪
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择 WIA 扫描仪")
+        dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel("选择 USB 扫描仪:"))
+        combo = QComboBox()
+        for s in wia_scanners:
+            combo.addItem(s.get("name", s.get("device_id", "未知")))
+        layout.addWidget(combo)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        scan_btn = AnimatedButton("扫描", button_type="primary")
+        btn_layout.addWidget(scan_btn)
+
+        cancel_btn = AnimatedButton("取消", button_type="secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        def _do_wia_scan():
+            idx = combo.currentIndex()
+            if idx < 0 or idx >= len(wia_scanners):
+                return
+            dialog.accept()
+
+            device = wia_scanners[idx]
+            self.status_bar.showMessage("正在通过 WIA 扫描...")
+
+            def _wia_thread():
+                try:
+                    data, ext = try_wia_scan(
+                        device_id=device.get("device_id"),
+                        resolution=self.resolution_val,
+                    )
+                    if data:
+                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        cache_manager.register_job(job_id)
+                        cache_path = cache_manager.write_page(job_id, 1, data, ext)
+                        del data
+                        out_dir = self.dir_entry.text() or self.output_dir
+                        output_path = os.path.join(
+                            out_dir,
+                            f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+                        )
+                        QTimer.singleShot(0, lambda: self._show_preview(
+                            cache_path, ext, output_path, job_id))
+                    else:
+                        QTimer.singleShot(0, lambda: self.status_bar.showMessage("WIA 扫描失败"))
+                except Exception as e:
+                    QTimer.singleShot(0, lambda: self._scan_error(f"WIA 错误: {e}"))
+
+            threading.Thread(target=_wia_thread, daemon=True).start()
+
+        scan_btn.clicked.connect(_do_wia_scan)
+        dialog.exec()
+
+    # ────────── 缓存设置 ──────────
+    def _show_cache_settings(self):
+        """显示缓存设置对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("缓存设置")
+        dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(dialog)
+
+        # 当前缓存配置
+        config = cache_manager.load_cache_config()
+
+        # 缓存限制
+        limit_layout = QHBoxLayout()
+        limit_layout.addWidget(QLabel("缓存限制 (MB):"))
+        limit_spin = QSpinBox()
+        limit_spin.setRange(100, 5000)
+        limit_spin.setValue(config.get("limit_mb", 1024))
+        limit_layout.addWidget(limit_spin)
+        layout.addLayout(limit_layout)
+
+        # 触发比例
+        trigger_layout = QHBoxLayout()
+        trigger_layout.addWidget(QLabel("触发比例 (%):"))
+        trigger_spin = QSpinBox()
+        trigger_spin.setRange(50, 99)
+        trigger_spin.setValue(int(config.get("trigger_ratio", 0.95) * 100))
+        trigger_layout.addWidget(trigger_spin)
+        layout.addLayout(trigger_layout)
+
+        # 清理大小
+        cleanup_layout = QHBoxLayout()
+        cleanup_layout.addWidget(QLabel("清理大小 (MB):"))
+        cleanup_spin = QSpinBox()
+        cleanup_spin.setRange(50, 500)
+        cleanup_spin.setValue(config.get("cleanup_mb", 200))
+        cleanup_layout.addWidget(cleanup_spin)
+        layout.addLayout(cleanup_layout)
+
+        layout.addStretch()
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        save_btn = AnimatedButton("保存", button_type="primary")
+        btn_layout.addWidget(save_btn)
+
+        cancel_btn = AnimatedButton("取消", button_type="secondary")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_layout.addWidget(cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+        def _save():
+            config["limit_mb"] = limit_spin.value()
+            config["trigger_ratio"] = trigger_spin.value() / 100.0
+            config["cleanup_mb"] = cleanup_spin.value()
+            cache_manager.save_cache_config(config)
+            self.status_bar.showMessage("缓存设置已保存")
+            dialog.accept()
+
+        save_btn.clicked.connect(_save)
+        dialog.exec()
+
+    # ────────── 配置文件管理 ──────────
+    def _show_profile_manager(self):
+        """显示配置文件管理对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("配置文件管理")
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        # 配置文件列表
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["IP 地址", "分辨率", "颜色", "格式", "来源"])
+        tree.setColumnWidth(0, 120)
+        tree.setColumnWidth(1, 80)
+        tree.setColumnWidth(2, 60)
+        tree.setColumnWidth(3, 60)
+        tree.setColumnWidth(4, 60)
+        layout.addWidget(tree)
+
+        def _refresh_profiles():
+            tree.clear()
+            profiles = profile_manager.get_all_profiles()
+            for ip, params in profiles.items():
+                item = QTreeWidgetItem([
+                    ip,
+                    str(params.get("resolution", "")),
+                    params.get("color_mode", ""),
+                    params.get("output_format", ""),
+                    params.get("source", ""),
+                ])
+                tree.addTopLevelItem(item)
+
+        _refresh_profiles()
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+
+        delete_btn = AnimatedButton("删除选中", button_type="secondary")
+        delete_btn.clicked.connect(lambda: _delete_selected())
+        btn_layout.addWidget(delete_btn)
+
+        clear_all_btn = AnimatedButton("清空全部", button_type="accent")
+        clear_all_btn.clicked.connect(lambda: _clear_all())
+        btn_layout.addWidget(clear_all_btn)
+
+        btn_layout.addStretch()
+
+        close_btn = AnimatedButton("关闭", button_type="primary")
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+        def _delete_selected():
+            item = tree.currentItem()
+            if not item:
+                return
+            ip = item.text(0)
+            profile_manager.delete_profile(ip)
+            _refresh_profiles()
+            self.status_bar.showMessage(f"已删除配置文件: {ip}")
+
+        def _clear_all():
+            reply = QMessageBox.question(dialog, "确认", "确定要清空所有配置文件吗？")
+            if reply == QMessageBox.Yes:
+                profile_manager.clear_all()
+                _refresh_profiles()
+                self.status_bar.showMessage("已清空所有配置文件")
+
         dialog.exec()
 
 
@@ -1367,6 +1897,10 @@ class MultiPagePreviewDialog(QDialog):
         crop_all_btn.clicked.connect(self._auto_crop_all)
         btn_layout.addWidget(crop_all_btn)
 
+        delete_btn = AnimatedButton("删除此页", button_type="secondary")
+        delete_btn.clicked.connect(self._delete_current_page)
+        btn_layout.addWidget(delete_btn)
+
         btn_layout.addStretch()
 
         cancel_btn = AnimatedButton("重新扫描", button_type="secondary")
@@ -1478,6 +2012,38 @@ class MultiPagePreviewDialog(QDialog):
                     self._rotations.pop(page_num, None)
             except Exception:
                 pass
+        self._update_preview()
+        self._refresh_thumbs()
+
+    def _delete_current_page(self):
+        """删除当前页"""
+        if len(self.pages) <= 1:
+            QMessageBox.warning(self, "提示", "至少需要保留一页")
+            return
+
+        page_num = self.pages[self.selected_idx]
+        reply = QMessageBox.question(
+            self, "确认", f"确定要删除第 {self.selected_idx + 1} 页吗？")
+        if reply != QMessageBox.Yes:
+            return
+
+        # 删除缓存文件
+        try:
+            cache_path = self._cache_path(page_num)
+            if os.path.exists(cache_path):
+                os.remove(cache_path)
+        except Exception:
+            pass
+
+        # 从列表中移除
+        self.pages.pop(self.selected_idx)
+        self._rotations.pop(page_num, None)
+        self._cropped.discard(page_num)
+
+        # 调整选中索引
+        if self.selected_idx >= len(self.pages):
+            self.selected_idx = len(self.pages) - 1
+
         self._update_preview()
         self._refresh_thumbs()
 
