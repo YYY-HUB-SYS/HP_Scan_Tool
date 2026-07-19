@@ -1483,10 +1483,6 @@ class PreviewDialog(ctk.CTkToplevel):
                 img.save(final, "PNG")
             elif out_ext in ("tiff", "tif"):
                 img.save(final, "TIFF")
-                else:
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    img.save(final, "JPEG", quality=95)
             saved = final
 
         # 复制到额外输出目录
