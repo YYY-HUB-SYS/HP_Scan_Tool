@@ -499,18 +499,27 @@ class ScanApp(QMainWindow):
         self.color_mode_val = self.cfg.get("color_mode_ui", "彩色")
         self.output_format_val = self.cfg.get("output_format", "jpg")
         self.source_val = self.cfg.get("source", "平板")
-        self.duplex_val = False
+        self.duplex_val = self.cfg.get("duplex", False)
         self.direct_save_val = self.cfg.get("direct_save", False)
-        self.extra_dirs = []
+        self.extra_dirs = self.cfg.get("extra_dirs", [])
         self.cards = []
 
         self._setup_ui()
+        self._refresh_extra_dirs()
         self._auto_discover()
 
     def _setup_ui(self):
         self.setWindowTitle("HP Scan Tool v4.0")
         self.setMinimumSize(900, 620)
-        self.resize(1050, 720)
+
+        # 恢复窗口大小和位置
+        width = self.cfg.get("window_width", 1050)
+        height = self.cfg.get("window_height", 720)
+        x = self.cfg.get("window_x")
+        y = self.cfg.get("window_y")
+        self.resize(width, height)
+        if x is not None and y is not None:
+            self.move(x, y)
 
         # 加载字体
         load_embedded_font()
@@ -809,6 +818,8 @@ class ScanApp(QMainWindow):
 
     def _on_duplex_changed(self, state):
         self.duplex_val = bool(state)
+        self.cfg["duplex"] = self.duplex_val
+        save_config(self.cfg)
 
     def _on_direct_save_changed(self, state):
         self.direct_save_val = bool(state)
@@ -835,10 +846,14 @@ class ScanApp(QMainWindow):
         p = QFileDialog.getExistingDirectory(self, "选择额外输出目录")
         if p and p not in self.extra_dirs:
             self.extra_dirs.append(p)
+            self.cfg["extra_dirs"] = self.extra_dirs
+            save_config(self.cfg)
             self._refresh_extra_dirs()
 
     def _clear_extra_dirs(self):
         self.extra_dirs.clear()
+        self.cfg["extra_dirs"] = self.extra_dirs
+        save_config(self.cfg)
         self._refresh_extra_dirs()
 
     def _refresh_extra_dirs(self):
@@ -1693,6 +1708,16 @@ class ScanApp(QMainWindow):
 
         save_btn.clicked.connect(_save)
         dialog.exec()
+
+    # ────────── 窗口关闭时保存设置 ──────────
+    def closeEvent(self, event):
+        """关闭窗口时保存窗口大小和位置"""
+        self.cfg["window_width"] = self.width()
+        self.cfg["window_height"] = self.height()
+        self.cfg["window_x"] = self.x()
+        self.cfg["window_y"] = self.y()
+        save_config(self.cfg)
+        super().closeEvent(event)
 
     # ────────── 配置文件管理 ──────────
     def _show_profile_manager(self):
