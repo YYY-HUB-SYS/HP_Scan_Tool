@@ -341,8 +341,11 @@ def _build_scan_job_xml(
     height: int = 4200,
     source: str = "Platen",
     duplex: bool = False,
+    max_pages: int = 1,
 ) -> str:
     """构建 POST /eSCL/ScanJobs 请求体，严格参照 node-hp-scan-to 抓包格式"""
+    # ADF 扫描需要设置 MaxScanPages 为较大值以支持多页
+    max_pages_xml = f"<scan:MaxScanPages>{max_pages}</scan:MaxScanPages>" if source == "Feeder" else ""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <scan:ScanJob xmlns:scan="{NS_SCAN}" xmlns:pwg="{NS_PWG}">
   <pwg:DocumentFormat>{doc_format}</pwg:DocumentFormat>
@@ -361,6 +364,7 @@ def _build_scan_job_xml(
   <scan:YResolution>{resolution}</scan:YResolution>
   <scan:ColorMode>{color_mode}</scan:ColorMode>
   <scan:Duplex>{str(duplex).lower()}</scan:Duplex>
+  {max_pages_xml}
 </scan:ScanJob>"""
 
 
@@ -381,7 +385,7 @@ MIME_EXT = {
 }
 
 
-def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex):
+def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=1):
     """
     创建扫描任务（POST ScanJobs），返回 (base, job_uri, ext, session)。
     调用者负责关闭 session。
@@ -402,6 +406,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
         height=scanner.max_height,
         source=source,
         duplex=duplex,
+        max_pages=max_pages,
     )
 
     headers = {"Content-Type": "application/xml"}
@@ -447,8 +452,10 @@ def execute_scan(
     session.verify = False
 
     try:
+        # ADF 扫描需要设置 MaxScanPages
+        max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex)
+            session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=max_pages)
 
         # 轮询 NextDocument
         start = time.time()
@@ -489,8 +496,10 @@ def execute_multipage_scan(
     session.verify = False
 
     try:
+        # ADF 扫描需要设置 MaxScanPages 为较大值
+        max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex)
+            session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=max_pages)
 
         # 循环获取页面
         pages = []
