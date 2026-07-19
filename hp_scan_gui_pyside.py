@@ -508,6 +508,7 @@ class ScanApp(QMainWindow):
         """构建左侧扫描仪列表面板"""
         panel = QFrame()
         panel.setFixedWidth(280)
+        panel.setMinimumWidth(260)
         panel.setObjectName("scannerPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(SPACING["md"], SPACING["md"], SPACING["md"], SPACING["md"])
@@ -517,10 +518,12 @@ class ScanApp(QMainWindow):
         title = QLabel("扫描仪")
         title.setFont(QFont(_FONT_FAMILY, 13, QFont.Bold))
         title.setStyleSheet(f"color: {COLORS['text_primary']};")
+        title.setMinimumHeight(28)
         layout.addWidget(title)
 
         # 刷新按钮
         refresh_btn = AnimatedButton("刷新", button_type="secondary")
+        refresh_btn.setMinimumHeight(32)
         refresh_btn.clicked.connect(self._auto_discover)
         layout.addWidget(refresh_btn)
 
@@ -528,9 +531,12 @@ class ScanApp(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("border: none; background: transparent;")
+        scroll.setMinimumWidth(240)
 
         self.cards_container = QWidget()
+        self.cards_container.setMinimumWidth(230)
         self.cards_layout = QVBoxLayout(self.cards_container)
         self.cards_layout.setContentsMargins(0, 0, 0, 0)
         self.cards_layout.setSpacing(SPACING["sm"])
@@ -555,32 +561,28 @@ class ScanApp(QMainWindow):
 
         # 分辨率
         params_layout.addWidget(QLabel("分辨率:"), 0, 0)
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(["150", "200", "300", "600", "1200"])
+        self.resolution_combo = self._create_styled_combo(["150", "200", "300", "600", "1200"])
         self.resolution_combo.setCurrentText(str(self.resolution_val))
         self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         params_layout.addWidget(self.resolution_combo, 0, 1)
 
         # 颜色模式
         params_layout.addWidget(QLabel("颜色:"), 1, 0)
-        self.color_mode_combo = QComboBox()
-        self.color_mode_combo.addItems(["彩色", "灰度", "黑白"])
+        self.color_mode_combo = self._create_styled_combo(["彩色", "灰度", "黑白"])
         self.color_mode_combo.setCurrentText(self.color_mode_val)
         self.color_mode_combo.currentTextChanged.connect(self._on_color_mode_changed)
         params_layout.addWidget(self.color_mode_combo, 1, 1)
 
         # 输出格式
         params_layout.addWidget(QLabel("格式:"), 2, 0)
-        self.format_combo = QComboBox()
-        self.format_combo.addItems(["jpg", "png", "pdf", "tiff"])
+        self.format_combo = self._create_styled_combo(["jpg", "png", "pdf", "tiff"])
         self.format_combo.setCurrentText(self.output_format_val)
         self.format_combo.currentTextChanged.connect(self._on_format_changed)
         params_layout.addWidget(self.format_combo, 2, 1)
 
         # 来源
         params_layout.addWidget(QLabel("来源:"), 3, 0)
-        self.source_combo = QComboBox()
-        self.source_combo.addItems(["平板", "ADF"])
+        self.source_combo = self._create_styled_combo(["平板", "ADF"])
         self.source_combo.setCurrentText(self.source_val)
         self.source_combo.currentTextChanged.connect(self._on_source_changed)
         params_layout.addWidget(self.source_combo, 3, 1)
@@ -663,6 +665,17 @@ class ScanApp(QMainWindow):
         self.cfg["source"] = self.source_val
         save_config(self.cfg)
         self._update_duplex_visibility()
+
+    def _create_styled_combo(self, items):
+        """创建统一样式的下拉框（修复双层叠加问题）"""
+        combo = QComboBox()
+        combo.addItems(items)
+        combo.setMinimumHeight(32)
+        # 关键修复：设置边框为无，避免双层叠加
+        combo.setFrame(False)
+        # 设置大小策略
+        combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return combo
 
     def _on_duplex_changed(self, state):
         self.duplex_val = bool(state)

@@ -17,6 +17,7 @@ QMainWindow {
 QFrame#scannerPanel {
     background: #F1F5F9;
     border-right: 1px solid #E2E8F0;
+    min-width: 260px;
 }
 
 /* ─── 扫描仪卡片 ─── */
@@ -24,6 +25,7 @@ ScannerCard {
     background: #FFFFFF;
     border: 1.5px solid #E2E8F0;
     border-radius: 12px;
+    min-height: 68px;
 }
 
 ScannerCard:hover {
@@ -106,6 +108,7 @@ QLineEdit {
     padding: 8px 12px;
     color: #1E293B;
     selection-background-color: #0D9488;
+    min-height: 20px;
 }
 
 QLineEdit:focus {
@@ -118,14 +121,14 @@ QLineEdit:disabled {
     color: #94A3B8;
 }
 
-/* ─── 下拉框 ─── */
+/* ─── 下拉框（修复双层叠加问题） ─── */
 QComboBox {
     background: #FFFFFF;
     border: 1.5px solid #E2E8F0;
     border-radius: 8px;
     padding: 8px 12px;
     color: #1E293B;
-    min-height: 20px;
+    min-height: 24px;
 }
 
 QComboBox:hover {
@@ -150,18 +153,25 @@ QComboBox::down-arrow {
     margin-right: 8px;
 }
 
+/* 下拉框弹出窗口 - 关键修复 */
 QComboBox QAbstractItemView {
     background: #FFFFFF;
     border: 1px solid #E2E8F0;
     border-radius: 8px;
     padding: 4px;
     outline: none;
+    /* 移除默认的系统边框 */
+    margin: 0;
+    /* 阴影效果 */
+    padding: 6px;
 }
 
 QComboBox QAbstractItemView::item {
-    padding: 8px 12px;
-    border-radius: 4px;
+    padding: 10px 14px;
+    border-radius: 6px;
     color: #1E293B;
+    margin: 2px 4px;
+    min-height: 20px;
 }
 
 QComboBox QAbstractItemView::item:hover {
