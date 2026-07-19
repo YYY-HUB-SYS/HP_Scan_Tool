@@ -671,10 +671,56 @@ class ScanApp(QMainWindow):
         combo = QComboBox()
         combo.addItems(items)
         combo.setMinimumHeight(32)
-        # 关键修复：设置边框为无，避免双层叠加
-        combo.setFrame(False)
-        # 设置大小策略
         combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 关键修复：使用自定义视图避免双层叠加
+        combo.setStyleSheet(f"""
+            QComboBox {{
+                background: #FFFFFF;
+                border: 1.5px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: #1E293B;
+            }}
+            QComboBox:hover {{
+                border-color: #0D9488;
+            }}
+            QComboBox:focus {{
+                border-color: #0D9488;
+                background: #F0FDFA;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 24px;
+            }}
+            QComboBox::down-arrow {{
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #64748B;
+                margin-right: 8px;
+            }}
+            QComboBox QAbstractItemView {{
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: 8px;
+                padding: 6px;
+                outline: none;
+            }}
+            QComboBox QAbstractItemView::item {{
+                padding: 10px 14px;
+                border-radius: 6px;
+                color: #1E293B;
+                margin: 2px 4px;
+            }}
+            QComboBox QAbstractItemView::item:hover {{
+                background: #F0FDFA;
+                color: #0D9488;
+            }}
+            QComboBox QAbstractItemView::item:selected {{
+                background: #0D9488;
+                color: white;
+            }}
+        """)
         return combo
 
     def _on_duplex_changed(self, state):
@@ -931,6 +977,11 @@ class ScanApp(QMainWindow):
         self.scan_btn.setText("扫描")
         self.scan_btn.setEnabled(True)
         self.scan_progress.setVisible(False)
+        # 移除取消监听按钮
+        if hasattr(self, 'cancel_listen_btn') and self.cancel_listen_btn:
+            self.status_bar.removeWidget(self.cancel_listen_btn)
+            self.cancel_listen_btn.deleteLater()
+            self.cancel_listen_btn = None
 
     def _scan_error(self, msg):
         """扫描错误"""
@@ -981,9 +1032,17 @@ class ScanApp(QMainWindow):
         source_val = "Platen" if "平板" in self.source_combo.currentText() else "Feeder"
         use_adf = source_val == "Feeder"
 
+        # 取消标志
+        self._listen_cancel_event = threading.Event()
+
         self.scan_btn.setText("监听中...")
         self.scan_btn.setEnabled(False)
         self.status_bar.showMessage("监听模式：等待打印机面板触发扫描...")
+
+        # 添加取消按钮
+        self.cancel_listen_btn = AnimatedButton("取消监听", button_type="accent")
+        self.cancel_listen_btn.clicked.connect(self._cancel_listen)
+        self.status_bar.addPermanentWidget(self.cancel_listen_btn)
 
         def _progress(msg, page=0):
             QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"监听模式：{msg}"))
@@ -1000,6 +1059,7 @@ class ScanApp(QMainWindow):
                         duplex=self.duplex_val,
                         wait_timeout=600.0,
                         progress_callback=_progress,
+                        cancel_event=self._listen_cancel_event,
                     )
                     if pages:
                         job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1023,6 +1083,7 @@ class ScanApp(QMainWindow):
                         duplex=self.duplex_val,
                         wait_timeout=300.0,
                         progress_callback=_progress,
+                        cancel_event=self._listen_cancel_event,
                     )
                     if result:
                         data, ext = result
@@ -1039,6 +1100,15 @@ class ScanApp(QMainWindow):
                 QTimer.singleShot(0, lambda: self._scan_error(f"监听模式错误: {e}"))
             finally:
                 QTimer.singleShot(0, self._reset_scan_ui)
+
+        threading.Thread(target=_listen_thread, daemon=True).start()
+
+    def _cancel_listen(self):
+        """取消监听模式"""
+        if hasattr(self, '_listen_cancel_event'):
+            self._listen_cancel_event.set()
+        self.status_bar.showMessage("监听模式：已取消")
+        self._reset_scan_ui()
 
         threading.Thread(target=_listen_thread, daemon=True).start()
 

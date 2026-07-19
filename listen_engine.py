@@ -30,6 +30,7 @@ def listen_for_scan(
     wait_timeout: float = 300.0,
     poll_interval: float = 2.0,
     progress_callback=None,
+    cancel_event=None,
 ) -> tuple[bytes, str] | None:
     """
     监听模式：等待打印机面板触发扫描。
@@ -47,6 +48,7 @@ def listen_for_scan(
         wait_timeout: 等待超时秒数（默认 5 分钟）
         poll_interval: 轮询间隔秒数
         progress_callback: 回调函数(status_msg)
+        cancel_event: threading.Event 取消事件
 
     Returns:
         (数据, 扩展名) 如果扫描成功，None 如果超时或取消
@@ -71,6 +73,11 @@ def listen_for_scan(
         nd_url = job_uri.rstrip("/") + "/NextDocument"
 
         while time.time() - start < wait_timeout:
+            # 检查取消
+            if cancel_event and cancel_event.is_set():
+                logger.info("监听模式已取消")
+                return None
+
             try:
                 r = session.get(nd_url, timeout=10)
                 if r.status_code == 200:
@@ -87,7 +94,11 @@ def listen_for_scan(
             except requests.RequestException:
                 pass
 
-            time.sleep(poll_interval)
+            # 分段睡眠以便及时响应取消
+            for _ in range(int(poll_interval * 5)):
+                if cancel_event and cancel_event.is_set():
+                    return None
+                time.sleep(0.2)
 
         logger.warning("监听模式超时：%.0f 秒内未收到扫描", wait_timeout)
         return None
@@ -107,6 +118,7 @@ def listen_for_multipage_scan(
     page_timeout: float = 120.0,
     poll_interval: float = 2.0,
     progress_callback=None,
+    cancel_event=None,
 ) -> list[tuple[bytes, str]] | None:
     """
     监听模式（多页）：等待打印机面板触发 ADF 扫描。
@@ -122,6 +134,7 @@ def listen_for_multipage_scan(
         page_timeout: 单页等待超时秒数
         poll_interval: 轮询间隔秒数
         progress_callback: 回调函数(status_msg, page_num)
+        cancel_event: threading.Event 取消事件
 
     Returns:
         [(数据, 扩展名), ...] 如果扫描成功，None 如果超时或取消
@@ -147,8 +160,16 @@ def listen_for_multipage_scan(
         overall_start = time.time()
 
         while time.time() - overall_start < wait_timeout:
+            # 检查取消
+            if cancel_event and cancel_event.is_set():
+                logger.info("监听模式已取消")
+                return pages if pages else None
+
             page_start = time.time()
             while time.time() - page_start < page_timeout:
+                if cancel_event and cancel_event.is_set():
+                    return pages if pages else None
+
                 try:
                     r = session.get(nd_url, timeout=10)
                     if r.status_code == 200:
@@ -164,7 +185,12 @@ def listen_for_multipage_scan(
                         pass
                 except requests.RequestException:
                     pass
-                time.sleep(poll_interval)
+
+                # 分段睡眠以便及时响应取消
+                for _ in range(int(poll_interval * 5)):
+                    if cancel_event and cancel_event.is_set():
+                        return pages if pages else None
+                    time.sleep(0.2)
             else:
                 if pages:
                     break
