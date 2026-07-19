@@ -701,11 +701,10 @@ class ScanApp(QMainWindow):
         """自动发现扫描仪"""
         self.status_bar.showMessage("正在发现扫描仪...")
 
-        def _discover():
-            self.coordinator.discover()
+        def _on_complete(new_count, new_scanners):
             QTimer.singleShot(0, self._on_discover_finished)
 
-        threading.Thread(target=_discover, daemon=True).start()
+        self.coordinator.discover_scanners_background(_on_complete)
 
     def _on_discover_finished(self):
         """发现完成更新 UI"""
