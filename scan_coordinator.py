@@ -30,6 +30,32 @@ COLOR_MODE_MAP = {
     "黑白": "BlackAndWhite1",
 }
 
+# 来源 UI 文本 → 协议值
+SOURCE_MAP = {
+    "平板": "Platen",
+    "ADF": "Feeder",
+}
+
+# 默认输出目录
+DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
+
+
+def _label_for(s: ScannerInfo) -> str:
+    """获取扫描仪显示名称"""
+    if s.custom_name:
+        return s.custom_name
+    return s.display_name
+
+
+def _ip_label_for(s: ScannerInfo) -> str:
+    """获取扫描仪 IP 和型号信息"""
+    parts = []
+    if s.ip:
+        parts.append(s.ip)
+    if s.model:
+        parts.append(s.model)
+    return " | ".join(parts) if parts else "未知设备"
+
 
 def _app_dir():
     """应用目录（PyInstaller 兼容）"""
