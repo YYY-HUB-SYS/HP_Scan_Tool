@@ -20,7 +20,6 @@ from escl_engine import (
     get_scanner_status, execute_scan, execute_multipage_scan,
     ScannerInfo, FORMAT_MIME,
 )
-from exposure import apply_exposure
 from wsd_engine import discover_all_scanners
 
 logger = logging.getLogger(__name__)
@@ -287,8 +286,7 @@ class ScanCoordinator:
     # ── 持久化辅助 ──
 
     def persist_scan_settings(self, resolution, color_mode, output_format,
-                               output_dir, source_label, exposure_mode,
-                               brightness, contrast):
+                               output_dir, source_label):
         """将当前扫描参数写入配置"""
         self.cfg.update({
             "resolution": resolution,
@@ -296,44 +294,8 @@ class ScanCoordinator:
             "output_format": output_format,
             "output_dir": output_dir,
             "source": source_label,
-            "exposure_mode": exposure_mode,
-            "brightness": brightness,
-            "contrast": contrast,
         })
         self.save_config()
-
-
-# ── 保存/确认辅助函数（供 PreviewDialog 使用）──
-
-
-def process_image_with_exposure(cache_path, mode, brightness=0, contrast=0,
-                                 gamma=1.0, shadows=0, highlights=0,
-                                 channel_gains=(1.0, 1.0, 1.0),
-                                 mime="image/jpeg"):
-    """从缓存加载图片并应用曝光处理，返回 PIL Image"""
-    from PIL import Image
-    img = Image.open(cache_path)
-    return apply_exposure(img, mode=mode, brightness=brightness, contrast=contrast,
-                          gamma=gamma, shadows=shadows, highlights=highlights,
-                          channel_gains=channel_gains, mime=mime)
-
-
-def save_scan_result(img, output_path, output_format="jpg"):
-    """保存处理后的 PIL Image 到目标文件"""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    if output_format == "pdf":
-        img.save(output_path, "PDF", resolution=150.0)
-    elif output_format == "png":
-        img.save(output_path, "PNG")
-    elif output_format == "bmp":
-        if img.mode == "RGB":
-            img.save(output_path, "BMP")
-        else:
-            img.convert("RGB").save(output_path, "BMP")
-    else:
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img.save(output_path, "JPEG", quality=95)
 
 
 def record_scan_history(device_name, device_ip, output_path, page_count,
@@ -367,58 +329,6 @@ def compute_page_groups(splits: list[int], total_pages: int) -> list[list[int]]:
     if prev < total_pages:
         groups.append(list(range(prev, total_pages)))
     return groups
-
-
-def save_multipage_result(job_id, ext, output_path, output_format, groups,
-                           group_names, process_page_fn):
-    """
-    保存多页扫描结果。
-    process_page_fn(page_idx) -> PIL.Image 用于获取处理后的页面图像。
-    """
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    base, _ = os.path.splitext(output_path)
-    saved_paths = []
-
-    if output_format == "pdf" and len(groups) == 1:
-        # 单组 → 单个 PDF
-        pages = [process_page_fn(p) for p in groups[0]]
-        if pages:
-            pages[0].save(output_path, "PDF", resolution=150.0,
-                          save_all=True, append_images=pages[1:])
-            saved_paths.append(output_path)
-    elif output_format == "pdf":
-        # 多组 → 多个 PDF
-        for gi, group in enumerate(groups):
-            pages = [process_page_fn(p) for p in group]
-            if pages:
-                name = group_names[gi] if gi < len(group_names) else f"组{gi + 1}"
-                safe = name.replace("/", "_").replace("\\", "_")
-                path = f"{base}_{safe}.pdf"
-                pages[0].save(path, "PDF", resolution=150.0,
-                              save_all=True, append_images=pages[1:])
-                saved_paths.append(path)
-    else:
-        # 逐页保存为图片
-        for gi, group in enumerate(groups):
-            for pi in group:
-                img = process_page_fn(pi)
-                if len(groups) > 1:
-                    name = group_names[gi] if gi < len(group_names) else f"组{gi + 1}"
-                    safe = name.replace("/", "_").replace("\\", "_")
-                    path = f"{base}_{safe}_p{pi + 1}.{ext}"
-                else:
-                    path = f"{base}_p{pi + 1}.{ext}"
-                if output_format == "png":
-                    img.save(path, "PNG")
-                elif output_format == "bmp":
-                    (img if img.mode == "RGB" else img.convert("RGB")).save(path, "BMP")
-                else:
-                    if img.mode != "RGB":
-                        img = img.convert("RGB")
-                    img.save(path, "JPEG", quality=95)
-                saved_paths.append(path)
-
-    return saved_paths
 
 
 def delete_cached_page(job_id, page_idx, ext, splits):

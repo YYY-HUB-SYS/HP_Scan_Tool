@@ -22,14 +22,12 @@ from escl_engine import (
     get_scanner_status, execute_scan, execute_multipage_scan,
     ScannerInfo, FORMAT_MIME, MIME_EXT,
 )
-from exposure import apply_exposure
 from wsd_engine import discover_all_scanners
 import cache_manager
 import history_manager
 from scan_coordinator import (
-    ScanCoordinator, process_image_with_exposure, save_scan_result,
-    record_scan_history, cleanup_cache_job, compute_page_groups,
-    save_multipage_result, delete_cached_page, COLOR_MODE_MAP,
+    ScanCoordinator, record_scan_history, cleanup_cache_job,
+    compute_page_groups, delete_cached_page, COLOR_MODE_MAP,
 )
 
 # ---------- 资源路径（SOP 7.5.1） ----------
@@ -129,6 +127,43 @@ class ScanApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        self.title("惠普集成扫描工具")
+        self.geometry("840x620")
+        self.minsize(720, 500)
+        # ★ 设置窗口图标：用 iconphoto + PNG（比 iconbitmap + ICO 更清晰）
+        try:
+            import tkinter as tk
+            _icon32 = get_resource_path("icon_32.png")
+            _icon64 = get_resource_path("icon_64.png")
+            _photo32 = tk.PhotoImage(file=_icon32)
+            _photo64 = tk.PhotoImage(file=_icon64)
+            self.iconphoto(True, _photo64)  # True = 应用到所有 Toplevel
+            self.iconphoto(False, _photo32)
+            # 保持引用防止被 GC
+            self._icon_photos = [_photo32, _photo64]
+        except Exception:
+            try:
+                _ico = get_resource_path("app.ico")
+                self.iconbitmap(default=_ico)
+                self.iconbitmap(_ico)
+            except Exception:
+                pass
+
+        saved_theme = self.cfg if hasattr(self, '_cfg_pre') else {}
+        # 先读配置决定主题（在 build 之前）
+        _pre_cfg = load_config()
+        ctk.set_appearance_mode(_pre_cfg.get("theme", "dark"))
+        ctk.set_default_color_theme("blue")
+
+        # ★ 加载遮罩：覆盖整个窗口，盖住 UI 构建过程
+        bg = "#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#f5f5f5"
+        self._splash = ctk.CTkFrame(self, fg_color=bg, corner_radius=0)
+        self._splash.place(relx=0, rely=0, relwidth=1, relheight=1)
+        ctk.CTkLabel(self._splash, text="加载中...",
+                     font=ctk.CTkFont(size=16),
+                     text_color=("gray30", "gray80")).place(relx=0.5, rely=0.5, anchor="center")
+        self.update_idletasks()  # 确保遮罩先渲染出来
+
         # 加载嵌入式思源黑体（仅本进程生效，不污染系统字体）
         _load_embedded_font()
 
@@ -151,14 +186,6 @@ class ScanApp(ctk.CTk):
         except Exception:
             pass
 
-        self.title("惠普集成扫描工具")
-        self.geometry("840x620")
-        self.minsize(720, 500)
-
-        saved_theme = self.cfg.get("theme", "dark")
-        ctk.set_appearance_mode(saved_theme)
-        ctk.set_default_color_theme("blue")
-
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
@@ -170,15 +197,20 @@ class ScanApp(ctk.CTk):
         self.color_mode_val = self.cfg.get("color_mode_ui", "彩色")
         self.output_format_val = self.cfg.get("output_format", "jpg")
         self.source_val = self.cfg.get("source", "平板")
-        self.exposure_mode = self.cfg.get("exposure_mode", "关闭")
-        self.brightness_val = self.cfg.get("brightness", 0)
-        self.contrast_val = self.cfg.get("contrast", 0)
 
         self._build_topbar()
         self._build_main()
         self._build_progress()
 
         self._restore_presets()
+
+        # ★ 遮罩必须在所有 pack/grid widget 之后 lift 到最上层，
+        # 否则 place 的 widget 可能被 pack/grid 的 canvas 覆盖
+        self._splash.lift()
+        self.update_idletasks()
+        self._splash.destroy()
+        self._splash = None
+
         self.after(400, self._auto_discover)
 
     # ────────── 顶栏 ──────────
@@ -238,10 +270,12 @@ class ScanApp(ctk.CTk):
         btn_bar.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 4))
 
         self.disc_btn = ctk.CTkButton(btn_bar, text="搜索局域网",
-                                       height=30, command=self._refresh,
+                                       height=34, font=ctk.CTkFont(size=12),
+                                       command=self._refresh,
                                        hover_color=("#3a7ebf", "#1f538d"))
         self.disc_btn.pack(side="left", padx=2)
-        ctk.CTkButton(btn_bar, text="手动添加", height=30,
+        ctk.CTkButton(btn_bar, text="手动添加", height=34,
+                      font=ctk.CTkFont(size=12),
                       fg_color="transparent", border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
@@ -288,86 +322,31 @@ class ScanApp(ctk.CTk):
         self._param(params, "来源", ["平板"], self.source_val, 0, 3)
         self.src_cb = params.grid_slaves(row=1, column=3)[0]
 
-        # 曝光控制面板（初始隐藏，扫描后才显示——有预览才能确定曝光）
-        self._exp_visible = False
-        exp_frame = ctk.CTkFrame(right)
-        self.exp_frame = exp_frame
-        exp_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(4, 2))
-        exp_frame.grid_remove()  # 初始隐藏
-        exp_frame.grid_columnconfigure(0, weight=1)
-
-        exp_hdr = ctk.CTkFrame(exp_frame, fg_color="transparent")
-        exp_hdr.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
-        ctk.CTkLabel(exp_hdr, text="曝光调整",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
-
-        self.exp_mode_var = ctk.StringVar(value=self.exposure_mode)
-        exp_seg = ctk.CTkSegmentedButton(
-            exp_frame,
-            values=["关闭", "自动", "手动"],
-            variable=self.exp_mode_var,
-            command=self._on_exposure_mode,
-            height=28,
-        )
-        exp_seg.grid(row=1, column=0, padx=10, pady=(2, 4))
-
-        # 手动曝光：亮度 / 对比度
-        self.manual_frame = ctk.CTkFrame(exp_frame, fg_color="transparent")
-        self.manual_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
-        self.manual_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(self.manual_frame, text="亮度",
-                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, padx=(0, 4), sticky="w")
-        self.bri_slider = ctk.CTkSlider(
-            self.manual_frame, from_=-100, to=100, number_of_steps=200,
-            command=self._on_brightness)
-        self.bri_slider.grid(row=0, column=1, sticky="ew", padx=4)
-        self.bri_lbl = ctk.CTkLabel(self.manual_frame, text=str(self.brightness_val),
-                                    font=ctk.CTkFont(size=11), width=32)
-        self.bri_lbl.grid(row=0, column=2, padx=(4, 0))
-        self.bri_slider.set(self.brightness_val)
-
-        ctk.CTkLabel(self.manual_frame, text="对比度",
-                     font=ctk.CTkFont(size=11)).grid(row=1, column=0, padx=(0, 4), sticky="w", pady=(4, 0))
-        self.con_slider = ctk.CTkSlider(
-            self.manual_frame, from_=-100, to=100, number_of_steps=200,
-            command=self._on_contrast)
-        self.con_slider.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.con_lbl = ctk.CTkLabel(self.manual_frame, text=str(self.contrast_val),
-                                    font=ctk.CTkFont(size=11), width=32)
-        self.con_lbl.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
-        self.con_slider.set(self.contrast_val)
-
-        # 初始滑块状态
-        self._set_manual_sliders(self.exposure_mode == "手动")
-
         # 保存目录（卡片式，与参数区视觉分隔）
         save_row = ctk.CTkFrame(right)
-        save_row.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 8))
+        save_row.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 8))
         ctk.CTkLabel(save_row, text="保存到",
                      font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 6))
         self.dir_entry = ctk.CTkEntry(save_row)
         self.dir_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
         self.dir_entry.insert(0, self.output_dir)
-        ctk.CTkButton(save_row, text="浏览", width=50, height=28,
-                      font=ctk.CTkFont(size=11),
+        ctk.CTkButton(save_row, text="浏览", width=60, height=34,
+                      font=ctk.CTkFont(size=12),
                       fg_color="transparent", border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       hover_color=("gray82", "gray25"),
                       command=self._browse).pack(side="right", padx=(0, 8))
 
-        # 操作按钮行（扫描为主操作，占更多宽度）
+        # 操作按钮行（四个按钮等高等宽，扫描按钮用实心蓝色区分主操作）
         action = ctk.CTkFrame(right, fg_color="transparent")
-        action.grid(row=5, column=0, sticky="ew", padx=12, pady=(4, 12))
-        action.grid_columnconfigure(0, weight=1)
-        action.grid_columnconfigure(1, weight=1)
-        action.grid_columnconfigure(2, weight=1)
-        action.grid_columnconfigure(3, weight=3)  # 扫描按钮占 3 份宽度，视觉主导
+        action.grid(row=4, column=0, sticky="ew", padx=12, pady=(4, 2))
+        action.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.caps_btn = ctk.CTkButton(action, text="查询能力",
-                                       height=32, border_width=1,
-                                       font=ctk.CTkFont(size=11),
+                                       height=36,
+                                       font=ctk.CTkFont(size=12),
+                                       border_width=1,
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
@@ -376,8 +355,9 @@ class ScanApp(ctk.CTk):
         self.caps_btn.grid(row=0, column=0, sticky="ew", padx=2)
 
         self.stat_btn = ctk.CTkButton(action, text="预览状态",
-                                       height=32, border_width=1,
-                                       font=ctk.CTkFont(size=11),
+                                       height=36,
+                                       font=ctk.CTkFont(size=12),
+                                       border_width=1,
                                        text_color=("gray30", "gray80"),
                                        border_color=("gray40", "gray60"),
                                        fg_color="transparent",
@@ -386,8 +366,9 @@ class ScanApp(ctk.CTk):
         self.stat_btn.grid(row=0, column=1, sticky="ew", padx=2)
 
         ctk.CTkButton(action, text="扫描历史",
-                      height=32, border_width=1,
-                      font=ctk.CTkFont(size=11),
+                      height=36,
+                      font=ctk.CTkFont(size=12),
+                      border_width=1,
                       text_color=("gray30", "gray80"),
                       border_color=("gray40", "gray60"),
                       fg_color="transparent",
@@ -395,11 +376,16 @@ class ScanApp(ctk.CTk):
                       command=self._show_history).grid(row=0, column=2, sticky="ew", padx=2)
 
         self.scan_btn = ctk.CTkButton(action, text="扫描",
-                                       height=38,
-                                       font=ctk.CTkFont(size=14, weight="bold"),
-                                       corner_radius=6,
+                                       height=36,
+                                       font=ctk.CTkFont(size=12, weight="bold"),
                                        command=self._start_scan)
         self.scan_btn.grid(row=0, column=3, sticky="ew", padx=2)
+
+        # 扫描进度条（初始隐藏，扫描时显示）
+        self.scan_progress = ctk.CTkProgressBar(right, height=10)
+        self.scan_progress.grid(row=5, column=0, sticky="ew", padx=12, pady=(2, 8))
+        self.scan_progress.grid_remove()
+        self.scan_progress.set(0)
 
     def _param(self, parent, label, values, default, row, col, command=None):
         ctk.CTkLabel(parent, text=label,
@@ -407,28 +393,6 @@ class ScanApp(ctk.CTk):
         cb = ctk.CTkComboBox(parent, values=values, state="readonly", width=100, command=command)
         cb.set(default)
         cb.grid(row=1, column=col, padx=8, pady=(2, 8))
-
-    # ────────── 曝光控制 ──────────
-    def _on_exposure_mode(self, value):
-        self.exposure_mode = value
-        self.cfg["exposure_mode"] = value
-        save_config(self.cfg)
-        self._set_manual_sliders(value == "手动")
-
-    def _on_brightness(self, val):
-        v = int(val)
-        self.brightness_val = v
-        self.bri_lbl.configure(text=str(v))
-
-    def _on_contrast(self, val):
-        v = int(val)
-        self.contrast_val = v
-        self.con_lbl.configure(text=str(v))
-
-    def _set_manual_sliders(self, enabled):
-        state = "normal" if enabled else "disabled"
-        self.bri_slider.configure(state=state)
-        self.con_slider.configure(state=state)
 
     # ────────── 窗口关闭清理 ──────────
     def destroy(self):
@@ -451,6 +415,32 @@ class ScanApp(ctk.CTk):
         self.progress.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 6))
         self.progress.grid_remove()
         self.progress.configure(mode="indeterminate")
+
+    def _set_taskbar_icon(self):
+        """用 Windows API 设置任务栏图标（精确尺寸，避免缩放模糊）"""
+        try:
+            import ctypes
+            # 获取窗口句柄（需要 GetParent 获取真正的顶层窗口）
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            if not hwnd:
+                hwnd = self.winfo_id()
+            if not hwnd:
+                return
+            
+            ico_path = getattr(self, '_ico_path', None)
+            if not ico_path:
+                return
+            
+            # LR_LOADFROMFILE=0x0010, IMAGE_ICON=1
+            # width=0, height=0 让 Windows 自动选择 ICO 中最合适的尺寸
+            hicon = ctypes.windll.user32.LoadImageW(
+                0, ico_path, 1, 0, 0, 0x0010)
+            if hicon:
+                # WM_SETICON=0x0080, ICON_SMALL=0, ICON_BIG=1
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon)
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon)
+        except Exception:
+            pass
 
     # ────────── 扫描仪卡片 ──────────
     def _rebuild_cards(self):
@@ -518,6 +508,14 @@ class ScanApp(ctk.CTk):
                 self.coordinator.scanners[i] = results[s.ip]
                 if self.selected and self.selected.ip == s.ip:
                     self.selected = results[s.ip]
+        # 探活完成后，如果还没有选中扫描仪，尝试恢复上次选中的
+        if self.selected is None:
+            saved_ip = self.cfg.get("selected_scanner_ip", "")
+            if saved_ip:
+                for i, s in enumerate(self.coordinator.scanners):
+                    if s.ip == saved_ip:
+                        self.select_scanner(i)
+                        break
 
     def _auto_discover(self):
         # 已有历史打印机则跳过自动搜索，直接加载
@@ -573,8 +571,16 @@ class ScanApp(ctk.CTk):
         self.status_bar.configure(
             text=f"发现 {n} 台打印机 (+{new_count} 新增) — 单击选中后按「扫描」" if n
             else "未发现打印机，请确认电源和网络，或手动添加 IP")
-        # 仅在无新设备时保留原选中；有新设备加入时重置以便用户看到完整列表
-        if new_count > 0:
+        # 恢复上次选中的扫描仪（按 IP 匹配）
+        saved_ip = self.cfg.get("selected_scanner_ip", "")
+        restored = False
+        if saved_ip:
+            for i, s in enumerate(self.coordinator.scanners):
+                if s.ip == saved_ip:
+                    self.select_scanner(i)
+                    restored = True
+                    break
+        if not restored:
             self.selected = None
             self.selected_idx = -1
 
@@ -613,6 +619,11 @@ class ScanApp(ctk.CTk):
             for i, card in enumerate(self.cards):
                 card.set_selected(i == idx)
 
+            # 持久化选中的扫描仪 IP
+            if self.selected.ip:
+                self.cfg["selected_scanner_ip"] = self.selected.ip
+                save_config(self.cfg)
+
     # ────────── 自定义名称 ──────────
     def set_custom_name(self, idx: int, name: str):
         if 0 <= idx < len(self.coordinator.scanners):
@@ -630,6 +641,33 @@ class ScanApp(ctk.CTk):
             if self.selected_idx == idx:
                 label = _label_for(self.coordinator.scanners[idx])
                 self.status_bar.configure(text=f"已选择: {label}")
+
+    # ────────── 调整打印机优先级 ──────────
+    def move_scanner(self, idx: int, direction: int):
+        """移动打印机在列表中的位置（direction: -1=上移, +1=下移）"""
+        new_idx = idx + direction
+        if not (0 <= new_idx < len(self.coordinator.scanners)):
+            return
+        
+        # 交换位置
+        scanners = self.coordinator.scanners
+        scanners[idx], scanners[new_idx] = scanners[new_idx], scanners[idx]
+        
+        # 更新选中索引
+        if self.selected_idx == idx:
+            self.selected_idx = new_idx
+        elif self.selected_idx == new_idx:
+            self.selected_idx = idx
+        
+        # 保存排序到配置
+        ips = []
+        for s in scanners:
+            if s.ip:
+                ips.append({"ip": s.ip, "model": s.model})
+        self.cfg["saved_ips"] = ips
+        save_config(self.cfg)
+        
+        self._rebuild_cards()
 
     # ────────── 手动添加 ──────────
     def _manual_add(self):
@@ -823,16 +861,16 @@ class ScanApp(ctk.CTk):
             "output_format": self.output_format_val,
             "output_dir": out_dir,
             "source": self.src_cb.get(),
-            "exposure_mode": self.exposure_mode,
-            "brightness": self.brightness_val,
-            "contrast": self.contrast_val,
         })
         save_config(self.cfg)
 
         # 增加活跃扫描计数
         count = self.coordinator.begin_scan()
-        self.scan_btn.configure(text=f"扫描中 ({count})...")
+        self.scan_btn.configure(text=f"扫描中 ({count})...", state="disabled")
         self.status_bar.configure(text=f"活跃扫描任务: {count}")
+        # 显示进度条
+        self.scan_progress.grid()
+        self.scan_progress.set(0)
 
         threading.Thread(target=self._do_capture, args=(
             scanner, fpath, source_val,
@@ -872,8 +910,10 @@ class ScanApp(ctk.CTk):
             if use_adf:
                 # 多页 ADF 扫描
                 def _progress(n, _total):
-                    self.after(0, lambda: self.status_bar.configure(
-                        text=f"正在扫描... 已获取 {n} 页"))
+                    self.after(0, lambda n=n: (
+                        self.status_bar.configure(text=f"正在扫描... 已获取 {n} 页"),
+                        self.scan_progress.set(min(0.95, n * 0.15))
+                    ))
 
                 pages = execute_multipage_scan(
                     scanner=scanner,
@@ -884,12 +924,14 @@ class ScanApp(ctk.CTk):
                     timeout=300.0,
                     progress_callback=_progress,
                 )
+                self.after(0, lambda: self.scan_progress.set(0.95))
                 # 写入缓存
                 ext = pages[0][1] if pages else self.output_format_val
                 for i, (data, ext) in enumerate(pages, 1):
                     cache_manager.write_page(job_id, i, data, ext)
                     del data
 
+                self.after(0, lambda: self.scan_progress.set(1.0))
                 if len(pages) > 1:
                     self.after(0, lambda s=scanner: self._show_multi_preview(job_id, ext, output_path, len(pages), scanner=s))
                 else:
@@ -897,6 +939,7 @@ class ScanApp(ctk.CTk):
                     self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, output_path, job_id, scanner=s))
             else:
                 # 单页平板扫描
+                self.after(0, lambda: self.scan_progress.set(0.3))
                 data, ext = execute_scan(
                     scanner=scanner,
                     resolution=self.resolution_val,
@@ -905,8 +948,10 @@ class ScanApp(ctk.CTk):
                     source=source_val,
                     timeout=90.0,
                 )
+                self.after(0, lambda: self.scan_progress.set(0.8))
                 cache_path = cache_manager.write_page(job_id, 1, data, ext)
                 del data
+                self.after(0, lambda: self.scan_progress.set(1.0))
                 self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, output_path, job_id, scanner=s))
         except Exception as e:
             tb = traceback.format_exc()
@@ -922,8 +967,11 @@ class ScanApp(ctk.CTk):
 
         scanner = self.selected
         count = self.coordinator.begin_scan()
-        self.scan_btn.configure(text=f"扫描中 ({count})...")
+        self.scan_btn.configure(text=f"扫描中 ({count})...", state="disabled")
         self.status_bar.configure(text=f"活跃扫描任务: {count}")
+        # 显示进度条
+        self.scan_progress.grid()
+        self.scan_progress.set(0)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_tag = scanner.model.replace(" ", "_") if scanner.model else "scan"
@@ -931,6 +979,7 @@ class ScanApp(ctk.CTk):
 
         def do():
             from wia_engine import try_wia_scan
+            self.after(0, lambda: self.scan_progress.set(0.3))
             result = try_wia_scan(
                 resolution=self.resolution_val,
                 color_mode_name=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
@@ -938,10 +987,12 @@ class ScanApp(ctk.CTk):
             )
             if result:
                 data, ext = result
+                self.after(0, lambda: self.scan_progress.set(0.8))
                 job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 cache_manager.register_job(job_id)
                 cache_path = cache_manager.write_page(job_id, 1, data, ext)
                 del data
+                self.after(0, lambda: self.scan_progress.set(1.0))
                 self.after(0, lambda s=scanner: self._show_preview(cache_path, ext, fpath, job_id, scanner=s))
             else:
                 self.after(0, lambda: self._scan_error("WIA 扫描失败，未找到可用扫描仪"))
@@ -954,6 +1005,9 @@ class ScanApp(ctk.CTk):
         if count == 0:
             self.scan_btn.configure(text="扫描", state="normal")
             self._set_loading(False)
+            # 隐藏进度条
+            self.scan_progress.grid_remove()
+            self.scan_progress.set(0)
         else:
             self.scan_btn.configure(text=f"扫描中 ({count})...")
 
@@ -966,17 +1020,10 @@ class ScanApp(ctk.CTk):
                             "2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达\n"
                             "3. 防火墙未拦截")
 
-    def _show_exposure_panel(self):
-        """扫描完成后显示曝光调整面板（首次扫描后展开）"""
-        if not self._exp_visible:
-            self._exp_visible = True
-            self.exp_frame.grid()
-
     def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         self._reset_scan_ui()
-        self._show_exposure_panel()
         count = self.coordinator.active_scan_count()
-        self.status_bar.configure(text=f"扫描完成 — 调整曝光效果后点击保存 (活跃: {count})")
+        self.status_bar.configure(text=f"扫描完成 — 点击保存 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
         PreviewDialog(self, cache_path, ext, output_path, job_id,
@@ -984,9 +1031,8 @@ class ScanApp(ctk.CTk):
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
         self._reset_scan_ui()
-        self._show_exposure_panel()
         count = self.coordinator.active_scan_count()
-        self.status_bar.configure(text=f"扫描完成 — {page_count} 页，调整曝光后保存 (活跃: {count})")
+        self.status_bar.configure(text=f"扫描完成 — {page_count} 页 (活跃: {count})")
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
         MultiPagePreviewDialog(self, job_id, ext, output_path, page_count,
@@ -997,24 +1043,30 @@ class ScanApp(ctk.CTk):
 
 
 # ================================================
-#  扫描预览对话框（实时曝光调整）
+#  扫描预览对话框
 # ================================================
 
 class PreviewDialog(ctk.CTkToplevel):
-    """扫描后预览：实时调整曝光效果，确认后保存"""
-
-    PW, PH = 420, 320  # 预览区域最大尺寸
-    HW, HH = 420, 80   # 直方图尺寸
+    """扫描后预览：确认后保存"""
 
     def __init__(self, parent, cache_path: str, ext: str, output_path: str, job_id: str,
                  device_name: str = "", device_ip: str = ""):
         super().__init__(parent)
-        self.title("扫描预览 — 调整曝光效果")
-        self.geometry("540x820")
-        self.minsize(460, 600)
+        self.title("扫描预览")
+        self.geometry("540x520")
+        self.minsize(460, 420)
         self.resizable(True, True)
         self.transient(parent)
-        self.grab_set()
+        try:
+            import tkinter as tk
+            _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
+            self.iconphoto(True, _p)
+            self._icon_photo = _p
+        except Exception:
+            try:
+                self.iconbitmap(get_resource_path("app.ico"))
+            except Exception:
+                pass
 
         self.cache_path = cache_path
         self.ext = ext
@@ -1022,144 +1074,22 @@ class PreviewDialog(ctk.CTkToplevel):
         self.job_id = job_id
         self.device_name = device_name
         self.device_ip = device_ip
-        self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
-
-        self.exp_mode = "关闭"
-        self.bri = 0
-        self.con = 0
-        self.gamma = 1.0
-        self.shadows = 0
-        self.highlights = 0
-        self.r_gain = 1.0
-        self.g_gain = 1.0
-        self.b_gain = 1.0
         self._preview_photo = None
 
         self._build()
-        self._update_preview()
+        self.grab_set()
 
-        # 居中显示
-        self.update_idletasks()
+        # 居中
         x = parent.winfo_x() + (parent.winfo_width() - 540) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 820) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 520) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
+        self.after_idle(self._show_image)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
-    # ────────── 构建 UI ──────────
     def _build(self):
-        # 图片预览区（可伸缩）
-        pf = ctk.CTkFrame(self)
-        pf.pack(fill="both", expand=True, padx=14, pady=(14, 6))
-        self.img_lbl = ctk.CTkLabel(pf, text="正在加载预览...",
-                                    fg_color=("gray85", "gray25"),
-                                    corner_radius=6)
-        self.img_lbl.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # 窗口大小变化时重新渲染预览
-        self.bind("<Configure>", self._on_resize)
-        self._last_size = (0, 0)
-
-        # 直方图区域
-        from tkinter import Canvas
-        self.hist_canvas = Canvas(self, width=self.HW, height=self.HH,
-                                  bg="#2b2b2b" if ctk.get_appearance_mode() == "Dark" else "#e8e8e8",
-                                  highlightthickness=0)
-        self.hist_canvas.pack(padx=14, pady=(0, 4))
-
-        # 预设选择行
-        import preset_manager
-        self._preset_mgr = preset_manager
-        preset_row = ctk.CTkFrame(self, fg_color="transparent")
-        preset_row.pack(fill="x", padx=14, pady=(2, 0))
-        ctk.CTkLabel(preset_row, text="预设",
-                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
-        self._preset_names = [p["name"] for p in preset_manager.load_presets()]
-        self._preset_combo = ctk.CTkComboBox(
-            preset_row, values=self._preset_names, state="readonly",
-            width=140, height=26, font=ctk.CTkFont(size=11),
-            command=self._on_preset_select)
-        self._preset_combo.pack(side="left", padx=(0, 4))
-        self._preset_combo.set("预设...")
-        ctk.CTkButton(preset_row, text="保存当前", width=60, height=26,
-                      font=ctk.CTkFont(size=10),
-                      fg_color="transparent", border_width=1,
-                      text_color=("gray30", "gray80"),
-                      border_color=("gray40", "gray60"),
-                      command=self._on_preset_save).pack(side="left")
-
-        # 曝光控制区
-        ef = ctk.CTkFrame(self)
-        ef.pack(fill="x", padx=14, pady=4)
-
-        ctk.CTkLabel(ef, text="曝光模式",
-                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=8, pady=(6, 2))
-
-        self.exp_var = ctk.StringVar(value="关闭")
-        ctk.CTkSegmentedButton(
-            ef, values=["关闭", "自动", "手动"],
-            variable=self.exp_var,
-            command=self._on_mode, height=30,
-        ).pack(padx=8, pady=(0, 6))
-
-        # 手动滑块
-        mf = ctk.CTkFrame(ef, fg_color="transparent")
-        mf.pack(fill="x", padx=8, pady=(0, 6))
-        mf.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(mf, text="亮度", font=ctk.CTkFont(size=11)).grid(
-            row=0, column=0, sticky="w", padx=(0, 4))
-        self.bri_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                   command=self._on_bri)
-        self.bri_s.grid(row=0, column=1, sticky="ew", padx=4)
-        self.bri_s.configure(state="disabled")
-        self.bri_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
-        self.bri_v.grid(row=0, column=2, padx=(4, 0))
-
-        ctk.CTkLabel(mf, text="对比度", font=ctk.CTkFont(size=11)).grid(
-            row=1, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        self.con_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                   command=self._on_con)
-        self.con_s.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.con_s.configure(state="disabled")
-        self.con_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
-        self.con_v.grid(row=1, column=2, padx=(4, 0), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="Gamma", font=ctk.CTkFont(size=11)).grid(
-            row=2, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        self.gam_s = ctk.CTkSlider(mf, from_=0.1, to=3.0, number_of_steps=290,
-                                    command=self._on_gamma)
-        self.gam_s.grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.gam_s.configure(state="disabled")
-        self.gam_v = ctk.CTkLabel(mf, text="1.0", font=ctk.CTkFont(size=11), width=30)
-        self.gam_v.grid(row=2, column=2, padx=(4, 0), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="阴影", font=ctk.CTkFont(size=11)).grid(
-            row=3, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        self.shd_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_shadows)
-        self.shd_s.grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.shd_s.configure(state="disabled")
-        self.shd_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
-        self.shd_v.grid(row=3, column=2, padx=(4, 0), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="高光", font=ctk.CTkFont(size=11)).grid(
-            row=4, column=0, sticky="w", padx=(0, 4), pady=(4, 0))
-        self.hil_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_highlights)
-        self.hil_s.grid(row=4, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.hil_s.configure(state="disabled")
-        self.hil_v = ctk.CTkLabel(mf, text="0", font=ctk.CTkFont(size=11), width=30)
-        self.hil_v.grid(row=4, column=2, padx=(4, 0), pady=(4, 0))
-
-        # 提示
-        ctk.CTkLabel(ef, text="「自动」去灰底  |  「手动」亮度/对比度/Gamma/阴影高光/通道增益",
-                     font=ctk.CTkFont(size=10),
-                     text_color=("gray50", "gray60")).pack(pady=(0, 6))
-
-        # 按钮行
         bf = ctk.CTkFrame(self, fg_color="transparent")
-        bf.pack(fill="x", padx=14, pady=(4, 14))
+        bf.pack(side="bottom", fill="x", padx=14, pady=(4, 14))
 
         ctk.CTkButton(bf, text="重新扫描", width=100, height=34,
                       fg_color="transparent", border_width=1,
@@ -1170,221 +1100,103 @@ class PreviewDialog(ctk.CTkToplevel):
                       font=ctk.CTkFont(size=14, weight="bold"),
                       command=self._confirm).pack(side="right")
 
-    # ────────── 曝光模式切换 ──────────
-    def _on_mode(self, value):
-        self.exp_mode = value
-        state = "normal" if value == "手动" else "disabled"
-        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hil_s):
-            s.configure(state=state)
-        self._update_preview()
+        pf = ctk.CTkFrame(self)
+        pf.pack(fill="both", expand=True, padx=14, pady=(14, 6))
+        pf.grid_columnconfigure(0, weight=1)
+        pf.grid_rowconfigure(0, weight=1)
+        self.img_lbl = ctk.CTkLabel(pf, text="正在加载预览...",
+                                    fg_color=("gray85", "gray25"),
+                                    corner_radius=6)
+        self.img_lbl.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-    def _on_bri(self, val):
-        self.bri = int(val)
-        self.bri_v.configure(text=str(self.bri))
-        self._update_preview()
+        self.bind("<Configure>", self._on_resize)
+        self._last_size = (0, 0)
 
-    def _on_con(self, val):
-        self.con = int(val)
-        self.con_v.configure(text=str(self.con))
-        self._update_preview()
-
-    def _on_gamma(self, val):
-        self.gamma = round(float(val), 2)
-        self.gam_v.configure(text=f"{self.gamma:.1f}")
-        self._update_preview()
-
-    def _on_shadows(self, val):
-        self.shadows = int(val)
-        self.shd_v.configure(text=str(self.shadows))
-        self._update_preview()
-
-    def _on_highlights(self, val):
-        self.highlights = int(val)
-        self.hil_v.configure(text=str(self.highlights))
-        self._update_preview()
-
-    # ────────── 预设 ──────────
-    def _on_preset_select(self, name):
-        """应用预设参数到所有滑块和状态"""
-        presets = self._preset_mgr.load_presets()
-        preset = next((p for p in presets if p["name"] == name), None)
-        if not preset:
-            return
-
-        # 设置曝光模式
-        mode_ui = {"off": "关闭", "auto": "自动", "manual": "手动"}.get(preset["mode"], "关闭")
-        self.exp_var.set(mode_ui)
-        self.exp_mode = mode_ui
-        state = "normal" if mode_ui == "手动" else "disabled"
-        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hil_s):
-            s.configure(state=state)
-
-        # 设置参数
-        self.bri = preset.get("brightness", 0)
-        self.con = preset.get("contrast", 0)
-        self.gamma = preset.get("gamma", 1.0)
-        self.shadows = preset.get("shadows", 0)
-        self.highlights = preset.get("highlights", 0)
-        gains = preset.get("channel_gains", [1.0, 1.0, 1.0])
-        self.r_gain, self.g_gain, self.b_gain = gains[0], gains[1], gains[2]
-
-        # 更新滑块位置
-        self.bri_slider.set(self.bri) if hasattr(self, 'bri_slider') else None
-        self.bri_s.set(self.bri)
-        self.bri_v.configure(text=str(self.bri))
-        self.con_s.set(self.con)
-        self.con_v.configure(text=str(self.con))
-        self.gam_s.set(self.gamma)
-        self.gam_v.configure(text=f"{self.gamma:.1f}")
-        self.shd_s.set(self.shadows)
-        self.shd_v.configure(text=str(self.shadows))
-        self.hil_s.set(self.highlights)
-        self.hil_v.configure(text=str(self.highlights))
-
-        self._update_preview()
-
-    def _on_preset_save(self):
-        """将当前参数保存为用户预设"""
-        from tkinter import simpledialog
-        name = simpledialog.askstring("保存预设", "预设名称:", parent=self)
-        if not name or not name.strip():
-            return
-        name = name.strip()
-        preset = {
-            "name": name,
-            "mode": {"关闭": "off", "自动": "auto", "手动": "manual"}.get(self.exp_mode, "off"),
-            "brightness": self.bri, "contrast": self.con,
-            "gamma": self.gamma, "shadows": self.shadows, "highlights": self.highlights,
-            "channel_gains": [self.r_gain, self.g_gain, self.b_gain],
-        }
-        self._preset_mgr.save_user_preset(preset)
-        # 刷新下拉列表
-        self._preset_names = [p["name"] for p in self._preset_mgr.load_presets()]
-        self._preset_combo.configure(values=self._preset_names)
-        self._preset_combo.set(name)
-
-    # ────────── 预览渲染 ──────────
-
-    def _on_resize(self, event=None):
-        """窗口大小变化时重新渲染预览（避免频繁触发）"""
-        if event is None:
-            return
-        w, h = event.width, event.height
-        if abs(w - self._last_size[0]) < 30 and abs(h - self._last_size[1]) < 30:
-            return
-        self._last_size = (w, h)
-        self._update_preview()
-
-    def _preview_size(self):
-        """根据当前窗口大小计算预览图最大尺寸"""
-        w = max(200, self.winfo_width() - 60)
-        h = max(150, self.winfo_height() - 380)
-        return (w, h)
-
-    def _update_preview(self):
-        """根据当前曝光设置实时刷新预览图（从缓存文件加载，无 bytes 往返）"""
+    def _show_image(self):
         try:
             img = Image.open(self.cache_path)
-
-            # 映射 UI 中文模式名 → 引擎模式名
-            mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
-            mode = mode_map.get(self.exp_mode, "off")
-            img = apply_exposure(img, mode=mode,
-                                 brightness=self.bri, contrast=self.con,
-                                 gamma=self.gamma, shadows=self.shadows,
-                                 highlights=self.highlights,
-                                 channel_gains=(self.r_gain, self.g_gain, self.b_gain),
-                                 mime=self.mime)
-
-            # 更新直方图（在缩放前，用全分辨率数据）
-            self._update_histogram(img)
-
-            # 缩放到预览尺寸（根据窗口大小动态计算）
-            img.thumbnail(self._preview_size(), Image.LANCZOS)
+            w = max(200, self.winfo_width() - 60)
+            h = max(150, self.winfo_height() - 120)
+            img.thumbnail((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo
             self.img_lbl.configure(image=photo, text="")
         except Exception as e:
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
-    def _update_histogram(self, img):
-        """绘制直方图：RGB 三通道叠加或灰度单通道"""
-        self.hist_canvas.delete("all")
-        w, h = self.HW, self.HH
-        try:
-            hist_data = img.histogram()
-        except Exception:
+    def _on_resize(self, event=None):
+        if event is None:
             return
-
-        if img.mode == "RGB":
-            # 三通道：R(0-255), G(256-511), B(512-767)
-            channels = [
-                (hist_data[0:256], "#e05050"),    # R 红
-                (hist_data[256:512], "#50c050"),   # G 绿
-                (hist_data[512:768], "#5080e0"),   # B 蓝
-            ]
-        elif img.mode == "L":
-            channels = [(hist_data[0:256], "#c0c0c0")]  # 灰度
-        else:
+        w, h = event.width, event.height
+        if abs(w - self._last_size[0]) < 30 and abs(h - self._last_size[1]) < 30:
             return
+        self._last_size = (w, h)
+        self._show_image()
 
-        # 找最大值用于归一化
-        max_val = max(max(ch) for ch, _ in channels) or 1
-
-        for values, color in channels:
-            points = []
-            for i in range(256):
-                x = i * w / 255
-                y = h - (values[i] / max_val) * h * 0.9
-                points.extend([x, y])
-            # 绘制为折线
-            self.hist_canvas.create_line(points, fill=color, width=1)
-
-    # ────────── 确认保存 ──────────
     def _confirm(self):
-        img = Image.open(self.cache_path)
-        mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
-        mode = mode_map.get(self.exp_mode, "off")
-        img = apply_exposure(img, mode=mode,
-                             brightness=self.bri, contrast=self.con,
-                             gamma=self.gamma, shadows=self.shadows,
-                             highlights=self.highlights,
-                             channel_gains=(self.r_gain, self.g_gain, self.b_gain),
-                             mime=self.mime)
+        default_dir = os.path.dirname(self.output_path)
+        default_name = os.path.basename(self.output_path)
+        out_ext = default_name.rsplit(".", 1)[-1].lower()
 
-        # 格式转换（如需要）
-        out_ext = self.output_path.rsplit(".", 1)[-1].lower()
-        if out_ext == "pdf" and self.ext != "pdf":
-            pdf_path = self.output_path.rsplit(".", 1)[0] + ".pdf"
-            img.convert("RGB").save(pdf_path, "PDF")
+        _filters = [
+            ("JPEG 图片", "*.jpg *.jpeg"),
+            ("PNG 图片", "*.png"),
+            ("TIFF 图片", "*.tiff *.tif"),
+            ("PDF 文档", "*.pdf"),
+        ]
+        ext_to_filter = {"jpg": 0, "jpeg": 0, "png": 1, "tiff": 2, "tif": 2, "pdf": 3}
+        idx = ext_to_filter.get(out_ext, 0)
+        _filters.insert(0, _filters.pop(idx))
+
+        save_path = filedialog.asksaveasfilename(
+            parent=self, title="保存扫描文件",
+            initialdir=default_dir, initialfile=default_name,
+            defaultextension=f".{out_ext}", filetypes=_filters)
+        if not save_path:
+            return
+
+        out_ext = save_path.rsplit(".", 1)[-1].lower()
+
+        # 直接从缓存读取原始数据保存（不做曝光处理）
+        if out_ext == "pdf":
+            img = Image.open(self.cache_path)
+            pdf_path = save_path if save_path.lower().endswith(".pdf") \
+                       else save_path.rsplit(".", 1)[0] + ".pdf"
+            img.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
             saved = pdf_path
         else:
-            final = self.output_path
-            if not final.lower().endswith(f".{self.ext}"):
-                final = f"{final}.{self.ext}"
-            fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
-            img.save(final, fmt)
+            # 直接复制缓存文件（避免重新编码损失质量）
+            import shutil
+            final = save_path
+            if not final.lower().endswith(f".{out_ext}"):
+                final = f"{final.rsplit('.', 1)[0]}.{out_ext}"
+            cache_src = self.cache_path
+            if out_ext == "jpg" or out_ext == "jpeg":
+                shutil.copy2(cache_src, final)
+            else:
+                img = Image.open(cache_src)
+                if out_ext == "png":
+                    img.save(final, "PNG")
+                elif out_ext == "tiff" or out_ext == "tif":
+                    img.save(final, "TIFF")
+                else:
+                    if img.mode != "RGB":
+                        img = img.convert("RGB")
+                    img.save(final, "JPEG", quality=95)
             saved = final
 
-        # 清除缓存
         cache_manager.remove_job(self.job_id)
 
-        # 记录扫描历史
         history_manager.append({
             "device_name": self.device_name,
             "device_ip": self.device_ip,
             "page_count": 1,
-            "format": self.ext,
+            "format": out_ext,
             "file_path": saved,
-            "exposure_mode": self.exp_mode,
-            "brightness": self.bri,
-            "contrast": self.con,
-            "gamma": self.gamma,
         })
 
         self.destroy()
-        if messagebox.askyesno("保存成功", f"已保存:\n{saved}\n\n打开所在文件夹？"):
-            os.startfile(os.path.dirname(saved))
+        os.startfile(os.path.dirname(saved))
 
     def _cancel(self):
         cache_manager.remove_job(self.job_id)
@@ -1396,61 +1208,51 @@ class PreviewDialog(ctk.CTkToplevel):
 # ================================================
 
 class MultiPagePreviewDialog(ctk.CTkToplevel):
-    """多页 ADF 扫描后的批量预览：缩略图导航、删除、统一/逐页曝光调整"""
+    """多页 ADF 扫描后的批量预览：缩略图导航、删除、分组管理"""
 
-    TW, TH = 80, 100   # 缩略图尺寸
-    PW, PH = 400, 300  # 主预览区尺寸
+    TW, TH = 80, 100
 
     def __init__(self, parent, job_id: str, ext: str, output_path: str, page_count: int,
                  device_name: str = "", device_ip: str = ""):
         super().__init__(parent)
         self.title(f"扫描预览 — {page_count} 页")
-        self.geometry("600x900")
-        self.minsize(500, 700)
+        self.geometry("600x700")
+        self.minsize(500, 600)
         self.resizable(True, True)
         self.transient(parent)
-        self.grab_set()
+        try:
+            import tkinter as tk
+            _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
+            self.iconphoto(True, _p)
+            self._icon_photo = _p
+        except Exception:
+            try:
+                self.iconbitmap(get_resource_path("app.ico"))
+            except Exception:
+                pass
 
         self.job_id = job_id
         self.ext = ext
         self.output_path = output_path
         self.device_name = device_name
         self.device_ip = device_ip
-        self.mime = FORMAT_MIME.get(ext.lower(), "image/jpeg")
 
-        # 页面状态
-        self.pages = list(range(1, page_count + 1))  # 当前保留的页码
+        self.pages = list(range(1, page_count + 1))
         self.selected_idx = 0
-
-        # 页面分组：splits 存储分割点（在某页之后分割），group_names 存储分组自定义名称
-        self.splits = set()          # e.g. {2, 5} 表示在第2页后和第5页后分割
-        self.group_names = {}        # e.g. {0: "合同", 1: "发票"} 分组索引→名称
-
-        # 曝光参数（全局）
-        self.exp_mode = "关闭"
-        self.bri = 0
-        self.con = 0
-        self.gamma = 1.0
-        self.shadows = 0
-        self.highlights = 0
-
-        # 逐页曝光覆盖：page_idx → {bri, con, gamma, shadows, highlights}
-        self._per_page_overrides = {}
-        self._per_page_mode = False  # 是否处于逐页编辑模式
-
+        self.splits = set()
+        self.group_names = {}
         self._preview_photo = None
         self._thumb_photos = {}
 
         self._build()
-        self._refresh_thumbs()
-        self._update_preview()
+        self.grab_set()
 
-        # 居中
-        self.update_idletasks()
         x = parent.winfo_x() + (parent.winfo_width() - 600) // 2
-        y = parent.winfo_y() + (parent.winfo_height() - 900) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - 700) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
+        self.after_idle(self._refresh_thumbs)
+        self.after(100, self._update_preview)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _cache_path(self, page_num):
@@ -1458,31 +1260,42 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                             f"page_{page_num:03d}.{self.ext}")
 
     def _build(self):
-        # 主预览区（可伸缩）
+        bf = ctk.CTkFrame(self, fg_color="transparent")
+        bf.pack(side="bottom", fill="x", padx=14, pady=(4, 14))
+
+        ctk.CTkButton(bf, text="重新扫描", width=90, height=32,
+                      fg_color="transparent", border_width=1,
+                      text_color=("gray30", "gray80"),
+                      border_color=("gray40", "gray60"),
+                      command=self._cancel).pack(side="left")
+        self.save_btn = ctk.CTkButton(bf, text="保存全部", width=140, height=36,
+                                       font=ctk.CTkFont(size=14, weight="bold"),
+                                       command=self._confirm)
+        self.save_btn.pack(side="right")
+
         pf = ctk.CTkFrame(self)
         pf.pack(fill="both", expand=True, padx=14, pady=(14, 4))
+        pf.grid_columnconfigure(0, weight=1)
+        pf.grid_rowconfigure(0, weight=1)
         self.img_lbl = ctk.CTkLabel(pf, text="加载中...",
                                     fg_color=("gray85", "gray25"),
                                     corner_radius=6)
-        self.img_lbl.pack(fill="both", expand=True, padx=6, pady=6)
+        self.img_lbl.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
 
-        # 窗口大小变化时重新渲染预览
         self.bind("<Configure>", self._on_resize)
         self._last_size = (0, 0)
 
         self.page_info_lbl = ctk.CTkLabel(pf, text="",
                                            font=ctk.CTkFont(size=11),
                                            text_color=("gray45", "gray65"))
-        self.page_info_lbl.pack()
+        self.page_info_lbl.grid(row=1, column=0, padx=6, pady=(0, 4))
 
-        # 缩略图条
         tf = ctk.CTkFrame(self)
         tf.pack(fill="x", padx=14, pady=4)
         self.thumb_container = ctk.CTkScrollableFrame(tf, fg_color="transparent",
                                                        orientation="horizontal", height=self.TH + 20)
         self.thumb_container.pack(fill="x", padx=4, pady=4)
 
-        # 分组控制条
         gf = ctk.CTkFrame(self, fg_color="transparent")
         gf.pack(fill="x", padx=14, pady=(0, 2))
         ctk.CTkButton(gf, text="在此页后插入分割", width=110, height=26,
@@ -1505,102 +1318,16 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                                             text_color=("gray45", "gray65"))
         self.group_info_lbl.pack(side="right", padx=8)
 
-        # 曝光控制（简化版）
-        ef = ctk.CTkFrame(self)
-        ef.pack(fill="x", padx=14, pady=4)
-        ef.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(ef, text="曝光",
-                     font=ctk.CTkFont(size=12, weight="bold")).grid(
-            row=0, column=0, padx=8, pady=(8, 2), sticky="w")
-
-        self.exp_var = ctk.StringVar(value="关闭")
-        ctk.CTkSegmentedButton(
-            ef, values=["关闭", "自动", "手动"],
-            variable=self.exp_var,
-            command=self._on_mode, height=28,
-        ).grid(row=0, column=1, columnspan=2, padx=8, pady=(8, 2), sticky="w")
-
-        self.per_page_btn = ctk.CTkButton(
-            ef, text="逐页编辑", width=70, height=26,
-            font=ctk.CTkFont(size=10),
-            fg_color=("gray75", "gray35"),
-            hover_color=("gray65", "gray45"),
-            command=self._toggle_per_page)
-        self.per_page_btn.grid(row=0, column=3, padx=8, pady=(8, 2), sticky="e")
-
-        # 手动滑块行
-        mf = ctk.CTkFrame(ef, fg_color="transparent")
-        mf.grid(row=1, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
-        mf.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(mf, text="亮度", font=ctk.CTkFont(size=10)).grid(row=0, column=0, padx=(0, 4))
-        self.bri_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_bri)
-        self.bri_s.grid(row=0, column=1, sticky="ew", padx=4)
-        self.bri_s.configure(state="disabled")
-        self.bri_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
-        self.bri_v.grid(row=0, column=2, padx=(4, 8))
-
-        ctk.CTkLabel(mf, text="对比度", font=ctk.CTkFont(size=10)).grid(row=1, column=0, padx=(0, 4), pady=(4, 0))
-        self.con_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_con)
-        self.con_s.grid(row=1, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.con_s.configure(state="disabled")
-        self.con_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
-        self.con_v.grid(row=1, column=2, padx=(4, 8), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="Gamma", font=ctk.CTkFont(size=10)).grid(row=2, column=0, padx=(0, 4), pady=(4, 0))
-        self.gam_s = ctk.CTkSlider(mf, from_=0.1, to=3.0, number_of_steps=290,
-                                    command=self._on_gamma)
-        self.gam_s.grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.gam_s.configure(state="disabled")
-        self.gam_v = ctk.CTkLabel(mf, text="1.0", width=28, font=ctk.CTkFont(size=10))
-        self.gam_v.grid(row=2, column=2, padx=(4, 8), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="阴影", font=ctk.CTkFont(size=10)).grid(row=3, column=0, padx=(0, 4), pady=(4, 0))
-        self.shd_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_shadows)
-        self.shd_s.grid(row=3, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.shd_s.configure(state="disabled")
-        self.shd_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
-        self.shd_v.grid(row=3, column=2, padx=(4, 8), pady=(4, 0))
-
-        ctk.CTkLabel(mf, text="高光", font=ctk.CTkFont(size=10)).grid(row=4, column=0, padx=(0, 4), pady=(4, 0))
-        self.hgl_s = ctk.CTkSlider(mf, from_=-100, to=100, number_of_steps=200,
-                                    command=self._on_highlights)
-        self.hgl_s.grid(row=4, column=1, sticky="ew", padx=4, pady=(4, 0))
-        self.hgl_s.configure(state="disabled")
-        self.hgl_v = ctk.CTkLabel(mf, text="0", width=28, font=ctk.CTkFont(size=10))
-        self.hgl_v.grid(row=4, column=2, padx=(4, 8), pady=(4, 0))
-
-        # 按钮行
-        bf = ctk.CTkFrame(self, fg_color="transparent")
-        bf.pack(fill="x", padx=14, pady=(4, 14))
-
-        ctk.CTkButton(bf, text="重新扫描", width=90, height=32,
-                      fg_color="transparent", border_width=1,
-                      text_color=("gray30", "gray80"),
-                      border_color=("gray40", "gray60"),
-                      command=self._cancel).pack(side="left")
-        self.save_btn = ctk.CTkButton(bf, text="保存全部", width=140, height=36,
-                                       font=ctk.CTkFont(size=14, weight="bold"),
-                                       command=self._confirm)
-        self.save_btn.pack(side="right")
-
-    # ────────── 缩略图 ──────────
     def _get_groups(self):
-        """返回分组列表，每组是页索引列表。e.g. [[0,1,2],[3,4],[5]]"""
         split_positions = sorted(self.splits)
         groups = []
         start = 0
         for sp in split_positions:
-            # sp 是页索引（0-based），分割在 sp 之后
             if sp + 1 < len(self.pages):
                 groups.append(list(range(start, sp + 1)))
                 start = sp + 1
         groups.append(list(range(start, len(self.pages))))
-        return [g for g in groups if g]  # 过滤空组
+        return [g for g in groups if g]
 
     def _refresh_thumbs(self):
         for w in self.thumb_container.winfo_children():
@@ -1608,17 +1335,15 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self._thumb_photos.clear()
 
         groups = self._get_groups()
-        group_of_page = {}  # page_idx → group_idx
+        group_of_page = {}
         for gi, g in enumerate(groups):
             for pi in g:
                 group_of_page[pi] = gi
 
-        # 更新分组信息标签
         n_groups = len(groups)
         self.group_info_lbl.configure(text=f"{n_groups} 个分组")
 
         for idx, page_num in enumerate(self.pages):
-            # 分割标记
             if idx > 0 and (idx - 1) in self.splits:
                 sep = ctk.CTkFrame(self.thumb_container, width=3,
                                     height=self.TH + 16,
@@ -1651,7 +1376,6 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 command=lambda i=idx: self._select_page(i))
             btn.pack()
 
-            # 删除按钮（至少保留 1 页）
             if len(self.pages) > 1:
                 ctk.CTkButton(
                     frame, text="x", width=18, height=18,
@@ -1661,84 +1385,21 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 ).place(relx=1.0, rely=0.0, anchor="ne")
 
     def _select_page(self, idx):
-        # 切页前，如果在逐页模式，保存当前页的滑块状态
-        if self._per_page_mode and self.exp_mode == "手动":
-            self._save_current_as_override()
         self.selected_idx = idx
-        # 切页后，如果在逐页模式，加载该页的覆盖参数
-        if self._per_page_mode:
-            self._load_override_for_selected()
         self._refresh_thumbs()
         self._update_preview()
-
-    def _toggle_per_page(self):
-        """切换逐页编辑模式"""
-        self._per_page_mode = not self._per_page_mode
-        if self._per_page_mode:
-            self.per_page_btn.configure(fg_color=("#3B8ED0", "#1F6AA5"),
-                                         text_color="white")
-            # 确保手动模式
-            if self.exp_mode != "手动":
-                self.exp_var.set("手动")
-                self._on_mode("手动")
-            # 加载当前页的覆盖
-            self._load_override_for_selected()
-        else:
-            self.per_page_btn.configure(fg_color=("gray75", "gray35"),
-                                         text_color=("gray30", "gray80"))
-            # 恢复全局参数到滑块
-            self._sync_sliders_from_global()
-
-    def _save_current_as_override(self):
-        """将当前滑块状态保存为选中页的覆盖"""
-        idx = self.selected_idx
-        self._per_page_overrides[idx] = {
-            "bri": self.bri, "con": self.con,
-            "gamma": self.gamma, "shadows": self.shadows,
-            "highlights": self.highlights,
-        }
-
-    def _load_override_for_selected(self):
-        """加载选中页的覆盖参数到滑块（无覆盖则用全局）"""
-        idx = self.selected_idx
-        if idx in self._per_page_overrides:
-            ov = self._per_page_overrides[idx]
-            self.bri = ov["bri"]
-            self.con = ov["con"]
-            self.gamma = ov["gamma"]
-            self.shadows = ov["shadows"]
-            self.highlights = ov["highlights"]
-        else:
-            # 无覆盖，用全局值
-            pass  # 全局值已在 self.bri 等中
-        self._sync_sliders_from_global()
-
-    def _sync_sliders_from_global(self):
-        """将 self.bri/con/gamma/shadows/highlights 同步到滑块 UI"""
-        self.bri_s.set(self.bri)
-        self.bri_v.configure(text=str(self.bri))
-        self.con_s.set(self.con)
-        self.con_v.configure(text=str(self.con))
-        self.gam_s.set(self.gamma)
-        self.gam_v.configure(text=f"{self.gamma:.1f}")
-        self.shd_s.set(self.shadows)
-        self.shd_v.configure(text=str(self.shadows))
-        self.hgl_s.set(self.highlights)
-        self.hgl_v.configure(text=str(self.highlights))
 
     def _delete_page(self, idx):
         page_num = self.pages[idx]
         self.pages.pop(idx)
-        # 删除缓存文件
         try:
             os.remove(self._cache_path(page_num))
         except OSError:
             pass
-        # 调整分割标记：删除当前页的分割，后续标记前移
         new_splits = set()
         for sp in self.splits:
             if sp == idx:
-                continue  # 被删页上的分割移除
+                continue
             elif sp > idx:
                 new_splits.add(sp - 1)
             else:
@@ -1748,24 +1409,20 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self._refresh_thumbs()
         self._update_preview()
 
-    # ────────── 分组操作 ──────────
     def _insert_split(self):
-        """在当前选中页之后插入分割标记"""
         idx = self.selected_idx
         if idx >= len(self.pages) - 1:
-            return  # 最后一页后不能分割
+            return
         self.splits.add(idx)
         self._refresh_thumbs()
 
     def _remove_split(self):
-        """移除当前选中页之后的分割标记（如果存在）"""
         idx = self.selected_idx
         if idx in self.splits:
             self.splits.discard(idx)
             self._refresh_thumbs()
 
     def _rename_group(self):
-        """重命名当前选中页所在分组"""
         groups = self._get_groups()
         gi = None
         for i, g in enumerate(groups):
@@ -1806,52 +1463,7 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         ctk.CTkButton(pop, text="确认", command=confirm).pack(pady=4)
         entry.bind("<Return>", lambda e: confirm())
 
-    # ────────── 曝光控制 ──────────
-    def _on_mode(self, value):
-        self.exp_mode = value
-        state = "normal" if value == "手动" else "disabled"
-        for s in (self.bri_s, self.con_s, self.gam_s, self.shd_s, self.hgl_s):
-            s.configure(state=state)
-        self._update_preview()
-
-    def _on_bri(self, val):
-        self.bri = int(val)
-        self.bri_v.configure(text=str(self.bri))
-        if self._per_page_mode:
-            self._save_current_as_override()
-        self._update_preview()
-
-    def _on_con(self, val):
-        self.con = int(val)
-        self.con_v.configure(text=str(self.con))
-        if self._per_page_mode:
-            self._save_current_as_override()
-        self._update_preview()
-
-    def _on_gamma(self, val):
-        self.gamma = round(float(val), 2)
-        self.gam_v.configure(text=f"{self.gamma:.1f}")
-        if self._per_page_mode:
-            self._save_current_as_override()
-        self._update_preview()
-
-    def _on_shadows(self, val):
-        self.shadows = int(val)
-        self.shd_v.configure(text=str(self.shadows))
-        if self._per_page_mode:
-            self._save_current_as_override()
-        self._update_preview()
-
-    def _on_highlights(self, val):
-        self.highlights = int(val)
-        self.hgl_v.configure(text=str(self.highlights))
-        if self._per_page_mode:
-            self._save_current_as_override()
-        self._update_preview()
-
-    # ────────── 预览渲染 ──────────
     def _on_resize(self, event=None):
-        """窗口大小变化时重新渲染预览（避免频繁触发）"""
         if event is None:
             return
         w, h = event.width, event.height
@@ -1860,26 +1472,13 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         self._last_size = (w, h)
         self._update_preview()
 
-    def _preview_size(self):
-        """根据当前窗口大小计算预览图最大尺寸"""
-        w = max(200, self.winfo_width() - 60)
-        h = max(150, self.winfo_height() - 480)
-        return (w, h)
-
     def _update_preview(self):
         try:
             page_num = self.pages[self.selected_idx]
             img = Image.open(self._cache_path(page_num))
-
-            mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
-            mode = mode_map.get(self.exp_mode, "off")
-            img = apply_exposure(img, mode=mode,
-                                 brightness=self.bri, contrast=self.con,
-                                 gamma=self.gamma, shadows=self.shadows,
-                                 highlights=self.highlights,
-                                 mime=self.mime)
-
-            img.thumbnail(self._preview_size(), Image.LANCZOS)
+            w = max(200, self.winfo_width() - 60)
+            h = max(150, self.winfo_height() - 300)
+            img.thumbnail((w, h), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
             self._preview_photo = photo
             self.img_lbl.configure(image=photo, text="")
@@ -1888,51 +1487,51 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
         except Exception as e:
             self.img_lbl.configure(image=None, text=f"预览失败: {e}")
 
-    # ────────── 保存 ──────────
-    def _process_page(self, page_num, mode, page_idx=None):
-        """从缓存加载并应用曝光，返回 PIL Image。支持逐页覆盖。"""
-        img = Image.open(self._cache_path(page_num))
-        # 检查是否有逐页覆盖
-        bri, con, gamma, shadows, highlights = self.bri, self.con, self.gamma, self.shadows, self.highlights
-        if page_idx is not None and page_idx in self._per_page_overrides:
-            ov = self._per_page_overrides[page_idx]
-            bri = ov["bri"]
-            con = ov["con"]
-            gamma = ov["gamma"]
-            shadows = ov["shadows"]
-            highlights = ov["highlights"]
-        return apply_exposure(img, mode=mode,
-                              brightness=bri, contrast=con,
-                              gamma=gamma, shadows=shadows,
-                              highlights=highlights,
-                              mime=self.mime)
-
     def _confirm(self):
-        mode_map = {"关闭": "off", "自动": "auto", "手动": "manual"}
-        mode = mode_map.get(self.exp_mode, "off")
-        saved_files = []
+        default_dir = os.path.dirname(self.output_path)
+        default_name = os.path.basename(self.output_path)
+        out_ext = default_name.rsplit(".", 1)[-1].lower()
 
-        out_ext = self.output_path.rsplit(".", 1)[-1].lower()
-        base_path = self.output_path.rsplit(".", 1)[0]
-        groups = self._get_groups()
+        _filters = [
+            ("JPEG 图片", "*.jpg *.jpeg"),
+            ("PNG 图片", "*.png"),
+            ("TIFF 图片", "*.tiff *.tif"),
+            ("PDF 文档", "*.pdf"),
+        ]
+        ext_to_filter = {"jpg": 0, "jpeg": 0, "png": 1, "tiff": 2, "tif": 2, "pdf": 3}
+        idx = ext_to_filter.get(out_ext, 0)
+        _filters.insert(0, _filters.pop(idx))
+
+        save_path = filedialog.asksaveasfilename(
+            parent=self, title="保存扫描文件（选择基础名称）",
+            initialdir=default_dir, initialfile=default_name,
+            defaultextension=f".{out_ext}", filetypes=_filters)
+        if not save_path:
+            return
+
+        save_dir = os.path.dirname(save_path)
+        save_stem = os.path.basename(save_path).rsplit(".", 1)[0]
+        out_ext = save_path.rsplit(".", 1)[-1].lower()
+        base_path = os.path.join(save_dir, save_stem)
+
+        saved_files = []
         is_pdf = (out_ext == "pdf")
+        groups = self._get_groups()
         has_groups = len(groups) > 1
 
         for gi, group_indices in enumerate(groups):
             group_name = self.group_names.get(gi, "")
             if has_groups:
-                # 多分组：用分组名或序号做前缀
                 prefix = group_name if group_name else f"文档_{gi + 1}"
             else:
                 prefix = None
 
             if is_pdf:
-                # PDF: 每个分组合并为一个多页PDF
                 pdf_images = []
                 for page_idx in group_indices:
                     page_num = self.pages[page_idx]
                     try:
-                        img = self._process_page(page_num, mode, page_idx=page_idx)
+                        img = Image.open(self._cache_path(page_num))
                         pdf_images.append(img.convert("RGB"))
                     except Exception:
                         pass
@@ -1945,25 +1544,33 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                                         append_images=pdf_images[1:])
                     saved_files.append(pdf_path)
             else:
-                # 非PDF: 每页独立文件
-                fmt = "JPEG" if self.mime == "image/jpeg" else "PNG"
                 for seq, page_idx in enumerate(group_indices, 1):
                     page_num = self.pages[page_idx]
                     try:
-                        img = self._process_page(page_num, mode, page_idx=page_idx)
+                        cache_file = self._cache_path(page_num)
                         if prefix:
-                            fpath = f"{base_path}_{prefix}_{seq:03d}.{self.ext}"
+                            fpath = f"{base_path}_{prefix}_{seq:03d}.{out_ext}"
                         else:
-                            fpath = f"{base_path}_{seq:03d}.{self.ext}"
-                        img.save(fpath, fmt)
+                            fpath = f"{base_path}_{seq:03d}.{out_ext}"
+                        if out_ext in ("jpg", "jpeg"):
+                            import shutil
+                            shutil.copy2(cache_file, fpath)
+                        else:
+                            img = Image.open(cache_file)
+                            if out_ext == "png":
+                                img.save(fpath, "PNG")
+                            elif out_ext in ("tiff", "tif"):
+                                img.save(fpath, "TIFF")
+                            else:
+                                if img.mode != "RGB":
+                                    img = img.convert("RGB")
+                                img.save(fpath, "JPEG", quality=95)
                         saved_files.append(fpath)
                     except Exception:
                         pass
 
-        # 清除缓存
         cache_manager.remove_job(self.job_id)
 
-        # 记录扫描历史（每个分组一条记录，或整体一条）
         if saved_files:
             history_manager.append({
                 "device_name": self.device_name,
@@ -1972,20 +1579,12 @@ class MultiPagePreviewDialog(ctk.CTkToplevel):
                 "format": self.ext,
                 "file_path": saved_files[0],
                 "file_count": len(saved_files),
-                "exposure_mode": self.exp_mode,
-                "brightness": self.bri,
-                "contrast": self.con,
-                "gamma": self.gamma,
             })
 
         self.destroy()
 
         if saved_files:
-            msg = "\n".join(saved_files[:5])
-            if len(saved_files) > 5:
-                msg += f"\n... 等 {len(saved_files)} 个文件"
-            if messagebox.askyesno("保存成功", f"已保存:\n{msg}\n\n打开所在文件夹？"):
-                os.startfile(os.path.dirname(saved_files[0]))
+            os.startfile(os.path.dirname(saved_files[0]))
 
     def _cancel(self):
         cache_manager.remove_job(self.job_id)
@@ -2033,6 +1632,25 @@ class ScannerCard(ctk.CTkFrame):
             hover_color=("gray80", "gray30"),
             command=self._show_rename_popup)
         self.rename_btn.grid(row=0, column=1, padx=(4, 0))
+
+        # 上移/下移按钮（调整优先级）
+        self.up_btn = ctk.CTkButton(
+            name_frame, text="▲", width=28, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent",
+            text_color=("gray45", "gray65"),
+            hover_color=("gray80", "gray30"),
+            command=self._move_up)
+        self.up_btn.grid(row=0, column=2, padx=(2, 0))
+
+        self.down_btn = ctk.CTkButton(
+            name_frame, text="▼", width=28, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color="transparent",
+            text_color=("gray45", "gray65"),
+            hover_color=("gray80", "gray30"),
+            command=self._move_down)
+        self.down_btn.grid(row=0, column=3, padx=(2, 0))
 
         # 信息行
         info_parts = [f"IP {s.ip}"]
@@ -2158,6 +1776,12 @@ class ScannerCard(ctk.CTkFrame):
         entry.focus_set()
         entry.bind("<Return>", lambda e: confirm())
 
+    def _move_up(self):
+        self.app.move_scanner(self.idx, -1)
+
+    def _move_down(self):
+        self.app.move_scanner(self.idx, 1)
+
 
 # ================================================
 #  扫描历史对话框
@@ -2172,6 +1796,16 @@ class HistoryDialog(ctk.CTkToplevel):
         self.geometry("700x500")
         self.transient(parent)
         self.grab_set()
+        try:
+            import tkinter as tk
+            _p = tk.PhotoImage(file=get_resource_path("icon_64.png"))
+            self.iconphoto(True, _p)
+            self._icon_photo = _p
+        except Exception:
+            try:
+                self.iconbitmap(get_resource_path("app.ico"))
+            except Exception:
+                pass
 
         self._build()
         self._load_records()
@@ -2282,6 +1916,25 @@ class HistoryDialog(ctk.CTkToplevel):
 # ================================================
 
 def main():
+    import ctypes
+    
+    # ★ 高 DPI 感知：防止 Windows 对窗口图标做位图拉伸导致模糊
+    # 这是任务栏图标模糊的根本原因（CPython issue #119174）
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    
+    # ★ Windows 任务栏图标：必须在创建任何窗口之前设置 AppUserModelID
+    # 否则任务栏会显示 python.exe 的图标，且各阶段图标会闪烁变化
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HP.ScanTool.v3.3")
+    except Exception:
+        pass
+
     app = ScanApp()
     app.mainloop()
     # 兜底：mainloop 退出后强制终止进程

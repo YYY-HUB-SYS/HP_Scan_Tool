@@ -31,13 +31,10 @@ def tmp_config_dir(tmp_path, monkeypatch):
 
     # monkeypatch 各模块的路径函数
     import cache_manager
-    import preset_manager
     import history_manager
 
     monkeypatch.setattr(cache_manager, "_cache_config_path",
                         lambda: str(config_dir / "cache_config.json"))
-    monkeypatch.setattr(preset_manager, "_presets_path",
-                        lambda: str(config_dir / "presets.json"))
     monkeypatch.setattr(history_manager, "_history_file",
                         lambda: str(config_dir / "history.json"))
 

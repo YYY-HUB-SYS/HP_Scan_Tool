@@ -25,7 +25,6 @@ __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
-    "apply_exposure", "auto_exposure", "manual_exposure",
     "FORMAT_MIME", "MIME_EXT",
 ]
 
@@ -330,13 +329,6 @@ MIME_EXT = {
 }
 
 
-# 曝光后处理已提取到 exposure.py，此处 re-export 保持向后兼容
-from exposure import (  # noqa: E402
-    apply_exposure, auto_exposure, manual_exposure,
-    _stretch_channel, _img_to_bytes,
-)
-
-
 def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex):
     """
     创建扫描任务（POST ScanJobs），返回 (base, job_uri, ext, session)。
@@ -493,11 +485,8 @@ def scan_to_file(
     source: str = "Platen",
     duplex: bool = False,
     timeout: float = 120.0,
-    exposure_mode: str = "off",
-    brightness: int = 0,
-    contrast: int = 0,
 ) -> str:
-    """扫描并保存到文件，返回文件路径。exposure_mode: off/auto/manual"""
+    """扫描并保存到文件，返回文件路径。"""
     data, ext = execute_scan(
         scanner=scanner,
         resolution=resolution,
@@ -507,13 +496,6 @@ def scan_to_file(
         duplex=duplex,
         timeout=timeout,
     )
-
-    # 曝光后处理
-    mime = FORMAT_MIME.get(ext, "image/jpeg")
-    if exposure_mode == "auto":
-        data = auto_exposure(data, mime)
-    elif exposure_mode == "manual":
-        data = manual_exposure(data, brightness, contrast, mime)
 
     # 如果要求 PDF 但打印机返回 JPEG（部分机型行为），用 Pillow 转换
     if output_format.lower() == "pdf" and ext != "pdf":

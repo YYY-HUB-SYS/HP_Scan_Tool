@@ -25,7 +25,6 @@ class TestScanArgs:
         assert args.format == "jpg"
         assert args.color == "color"
         assert args.source == "Platen"
-        assert args.exposure == "off"
         assert args.output is None
 
     def test_all_options(self):
@@ -36,7 +35,6 @@ class TestScanArgs:
             "--format", "png",
             "--color", "gray",
             "--source", "Feeder",
-            "--exposure", "auto",
             "--output", "/tmp/scans",
         ])
         assert args.ip == "10.0.0.1"
@@ -44,7 +42,6 @@ class TestScanArgs:
         assert args.format == "png"
         assert args.color == "gray"
         assert args.source == "Feeder"
-        assert args.exposure == "auto"
         assert args.output == "/tmp/scans"
 
     def test_ip_required(self):
@@ -66,11 +63,6 @@ class TestScanArgs:
         parser = cli._build_parser()
         with pytest.raises(SystemExit):
             parser.parse_args(["scan", "--ip", "1.2.3.4", "--source", "Duplex"])
-
-    def test_invalid_exposure(self):
-        parser = cli._build_parser()
-        with pytest.raises(SystemExit):
-            parser.parse_args(["scan", "--ip", "1.2.3.4", "--exposure", "vivid"])
 
 
 # ── discover 子命令 ──────────────────────────────────────

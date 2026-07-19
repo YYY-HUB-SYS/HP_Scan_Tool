@@ -9,6 +9,9 @@ a = Analysis(
     binaries=[],
     datas=[
         ('fonts/NotoSansSC-Regular.ttf', 'fonts'),
+        ('app.ico', '.'),
+        ('icon_32.png', '.'),
+        ('icon_64.png', '.'),
     ],
     hiddenimports=[
         'requests', 'urllib3',
@@ -21,8 +24,8 @@ a = Analysis(
         'tkinter', 'tkinter.ttk', 'tkinter.filedialog', 'tkinter.messagebox', 'tkinter.simpledialog',
         # 项目内模块
         'escl_engine', 'wia_engine', 'wsd_engine',
-        'exposure', 'scan_coordinator',
-        'cache_manager', 'preset_manager', 'history_manager',
+        'scan_coordinator',
+        'cache_manager', 'history_manager',
     ],
     hookspath=[],
     hooksconfig={},
@@ -55,5 +58,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon='app.ico',
 )
