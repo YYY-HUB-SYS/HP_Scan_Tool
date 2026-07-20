@@ -1468,8 +1468,6 @@ class ScanApp(QMainWindow):
         self.status_bar.showMessage("监听模式：已取消")
         self._reset_scan_ui()
 
-        threading.Thread(target=_listen_thread, daemon=True).start()
-
     # ────────── 历史记录 ──────────
     def _show_history(self):
         """显示扫描历史"""
@@ -2367,7 +2365,7 @@ class HistoryDialog(QDialog):
         add_fade_animation(self, ANIM["normal"])
 
     def _load_history(self):
-        history = history_manager.get_history()
+        history = history_manager.list_records(limit=9999)
         for entry in reversed(history):
             item = QTreeWidgetItem([
                 entry.get("timestamp", "")[:19],
