@@ -388,6 +388,7 @@ class AnimatedButton(QPushButton):
         super().__init__(text, parent)
         self.button_type = button_type
         self.setCursor(Qt.PointingHandCursor)
+        self._original_geometry = None
         self._update_style()
 
     def _update_style(self):
@@ -451,23 +452,35 @@ class AnimatedButton(QPushButton):
                 }}
             """)
 
+    def setGeometry(self, rect):
+        """重写 setGeometry 保存原始位置"""
+        super().setGeometry(rect)
+        if self._original_geometry is None:
+            self._original_geometry = rect
+
     def mousePressEvent(self, event):
-        # 点击缩放动画
+        # 点击缩放动画 - 使用原始 geometry 作为基准
+        if self._original_geometry is None:
+            self._original_geometry = self.geometry()
+
         self._anim = QPropertyAnimation(self, b"geometry")
         self._anim.setDuration(ANIM["fast"])
-        self._anim.setStartValue(self.geometry())
-        rect = self.geometry()
-        self._anim.setEndValue(QRect(rect.x() + 1, rect.y() + 1, rect.width() - 2, rect.height() - 2))
+        self._anim.setStartValue(self._original_geometry)
+        orig = self._original_geometry
+        self._anim.setEndValue(QRect(orig.x() + 1, orig.y() + 1, orig.width() - 2, orig.height() - 2))
         self._anim.setEasingCurve(QEasingCurve.OutQuad)
         self._anim.start()
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # 恢复动画 - 恢复到原始 geometry
+        if self._original_geometry is None:
+            self._original_geometry = self.geometry()
+
         self._anim = QPropertyAnimation(self, b"geometry")
         self._anim.setDuration(ANIM["fast"])
         self._anim.setStartValue(self.geometry())
-        rect = self.geometry()
-        self._anim.setEndValue(QRect(rect.x() - 1, rect.y() - 1, rect.width() + 2, rect.height() + 2))
+        self._anim.setEndValue(self._original_geometry)
         self._anim.setEasingCurve(QEasingCurve.OutQuad)
         self._anim.start()
         super().mouseReleaseEvent(event)
@@ -703,9 +716,9 @@ class ScanApp(QMainWindow):
         self.scan_btn.clicked.connect(self._start_scan)
         btn_layout.addWidget(self.scan_btn)
 
-        listen_btn = AnimatedButton("监听模式", button_type="accent")
-        listen_btn.clicked.connect(self._start_listen)
-        btn_layout.addWidget(listen_btn)
+        self.listen_btn = AnimatedButton("监听模式", button_type="accent")
+        self.listen_btn.clicked.connect(self._start_listen)
+        btn_layout.addWidget(self.listen_btn)
 
         history_btn = AnimatedButton("扫描历史", button_type="secondary")
         history_btn.clicked.connect(self._show_history)
@@ -868,9 +881,15 @@ class ScanApp(QMainWindow):
     # ────────── 扫描仪管理 ──────────
     def _auto_discover(self):
         """自动发现扫描仪"""
+        # 防止重复点击
+        if hasattr(self, '_discovering') and self._discovering:
+            return
+        self._discovering = True
+
         self.status_bar.showMessage("正在发现扫描仪...")
 
         def _on_complete(new_count, new_scanners):
+            self._discovering = False
             QTimer.singleShot(0, self._on_discover_finished)
 
         self.coordinator.discover_scanners_background(_on_complete)
@@ -1329,6 +1348,7 @@ class ScanApp(QMainWindow):
         """重置扫描 UI"""
         self.scan_btn.setText("扫描")
         self.scan_btn.setEnabled(True)
+        self.listen_btn.setEnabled(True)
         self.scan_progress.setVisible(False)
         # 移除取消监听按钮
         if hasattr(self, 'cancel_listen_btn') and self.cancel_listen_btn:
@@ -1395,6 +1415,7 @@ class ScanApp(QMainWindow):
 
         self.scan_btn.setText("监听中...")
         self.scan_btn.setEnabled(False)
+        self.listen_btn.setEnabled(False)
         self.status_bar.showMessage("监听模式：等待打印机面板触发扫描...")
 
         # 添加取消按钮
