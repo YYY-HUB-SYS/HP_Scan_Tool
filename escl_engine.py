@@ -491,25 +491,27 @@ def execute_scan(
         base, job_uri, ext = _create_scan_job(
             session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=max_pages)
 
-        # 轮询 NextDocument
+        # 轮询 NextDocument（更短的间隔 + 更长的读取超时捕捉扫描数据）
         start = time.time()
         nd_url = job_uri.rstrip("/") + "/NextDocument"
         while time.time() - start < timeout:
-            # 检查取消
             if cancel_event and cancel_event.is_set():
                 return None, ext
 
             try:
-                r = session.get(nd_url, timeout=3)
+                r = session.get(nd_url, timeout=15)
                 if r.status_code == 200:
                     return _fix_jpeg_header(r.content), ext
                 elif r.status_code == 503:
                     pass  # 扫描进行中
+                elif r.status_code == 410:
+                    # 扫描已完成但数据已过期（打印机已返回过200但客户端没取到）
+                    raise RuntimeError("扫描数据已过期（HTTP 410），请放纸后重试")
             except requests.RequestException:
                 pass
 
-            # 分段睡眠以便及时响应取消
-            for _ in range(5):
+            # 短间隔快速轮询
+            for _ in range(3):
                 if cancel_event and cancel_event.is_set():
                     return None, ext
                 time.sleep(0.1)
@@ -562,23 +564,23 @@ def execute_multipage_scan(
                     return pages if pages else []
 
                 try:
-                    r = session.get(nd_url, timeout=3)
+                    r = session.get(nd_url, timeout=15)
                     if r.status_code == 200:
                         pages.append((_fix_jpeg_header(r.content), ext))
                         if progress_callback:
                             progress_callback(len(pages), len(pages))
-                        time.sleep(0.3)  # 短暂延迟，避免立即轰炸设备
-                        break  # 获取成功，进入下一页
+                        time.sleep(0.3)
+                        break
                     elif r.status_code == 404:
-                        # 无更多页面
                         return pages
+                    elif r.status_code == 410:
+                        return pages  # 扫描过期，当前页面不可用
                     elif r.status_code == 503:
-                        pass  # 扫描进行中，继续等待
+                        pass
                 except requests.RequestException:
                     pass
 
-                # 分段睡眠以便及时响应取消
-                for _ in range(5):
+                for _ in range(3):
                     if cancel_event and cancel_event.is_set():
                         return pages if pages else []
                     time.sleep(0.1)
