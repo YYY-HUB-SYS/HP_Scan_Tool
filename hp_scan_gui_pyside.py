@@ -1244,6 +1244,7 @@ class ScanApp(QMainWindow):
         if has_adf:
             self.source_combo.addItem("ADF")
             self.source_combo.addItem("自动")  # 自动检测输稿器状态
+            self.source_combo.setCurrentText("自动")  # 有ADF时默认自动
         self._update_duplex_visibility()
 
     # ────────── 配置文件 ──────────
