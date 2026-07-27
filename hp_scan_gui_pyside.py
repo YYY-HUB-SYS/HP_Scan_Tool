@@ -777,11 +777,12 @@ class ScanApp(QMainWindow):
             self._loading.set_detail("部分设备超时，跳过...")
 
     def _finish_loading(self):
-        """无保存设备时直接进入"""
-        if self._loading:
-            self._loading.close()
-            self._loading = None
-        self.show()
+        """无保存设备时：加载界面等待自动发现"""
+        self._loading.set_step("正在发现扫描仪...")
+        self._loading.set_detail("通过 mDNS/WSD 搜索网络中的打印机")
+        self._startup_discover = True  # 标记为启动发现模式
+
+        # 启动自动发现（完成后由 _on_discover_finished 关闭加载界面）
         self._auto_discover()
 
     def _on_startup_complete(self):
@@ -1131,6 +1132,16 @@ class ScanApp(QMainWindow):
         self._rebuild_cards()
         count = len(self.coordinator.scanners)
         self.status_bar.showMessage(f"发现 {count} 台扫描仪")
+
+        # 启动发现模式：关闭加载界面，显示主窗口
+        if getattr(self, '_startup_discover', False):
+            self._startup_discover = False
+            if self.coordinator.scanners:
+                self._on_card_clicked(0)
+            if self._loading:
+                self._loading.close()
+                self._loading = None
+            self.show()
 
     def _rebuild_cards(self):
         """重建扫描仪卡片列表"""
