@@ -12,6 +12,8 @@ import logging
 import struct
 import time
 import xml.etree.ElementTree as ET
+
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from typing import Optional
 
