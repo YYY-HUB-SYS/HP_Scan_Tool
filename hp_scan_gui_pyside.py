@@ -1011,6 +1011,7 @@ class ScanApp(QMainWindow):
         self.source_combo.addItem("平板")
         if has_adf:
             self.source_combo.addItem("ADF")
+            self.source_combo.addItem("自动")  # 自动检测输稿器状态
         self._update_duplex_visibility()
 
     # ────────── 配置文件 ──────────
@@ -1051,7 +1052,7 @@ class ScanApp(QMainWindow):
 
     # ────────── 扫描 ──────────
     def _start_scan(self):
-        """开始扫描"""
+        """开始扫描（自动检测 ADF 状态）"""
         if not self.selected:
             QMessageBox.warning(self, "提示", "请先选择一台打印机")
             return
@@ -1068,8 +1069,13 @@ class ScanApp(QMainWindow):
         self._save_profile()
 
         scanner = self.selected
-        source_val = "Platen" if "平板" in self.source_combo.currentText() else "Feeder"
-        use_adf = source_val == "Feeder"
+        source_text = self.source_combo.currentText()
+        if source_text == "ADF":
+            source_val = "Feeder"
+        elif source_text == "自动":
+            source_val = "Auto"  # 由 _detect_adf_source 自动判断
+        else:
+            source_val = "Platen"
 
         self.scan_btn.setText("扫描中...")
         self.scan_btn.setEnabled(False)
@@ -1087,10 +1093,16 @@ class ScanApp(QMainWindow):
 
         def _scan_thread():
             try:
+                # 自动检测 ADF 状态
+                actual_source, use_adf = self._detect_adf_source(scanner, source_val)
+
+                if self._scan_cancel_event.is_set():
+                    return
+
                 if use_adf:
-                    self._do_multipage_scan(scanner, out_dir, source_val, cancel_event=self._scan_cancel_event)
+                    self._do_multipage_scan(scanner, out_dir, actual_source, cancel_event=self._scan_cancel_event)
                 else:
-                    self._do_single_scan(scanner, out_dir, source_val, cancel_event=self._scan_cancel_event)
+                    self._do_single_scan(scanner, out_dir, actual_source, cancel_event=self._scan_cancel_event)
             except Exception as e:
                 if not self._scan_cancel_event.is_set():
                     QTimer.singleShot(0, lambda: self._scan_error(f"{type(e).__name__}: {e}"))
@@ -1098,6 +1110,57 @@ class ScanApp(QMainWindow):
                 QTimer.singleShot(0, self._reset_scan_ui)
 
         threading.Thread(target=_scan_thread, daemon=True).start()
+
+    def _detect_adf_source(self, scanner, user_source):
+        """
+        自动检测 ADF 输稿器状态，决定实际扫描来源。
+
+        逻辑:
+        1. 用户选择了 Feeder 且设备有 ADF → 直接使用 Feeder
+        2. 用户选择了 Platen → 直接使用 Platen
+        3. 用户未选择来源（自动模式）:
+           a. 设备有 ADF → 检测输稿器是否有纸，有纸用 Feeder，无纸用 Platen
+           b. 设备无 ADF → 强制 Platen
+        """
+        # 如果用户指定了来源，直接用
+        if user_source == "Feeder" and scanner.has_adf:
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用 ADF 输稿器扫描"))
+            return "Feeder", True
+        if user_source == "Platen":
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
+            return "Platen", False
+
+        # 自动模式 (user_source == "Auto")：根据设备能力选择
+        if scanner.has_adf:
+            # 检测输稿器状态
+            adf_loaded = False
+            try:
+                if scanner.escl_url:
+                    import requests
+                    sess = requests.Session()
+                    sess.verify = False
+                    try:
+                        base = scanner.escl_url.rstrip("/")
+                        r = sess.get(f"{base}/ScannerCapabilities", timeout=3)
+                        if r.status_code == 200 and "AdfLoaded" in r.text and "true" in r.text.lower():
+                            adf_loaded = True
+                    except Exception:
+                        pass
+                    finally:
+                        sess.close()
+            except Exception:
+                pass
+
+            if adf_loaded:
+                QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到 ADF 已装载，使用输稿器扫描"))
+                return "Feeder", True
+            else:
+                QTimer.singleShot(0, lambda: self.status_bar.showMessage("输稿器为空或检测失败，使用平板扫描"))
+                return "Platen", False
+
+        # 设备无 ADF，强制平板
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
+        return "Platen", False
 
     def _cancel_scan(self):
         """取消扫描"""
@@ -1113,7 +1176,7 @@ class ScanApp(QMainWindow):
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         cache_manager.register_job(job_id)
 
-        data, ext = execute_scan(
+        result = execute_scan(
             scanner=scanner,
             resolution=self.resolution_val,
             color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
@@ -1123,9 +1186,15 @@ class ScanApp(QMainWindow):
             cancel_event=cancel_event,
         )
 
-        # 检查是否已取消
-        if cancel_event and cancel_event.is_set():
+        # 检查是否取消或无数据
+        if result is None or (cancel_event and cancel_event.is_set()):
             cache_manager.remove_job(job_id)
+            return
+
+        data, ext = result
+        if not data:
+            cache_manager.remove_job(job_id)
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("扫描失败：未获取到数据"))
             return
 
         cache_path = cache_manager.write_page(job_id, 1, data, ext)
@@ -1159,8 +1228,8 @@ class ScanApp(QMainWindow):
             cancel_event=cancel_event,
         )
 
-        # 检查是否已取消
-        if cancel_event and cancel_event.is_set():
+        # 检查是否取消或无数据
+        if not pages or (cancel_event and cancel_event.is_set()):
             cache_manager.remove_job(job_id)
             return
 
@@ -1407,8 +1476,16 @@ class ScanApp(QMainWindow):
             os.makedirs(out_dir, exist_ok=True)
 
         scanner = self.selected
-        source_val = "Platen" if "平板" in self.source_combo.currentText() else "Feeder"
-        use_adf = source_val == "Feeder"
+        source_text = self.source_combo.currentText()
+        if source_text == "ADF":
+            source_val = "Feeder"
+            use_adf = True
+        elif source_text == "自动":
+            source_val = "Auto"
+            use_adf = False  # 由 _detect_adf_source 判断
+        else:
+            source_val = "Platen"
+            use_adf = False
 
         # 取消标志
         self._listen_cancel_event = threading.Event()
