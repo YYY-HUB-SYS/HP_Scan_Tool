@@ -730,13 +730,20 @@ class ScanApp(QMainWindow):
 
         # 后台线程：只做网络请求，绝不碰 UI
         def _probe_thread():
-            from escl_engine import fetch_capabilities
+            from escl_engine import fetch_capabilities, probe_escl
             for idx, scanner in enumerate(saved):
                 self._probe_state["current"] = idx
                 self._probe_state["detail"] = (
                     f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
                 try:
-                    fetch_capabilities(scanner, timeout=3.0)
+                    # 先探测 eSCL URL（restore 回来的 scanner 没有 escl_url）
+                    if not scanner.escl_url and scanner.ip:
+                        url = probe_escl(scanner.ip, timeout=2.0)
+                        if url:
+                            scanner.escl_url = url
+                    # 再获取设备能力
+                    if scanner.escl_url:
+                        fetch_capabilities(scanner, timeout=3.0)
                 except Exception as e:
                     self._probe_state["errors"].append((scanner.display_name, str(e)))
                 self._probe_state["current"] = idx + 1
@@ -1393,12 +1400,12 @@ class ScanApp(QMainWindow):
         )
 
         # 检查是否取消或无数据
-        if result is None or (cancel_event and cancel_event.is_set()):
+        if result is None or not isinstance(result, tuple) or len(result) != 2:
             cache_manager.remove_job(job_id)
             return
-
         data, ext = result
-        if not data:
+        if not data or (cancel_event and cancel_event.is_set()):
+            cache_manager.remove_job(job_id)
             cache_manager.remove_job(job_id)
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("扫描失败：未获取到数据"))
             return
