@@ -2382,9 +2382,9 @@ class PreviewDialog(QDialog):
             img = Image.open(self.cache_path)
             cropped = auto_crop(img)
             if cropped is not img:
-                crop_path = self.cache_path + ".cropped"
-                cropped.save(crop_path, quality=95)
-                self.cache_path = crop_path
+                # 直接覆盖原缓存文件（使用原始格式）
+                fmt = self.ext.upper() if self.ext != "jpg" else "JPEG"
+                cropped.save(self.cache_path, format=fmt)
                 self._cropped = True
                 self._rotation = 0
                 self._show_image()
