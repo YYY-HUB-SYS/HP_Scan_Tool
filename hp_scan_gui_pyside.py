@@ -561,24 +561,21 @@ class LoadingDialog(QDialog):
         layout.addStretch()
 
     def set_step(self, text: str):
-        """设置当前步骤文本"""
+        """设置当前步骤文本（仅主线程调用）"""
         self.step_label.setText(text)
-        QApplication.processEvents()
 
     def set_detail(self, text: str):
-        """设置详细信息"""
+        """设置详细信息（仅主线程调用）"""
         self.detail_label.setText(text)
-        QApplication.processEvents()
 
     def set_determinate(self, maximum: int):
-        """切换为确定进度模式"""
+        """切换为确定进度模式（仅主线程调用）"""
         self.progress.setRange(0, maximum)
         self.progress.setValue(0)
 
     def set_value(self, value: int):
-        """更新进度值"""
+        """更新进度值（仅主线程调用）"""
         self.progress.setValue(value)
-        QApplication.processEvents()
 
 
 # ────────── 主窗口 ──────────
@@ -700,73 +697,89 @@ class ScanApp(QMainWindow):
         # 第1步：检查是否有已保存的扫描仪
         saved = self.coordinator.restore_saved_scanners()
         if not saved:
-            self._loading.close()
-            self._loading = None
-            self.show()
-            self._auto_discover()
+            QTimer.singleShot(0, self._finish_loading)
             return
 
-        # 第2步：逐个探测设备能力（带进度 + 全局超时看门狗）
+        # 第2步：逐个探测设备能力
         self._loading.set_step("正在探测扫描仪...")
         self._loading.set_determinate(len(saved))
         self._rebuild_cards()
 
-        errors = []
-        self._probe_errors = []
+        # 线程间共享的进度状态（后台线程只写，主线程轮询读）
+        self._probe_state = {
+            "current": 0, "total": len(saved),
+            "detail": "", "done": False, "errors": [],
+        }
 
-        # 看门狗：15 秒后强制完成（无论探测是否结束）
-        def _watchdog():
-            if self._loading:
-                self._loading.set_detail("部分设备探测超时，跳过...")
-                QTimer.singleShot(500, self._on_startup_complete)
+        # 主线程轮询器：每 100ms 读进度并更新 UI
+        def _poll():
+            s = self._probe_state
+            if s["done"]:
+                self._poll_timer.stop()
+                QTimer.singleShot(100, self._on_startup_complete)
+                return
+            self._loading.set_detail(s["detail"])
+            self._loading.set_value(s["current"])
 
-        watchdog_timer = QTimer()
-        watchdog_timer.setSingleShot(True)
-        watchdog_timer.timeout.connect(_watchdog)
-        watchdog_timer.start(min(15000, len(saved) * 4000))  # 最多 15s 或每台 4s
+        self._poll_timer = QTimer()
+        self._poll_timer.timeout.connect(_poll)
+        self._poll_timer.start(100)
 
+        # 看门狗：15s 后强制完成
+        QTimer.singleShot(15000, self._on_probe_watchdog)
+
+        # 后台线程：只做网络请求，绝不碰 UI
         def _probe_thread():
+            from escl_engine import fetch_capabilities
             for idx, scanner in enumerate(saved):
+                self._probe_state["current"] = idx
+                self._probe_state["detail"] = (
+                    f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
                 try:
-                    from escl_engine import fetch_capabilities
-                    self._loading.set_detail(
-                        f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
-                    # 缩短超时到 3 秒，避免在离线设备上等待过久
                     fetch_capabilities(scanner, timeout=3.0)
                 except Exception as e:
-                    errors.append((scanner.display_name, str(e)))
-                finally:
-                    self._loading.set_value(idx + 1)
-            # 探测完成，停止看门狗
-            watchdog_timer.stop()
-            self._probe_errors = errors
-            QTimer.singleShot(0, self._on_startup_complete)
+                    self._probe_state["errors"].append((scanner.display_name, str(e)))
+                self._probe_state["current"] = idx + 1
+            self._probe_state["done"] = True
 
         threading.Thread(target=_probe_thread, daemon=True).start()
 
+    def _on_probe_watchdog(self):
+        """看门狗触发：强制结束等待"""
+        if hasattr(self, '_probe_state') and not self._probe_state.get("done"):
+            self._probe_state["done"] = True
+            self._loading.set_detail("部分设备超时，跳过...")
+
+    def _finish_loading(self):
+        """无保存设备时直接进入"""
+        if self._loading:
+            self._loading.close()
+            self._loading = None
+        self.show()
+        self._auto_discover()
+
     def _on_startup_complete(self):
-        """启动流程完成，应用结果并进入主界面"""
-        # 更新卡片
+        """启动流程完成，进入主界面"""
+        if hasattr(self, '_poll_timer'):
+            self._poll_timer.stop()
+
+        errors = self._probe_state.get("errors", [])
         self._rebuild_cards()
 
-        # 自动选择第一个扫描仪
         if self.coordinator.scanners and self.selected_idx < 0:
             self._on_card_clicked(0)
 
-        # 关闭加载界面，显示主窗口
         if self._loading:
             self._loading.close()
             self._loading = None
         self.show()
 
-        # 状态栏提示
         count = len(self.coordinator.scanners)
-        if self._probe_errors:
-            self.status_bar.showMessage(f"就绪 — {count} 台扫描仪（部分探测失败）")
-        else:
-            self.status_bar.showMessage(f"就绪 — {count} 台扫描仪")
+        msg = f"就绪 — {count} 台扫描仪"
+        if errors:
+            msg += f"（{len(errors)} 台探测失败）"
+        self.status_bar.showMessage(msg)
 
-        # 自动发现新设备（低优先级，不影响当前操作）
         QTimer.singleShot(2000, self._auto_discover)
 
     def _build_scanner_panel(self, parent_layout):
