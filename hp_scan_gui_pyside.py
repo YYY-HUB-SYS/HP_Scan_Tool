@@ -568,8 +568,13 @@ class ScanApp(QMainWindow):
         if saved:
             self._rebuild_cards()
             self.status_bar.showMessage(f"已恢复 {len(saved)} 台扫描仪，正在探测...")
+
             # 必须在后台探测设备能力，才能获取 has_adf/has_duplex
-            self.coordinator.probe_scanners_background(saved, self._on_probe_results)
+            # 用 QTimer.singleShot 包装回调，确保 UI 更新在主线程执行
+            def _probe_main(results):
+                QTimer.singleShot(0, lambda: self._on_probe_results(results))
+
+            self.coordinator.probe_scanners_background(saved, _probe_main)
 
         # 进度条（嵌入状态栏）
         self.scan_progress = QProgressBar()
