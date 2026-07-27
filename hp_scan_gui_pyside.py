@@ -1430,9 +1430,8 @@ class ScanApp(QMainWindow):
         source_text = self.source_combo.currentText()
         if source_text == "ADF":
             source_val = "Feeder"
-        elif source_text == "自动":
-            source_val = "Auto"  # 由 _detect_adf_source 自动判断
         else:
+            # "平板" 和 "自动" 都走平板单页扫描
             source_val = "Platen"
 
         self.scan_btn.setText("扫描中...")
@@ -1476,18 +1475,11 @@ class ScanApp(QMainWindow):
         threading.Thread(target=_scan_thread, daemon=True).start()
 
     def _detect_adf_source(self, scanner, user_source):
-        """根据用户选择和设备能力决定扫描来源（纯本地，无网络请求）"""
+        """根据用户选择决定扫描来源"""
         if user_source == "Feeder" and scanner.has_adf:
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用 ADF 输稿器扫描"))
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF 输稿器扫描"))
             return "Feeder", True
-        if user_source == "Platen":
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
-            return "Platen", False
-        # 自动：有ADF直接用，没有就用平板
-        if scanner.has_adf:
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动模式 → 使用 ADF"))
-            return "Feeder", True
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动模式 → 使用平板"))
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("平板扫描"))
         return "Platen", False
 
     def _cancel_scan(self):
