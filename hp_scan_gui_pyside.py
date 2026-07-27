@@ -1471,16 +1471,13 @@ class ScanApp(QMainWindow):
 
     def _detect_adf_source(self, scanner, user_source):
         """
-        自动检测 ADF 输稿器状态，决定实际扫描来源。
+        根据用户选择和设备能力决定扫描来源（纯本地判断，无网络请求）。
 
         逻辑:
-        1. 用户选择了 Feeder 且设备有 ADF → 直接使用 Feeder
-        2. 用户选择了 Platen → 直接使用 Platen
-        3. 用户未选择来源（自动模式）:
-           a. 设备有 ADF → 检测输稿器是否有纸，有纸用 Feeder，无纸用 Platen
-           b. 设备无 ADF → 强制 Platen
+        1. 用户选择了 ADF 且设备有 → 直接使用
+        2. 用户选择了 Platen → 直接使用
+        3. 自动模式: 有ADF就用ADF，没有就用Platen
         """
-        # 如果用户指定了来源，直接用
         if user_source == "Feeder" and scanner.has_adf:
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用 ADF 输稿器扫描"))
             return "Feeder", True
@@ -1488,36 +1485,8 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
             return "Platen", False
 
-        # 自动模式 (user_source == "Auto")：根据设备能力选择
-        if scanner.has_adf:
-            # 检测输稿器状态
-            adf_loaded = False
-            try:
-                if scanner.escl_url:
-                    import requests
-                    sess = requests.Session()
-                    sess.verify = False
-                    try:
-                        base = scanner.escl_url.rstrip("/")
-                        r = sess.get(f"{base}/ScannerCapabilities", timeout=3)
-                        if r.status_code == 200 and "AdfLoaded" in r.text and "true" in r.text.lower():
-                            adf_loaded = True
-                    except Exception:
-                        pass
-                    finally:
-                        sess.close()
-            except Exception:
-                pass
-
-            if adf_loaded:
-                QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到 ADF 已装载，使用输稿器扫描"))
-                return "Feeder", True
-            else:
-                QTimer.singleShot(0, lambda: self.status_bar.showMessage("输稿器为空或检测失败，使用平板扫描"))
-                return "Platen", False
-
-        # 设备无 ADF，强制平板
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
+        # 自动模式：默认平板（安全），用户明确选ADF时才用输稿器
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 使用平板扫描"))
         return "Platen", False
 
     def _cancel_scan(self):
