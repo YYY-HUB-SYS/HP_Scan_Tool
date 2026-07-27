@@ -174,11 +174,13 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
 
 def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
     """探测指定 IP 的 eSCL 服务，返回完整 eSCL 基础 URL"""
-    # 尝试 HTTP 和 HTTPS，多种端口组合
-    # HP LaserJet M232 等机型使用 HTTPS 443
+    # HP 打印机常见端口：HTTP 80, HTTPS 443, 备用 8080/8443/53048
     probe_configs = [
-        (f"http://{ip}:80",   "HTTP:80"),
-        (f"https://{ip}:443", "HTTPS:443"),
+        (f"http://{ip}:80",      "HTTP:80"),
+        (f"https://{ip}:443",    "HTTPS:443"),
+        (f"https://{ip}:53048",  "HTTPS:53048"),
+        (f"http://{ip}:8080",    "HTTP:8080"),
+        (f"https://{ip}:8443",   "HTTPS:8443"),
     ]
 
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
@@ -188,16 +190,31 @@ def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
             try:
                 r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
                 if r.status_code == 200:
+                    logger.info("probe_escl %s 成功: %s%s", ip, base, path)
                     if "/eSCL" in path:
                         return f"{base}/eSCL/"
                     return f"{base}/"
+            except requests.ConnectionError:
+                break  # 端口不通，不用再试该 base 的其他 path
             except Exception:
                 continue
 
+    logger.warning("probe_escl %s 失败: 所有端口均无响应", ip)
     return None
 
 
 # ==================== 能力查询 (node-hp-scan-to 协议) ====================
+
+def _probe_adf_from_status(scanner: ScannerInfo, base: str, timeout: float):
+    """ScannerCapabilities 不可用时，从 ScannerStatus 回退检测 ADF"""
+    try:
+        r = requests.get(f"{base}/ScannerStatus", timeout=(2.0, timeout), verify=False)
+        if r.status_code == 200 and "AdfState" in r.text:
+            scanner.has_adf = True
+            logger.info("从 ScannerStatus 检测到 ADF: %s", scanner.ip)
+    except Exception:
+        pass
+
 
 def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInfo:
     """
@@ -207,10 +224,18 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
     if not scanner.escl_url:
         return scanner
 
-    url = scanner.escl_url.rstrip("/") + "/ScannerCapabilities"
+    base = scanner.escl_url.rstrip("/")
+    url = base + "/ScannerCapabilities"
+
     try:
-        r = requests.get(url, timeout=(2.0, timeout), verify=False)
+        # 不用自动跳转：部分 HP 打印机 HTTP→HTTPS 重定向但 TLS 握手失败
+        r = requests.get(url, timeout=(2.0, timeout), verify=False, allow_redirects=False)
+        if r.status_code in (301, 302, 307, 308):
+            alt_url = url.replace("https://", "http://")
+            r = requests.get(alt_url, timeout=(2.0, timeout), verify=False, allow_redirects=False)
         if r.status_code != 200:
+            # ScannerCapabilities 失败 → 回退到 ScannerStatus 探测 ADF
+            _probe_adf_from_status(scanner, base, timeout)
             return scanner
         root = ET.fromstring(r.text)
 
