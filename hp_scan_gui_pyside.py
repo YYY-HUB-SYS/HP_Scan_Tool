@@ -1437,7 +1437,6 @@ class ScanApp(QMainWindow):
 
         self.scan_btn.setText("扫描中...")
         self.scan_btn.setEnabled(False)
-        self.status_bar.showMessage("正在扫描...")
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
 
@@ -1456,6 +1455,13 @@ class ScanApp(QMainWindow):
 
                 if self._scan_cancel_event.is_set():
                     return
+
+                # 平板扫描提示用户去放纸
+                if not use_adf:
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage(
+                        "平板扫描：请将文档放在扫描仪玻璃上并按打印机上的扫描按钮"))
+                else:
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF扫描：输稿器自动进纸，请稍候..."))
 
                 if use_adf:
                     self._do_multipage_scan(scanner, out_dir, actual_source, cancel_event=self._scan_cancel_event)
