@@ -475,7 +475,7 @@ def execute_scan(
     output_format: str = "jpg",
     source: str = "Platen",
     duplex: bool = False,
-    timeout: float = 120.0,
+    timeout: float = 30.0,
     cancel_event=None,
 ) -> tuple[bytes, str]:
     """
@@ -500,7 +500,7 @@ def execute_scan(
                 return None, ext
 
             try:
-                r = session.get(nd_url, timeout=10)
+                r = session.get(nd_url, timeout=3)
                 if r.status_code == 200:
                     return _fix_jpeg_header(r.content), ext
                 elif r.status_code == 503:
@@ -526,8 +526,8 @@ def execute_multipage_scan(
     output_format: str = "jpg",
     source: str = "Platen",
     duplex: bool = False,
-    timeout: float = 300.0,
-    page_timeout: float = 60.0,
+    timeout: float = 90.0,
+    page_timeout: float = 30.0,
     progress_callback=None,
     cancel_event=None,
 ) -> list[tuple[bytes, str]]:
@@ -562,7 +562,7 @@ def execute_multipage_scan(
                     return pages if pages else []
 
                 try:
-                    r = session.get(nd_url, timeout=10)
+                    r = session.get(nd_url, timeout=3)
                     if r.status_code == 200:
                         pages.append((_fix_jpeg_header(r.content), ext))
                         if progress_callback:
