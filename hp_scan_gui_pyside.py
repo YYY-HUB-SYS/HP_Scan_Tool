@@ -13,9 +13,12 @@ import os
 import shutil
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from typing import Optional
+
+from PIL import Image
 
 import cache_manager
 import history_manager
@@ -564,7 +567,9 @@ class ScanApp(QMainWindow):
         saved = self.coordinator.restore_saved_scanners()
         if saved:
             self._rebuild_cards()
-            self.status_bar.showMessage(f"已恢复 {len(saved)} 台扫描仪")
+            self.status_bar.showMessage(f"已恢复 {len(saved)} 台扫描仪，正在探测...")
+            # 必须在后台探测设备能力，才能获取 has_adf/has_duplex
+            self.coordinator.probe_scanners_background(saved, self._on_probe_results)
 
         # 进度条（嵌入状态栏）
         self.scan_progress = QProgressBar()
@@ -893,6 +898,16 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, self._on_discover_finished)
 
         self.coordinator.discover_scanners_background(_on_complete)
+
+    def _on_probe_results(self, results: dict):
+        """扫描仪探测完成，更新设备能力"""
+        if results:
+            self.coordinator.apply_probe_results(results)
+        self._rebuild_cards()
+        # 自动选择第一个扫描仪
+        if self.coordinator.scanners and self.selected_idx < 0:
+            self._on_card_clicked(0)
+        self.status_bar.showMessage(f"就绪 — {len(self.coordinator.scanners)} 台扫描仪")
 
     def _on_discover_finished(self):
         """发现完成更新 UI"""
