@@ -777,12 +777,15 @@ class ScanApp(QMainWindow):
             self._loading.set_detail("部分设备超时，跳过...")
 
     def _finish_loading(self):
-        """无保存设备时：加载界面等待自动发现"""
+        """无保存设备时：加载界面等待自动发现（最多20秒）"""
         self._loading.set_step("正在发现扫描仪...")
         self._loading.set_detail("通过 mDNS/WSD 搜索网络中的打印机")
-        self._startup_discover = True  # 标记为启动发现模式
+        self._startup_discover = True
 
-        # 启动自动发现（完成后由 _on_discover_finished 关闭加载界面）
+        # 看门狗：20秒后强制进入（即使没找到设备）
+        QTimer.singleShot(20000, self._on_startup_discover_watchdog)
+
+        # 启动自动发现
         self._auto_discover()
 
     def _on_startup_complete(self):
@@ -1126,6 +1129,16 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, self._on_discover_finished)
 
         self.coordinator.discover_scanners_background(_on_complete)
+
+    def _on_startup_discover_watchdog(self):
+        """启动发现看门狗：超时后强制进入"""
+        if getattr(self, '_startup_discover', False):
+            self._startup_discover = False
+            if self._loading:
+                self._loading.close()
+                self._loading = None
+            self.show()
+            self.status_bar.showMessage("未发现扫描仪，请点击「刷新」或「手动添加」")
 
     def _on_discover_finished(self):
         """发现完成更新 UI"""
