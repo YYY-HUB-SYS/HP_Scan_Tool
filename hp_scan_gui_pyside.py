@@ -1231,15 +1231,15 @@ class ScanApp(QMainWindow):
             card.toggle_disabled.connect(self._on_toggle_disabled)
             self.cards.append(card)
             if is_disabled:
-                card.setEnabled(False)
                 card.setStyleSheet(f"""
                     ScannerCard {{
                         background: {COLORS['surface']};
                         border: 1.5px dashed {COLORS['border']};
                         border-radius: {RADIUS['lg']}px;
-                        opacity: 0.55;
                     }}
                 """)
+                card.setGraphicsEffect(QGraphicsOpacityEffect(opacity=0.55))
+                # 标记为停用状态（_on_card_clicked 会拦截点击）
                 disabled_scanners.append(card)
             else:
                 active_scanners.append(card)
@@ -1275,7 +1275,11 @@ class ScanApp(QMainWindow):
     def _on_card_clicked(self, idx: int):
         """点击扫描仪卡片"""
         if 0 <= idx < len(self.coordinator.scanners):
-            self.selected = self.coordinator.scanners[idx]
+            scanner = self.coordinator.scanners[idx]
+            # 停用设备不响应选择点击（但启用按钮仍可用）
+            if scanner.ip in self.disabled_ips:
+                return
+            self.selected = scanner
             self.selected_idx = idx
 
             for i, card in enumerate(self.cards):
