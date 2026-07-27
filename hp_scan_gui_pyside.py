@@ -1485,8 +1485,20 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
             return "Platen", False
 
-        # 自动模式：默认平板（安全），用户明确选ADF时才用输稿器
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 使用平板扫描"))
+        # 自动模式：ADF优先（1秒快速检测装纸状态），失败则平板
+        if scanner.has_adf and scanner.escl_url:
+            try:
+                import requests
+                r = requests.get(
+                    f"{scanner.escl_url.rstrip('/')}/ScannerStatus",
+                    timeout=1, verify=False, allow_redirects=False,
+                )
+                if r.status_code == 200 and "ScannerAdfLoaded" in r.text:
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → ADF 已装载，使用输稿器"))
+                    return "Feeder", True
+            except Exception:
+                pass
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → ADF 未装载，使用平板"))
         return "Platen", False
 
     def _cancel_scan(self):
