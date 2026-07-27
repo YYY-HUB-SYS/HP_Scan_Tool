@@ -195,12 +195,11 @@ def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
 def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInfo:
     """
     从 /eSCL/ScannerCapabilities 解析扫描仪全部能力。
-    返回修改后的副本，不修改传入的 scanner 对象。
+    直接修改传入的 scanner 对象（原地更新）。
     """
     if not scanner.escl_url:
-        return copy.copy(scanner)
+        return scanner
 
-    scanner = copy.copy(scanner)
     url = scanner.escl_url.rstrip("/") + "/ScannerCapabilities"
     try:
         r = requests.get(url, timeout=(2.0, timeout), verify=False)
