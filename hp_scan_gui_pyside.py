@@ -1231,6 +1231,10 @@ class ScanApp(QMainWindow):
             card.toggle_disabled.connect(self._on_toggle_disabled)
             self.cards.append(card)
             if is_disabled:
+                # 恢复停用状态（卡片重建时 _disabled 被重置）
+                card._disabled = True
+                card.disable_btn.setText("▶")
+                card.disable_btn.setToolTip("已停用，点击启用")
                 card.setStyleSheet(f"""
                     ScannerCard {{
                         background: {COLORS['surface']};
@@ -1239,7 +1243,6 @@ class ScanApp(QMainWindow):
                     }}
                 """)
                 card.setGraphicsEffect(QGraphicsOpacityEffect(opacity=0.55))
-                # 标记为停用状态（_on_card_clicked 会拦截点击）
                 disabled_scanners.append(card)
             else:
                 active_scanners.append(card)
