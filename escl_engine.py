@@ -192,7 +192,7 @@ def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
 
 # ==================== 能力查询 (node-hp-scan-to 协议) ====================
 
-def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInfo:
+def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInfo:
     """
     从 /eSCL/ScannerCapabilities 解析扫描仪全部能力。
     返回修改后的副本，不修改传入的 scanner 对象。
@@ -203,7 +203,7 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 5.0) -> ScannerInf
     scanner = copy.copy(scanner)
     url = scanner.escl_url.rstrip("/") + "/ScannerCapabilities"
     try:
-        r = requests.get(url, timeout=timeout, verify=False)
+        r = requests.get(url, timeout=(2.0, timeout), verify=False)
         if r.status_code != 200:
             return scanner
         root = ET.fromstring(r.text)

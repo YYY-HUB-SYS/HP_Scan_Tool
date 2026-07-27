@@ -687,51 +687,58 @@ class ScanApp(QMainWindow):
     # ── 启动流程（由 LoadingDialog 驱动）──
     def _do_startup_scan(self):
         """逐步执行启动流程：恢复设备 → 探测能力 → 进入主界面"""
+        # 抑制 SSL 警告（探测时大量 verify=False 请求）
+        try:
+            import urllib3; urllib3.disable_warnings()
+        except Exception:
+            pass
+        try:
+            import warnings; warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+        except Exception:
+            pass
+
         # 第1步：检查是否有已保存的扫描仪
         saved = self.coordinator.restore_saved_scanners()
         if not saved:
-            # 没有已保存的扫描仪，直接进入（后续自动发现）
             self._loading.close()
             self._loading = None
             self.show()
             self._auto_discover()
             return
 
-        # 第2步：逐个探测设备能力（带进度）
+        # 第2步：逐个探测设备能力（带进度 + 全局超时看门狗）
         self._loading.set_step("正在探测扫描仪...")
         self._loading.set_determinate(len(saved))
         self._rebuild_cards()
 
-        results = {}
         errors = []
-
-        def _probe_one(scanner, idx):
-            """探测单台设备"""
-            try:
-                from escl_engine import fetch_capabilities
-                self._loading.set_detail(f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
-                fetch_capabilities(scanner)
-                results[scanner.ip or str(idx)] = {
-                    "has_adf": scanner.has_adf,
-                    "has_duplex": scanner.has_duplex,
-                    "max_width": scanner.max_width,
-                    "max_height": scanner.max_height,
-                    "escl_url": scanner.escl_url,
-                }
-            except Exception as e:
-                errors.append((scanner.display_name, str(e)))
-            finally:
-                self._loading.set_value(idx + 1)
-
-        # 在后台线程中逐个探测
-        # 使用 threading + 信号方式通知主线程
-        self._probe_done = False
         self._probe_errors = []
+
+        # 看门狗：15 秒后强制完成（无论探测是否结束）
+        def _watchdog():
+            if self._loading:
+                self._loading.set_detail("部分设备探测超时，跳过...")
+                QTimer.singleShot(500, self._on_startup_complete)
+
+        watchdog_timer = QTimer()
+        watchdog_timer.setSingleShot(True)
+        watchdog_timer.timeout.connect(_watchdog)
+        watchdog_timer.start(min(15000, len(saved) * 4000))  # 最多 15s 或每台 4s
 
         def _probe_thread():
             for idx, scanner in enumerate(saved):
-                _probe_one(scanner, idx)
-            self._probe_done = True
+                try:
+                    from escl_engine import fetch_capabilities
+                    self._loading.set_detail(
+                        f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
+                    # 缩短超时到 3 秒，避免在离线设备上等待过久
+                    fetch_capabilities(scanner, timeout=3.0)
+                except Exception as e:
+                    errors.append((scanner.display_name, str(e)))
+                finally:
+                    self._loading.set_value(idx + 1)
+            # 探测完成，停止看门狗
+            watchdog_timer.stop()
             self._probe_errors = errors
             QTimer.singleShot(0, self._on_startup_complete)
 
