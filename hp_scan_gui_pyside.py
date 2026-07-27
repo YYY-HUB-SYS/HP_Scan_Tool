@@ -1456,10 +1456,10 @@ class ScanApp(QMainWindow):
                 if self._scan_cancel_event.is_set():
                     return
 
-                # 平板扫描提示用户去放纸
+                # 平板扫描：自动开始，约5-10秒完成
                 if not use_adf:
                     QTimer.singleShot(0, lambda: self.status_bar.showMessage(
-                        "平板扫描：请将文档放在扫描仪玻璃上并按打印机上的扫描按钮"))
+                        "平板扫描进行中，约5-10秒完成..."))
                 else:
                     QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF扫描：输稿器自动进纸，请稍候..."))
 
