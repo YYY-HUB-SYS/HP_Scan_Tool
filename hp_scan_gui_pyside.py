@@ -2379,10 +2379,12 @@ class PreviewDialog(QDialog):
 
     def _auto_crop(self):
         try:
+            if not os.path.exists(self.cache_path):
+                self.info_label.setText("裁边失败: 缓存文件不存在")
+                return
             img = Image.open(self.cache_path)
             cropped = auto_crop(img)
             if cropped is not img:
-                # 直接覆盖原缓存文件（使用原始格式）
                 fmt = self.ext.upper() if self.ext != "jpg" else "JPEG"
                 cropped.save(self.cache_path, format=fmt)
                 self._cropped = True
