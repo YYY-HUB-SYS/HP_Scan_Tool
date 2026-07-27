@@ -180,8 +180,8 @@ class ScannerCard(QFrame):
         self._selected = False
         self._hovered = False
 
-        self.setMinimumHeight(76)
-        self.setMaximumHeight(100)
+        self.setMinimumHeight(64)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.setCursor(Qt.PointingHandCursor)
         self.setFrameShape(QFrame.StyledPanel)
         self.setObjectName("scannerCard")
@@ -194,54 +194,73 @@ class ScannerCard(QFrame):
 
     def _setup_ui(self):
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
 
         # 状态指示器
         self.status_dot = QLabel("●")
-        self.status_dot.setFixedWidth(16)
-        self.status_dot.setStyleSheet(f"color: {COLORS['success']}; font-size: 14px;")
+        self.status_dot.setFixedWidth(12)
+        self.status_dot.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
         layout.addWidget(self.status_dot)
 
         # 名称和信息
         info_layout = QVBoxLayout()
-        info_layout.setSpacing(3)
+        info_layout.setSpacing(2)
 
         name = _label_for(self.scanner)
         self.name_label = QLabel(name)
-        self.name_label.setFont(QFont(_FONT_FAMILY, 11, QFont.Bold))
+        self.name_label.setFont(QFont(_FONT_FAMILY, 10, QFont.Bold))
         self.name_label.setStyleSheet(f"color: {COLORS['text_primary']};")
         self.name_label.setWordWrap(True)
-        self.name_label.setMinimumHeight(20)
+        self.name_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         info_layout.addWidget(self.name_label)
 
         ip_text = _ip_label_for(self.scanner)
         self.ip_label = QLabel(ip_text)
-        self.ip_label.setFont(QFont(_FONT_FAMILY, 9))
+        self.ip_label.setFont(QFont(_FONT_FAMILY, 8))
         self.ip_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         self.ip_label.setWordWrap(True)
+        self.ip_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         info_layout.addWidget(self.ip_label)
 
         layout.addLayout(info_layout, 1)
 
-        # 功能标签
-        tags = []
+        # 功能标签列（竖向排列，节省横向空间）
+        tag_layout = QVBoxLayout()
+        tag_layout.setSpacing(2)
+
         if self.scanner.has_adf:
-            tags.append("ADF")
-        if self.scanner.has_duplex:
-            tags.append("双面")
-        if self.scanner.escl_url:
-            tags.append("eSCL")
-        if tags:
-            tags_text = " · ".join(tags)
-            tags_label = QLabel(tags_text)
-            tags_label.setFont(QFont(_FONT_FAMILY, 8))
-            tags_label.setStyleSheet(
+            t = QLabel("ADF")
+            t.setFont(QFont(_FONT_FAMILY, 7))
+            t.setStyleSheet(
                 f"color: {COLORS['primary']}; background: {COLORS['primary_bg']};"
-                f"padding: 3px 8px; border-radius: {RADIUS['sm']}px;"
+                f"padding: 1px 5px; border-radius: {RADIUS['sm']}px;"
             )
-            tags_label.setWordWrap(False)
-            layout.addWidget(tags_label)
+            t.setAlignment(Qt.AlignCenter)
+            tag_layout.addWidget(t)
+
+        if self.scanner.has_duplex:
+            t = QLabel("双面")
+            t.setFont(QFont(_FONT_FAMILY, 7))
+            t.setStyleSheet(
+                f"color: {COLORS['primary']}; background: {COLORS['primary_bg']};"
+                f"padding: 1px 5px; border-radius: {RADIUS['sm']}px;"
+            )
+            t.setAlignment(Qt.AlignCenter)
+            tag_layout.addWidget(t)
+
+        if self.scanner.escl_url:
+            t = QLabel("eSCL")
+            t.setFont(QFont(_FONT_FAMILY, 7))
+            t.setStyleSheet(
+                f"color: {COLORS['success']}; background: #ECFDF5;"
+                f"padding: 1px 5px; border-radius: {RADIUS['sm']}px;"
+            )
+            t.setAlignment(Qt.AlignCenter)
+            tag_layout.addWidget(t)
+
+        if tag_layout.count() > 0:
+            layout.addLayout(tag_layout)
 
         # 上下移动按钮
         move_layout = QVBoxLayout()
@@ -738,12 +757,12 @@ class ScanApp(QMainWindow):
                 try:
                     # 先探测 eSCL URL（restore 回来的 scanner 没有 escl_url）
                     if not scanner.escl_url and scanner.ip:
-                        url = probe_escl(scanner.ip, timeout=2.0)
+                        url = probe_escl(scanner.ip, timeout=4.0)
                         if url:
                             scanner.escl_url = url
                     # 再获取设备能力
                     if scanner.escl_url:
-                        fetch_capabilities(scanner, timeout=3.0)
+                        fetch_capabilities(scanner, timeout=4.0)
                 except Exception as e:
                     self._probe_state["errors"].append((scanner.display_name, str(e)))
                 self._probe_state["current"] = idx + 1
@@ -792,8 +811,8 @@ class ScanApp(QMainWindow):
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
         panel = QFrame()
-        panel.setFixedWidth(280)
-        panel.setMinimumWidth(260)
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(340)
         panel.setObjectName("scannerPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(SPACING["md"], SPACING["md"], SPACING["md"], SPACING["md"])
