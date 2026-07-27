@@ -39,7 +39,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
     QPainter, QColor, QPen, QBrush, QLinearGradient,
-    QAction, QKeySequence, QShortcut, QPalette,
+    QAction, QKeySequence, QShortcut, QPalette, QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -408,7 +408,7 @@ class ImageViewer(QWidget):
     def _update_scaled(self):
         if self._pixmap is None:
             return
-        transform =()
+        transform = QTransform()
         if self._rotation:
             transform = transform.rotate(self._rotation)
         pm = self._pixmap.transformed(transform)
