@@ -2383,15 +2383,14 @@ class PreviewDialog(QDialog):
             if not cache or not os.path.exists(cache):
                 self.info_label.setText("裁边失败: 缓存文件不存在")
                 return
-            # 读取原始字节避免文件锁
             with open(cache, "rb") as f:
                 raw = f.read()
             img = Image.open(io.BytesIO(raw))
             cropped = auto_crop(img)
             if cropped is not img:
                 buf = io.BytesIO()
-                fmt = "JPEG" if self.ext in ("jpg", "jpeg") else self.ext.upper()
-                cropped.save(buf, format=fmt)
+                cropped = cropped.convert("RGB")
+                cropped.save(buf, format="JPEG")
                 with open(cache, "wb") as f:
                     f.write(buf.getvalue())
                 self._cropped = True
