@@ -489,6 +489,98 @@ class AnimatedButton(QPushButton):
         super().mouseReleaseEvent(event)
 
 
+# ────────── 启动加载界面 ──────────
+class LoadingDialog(QDialog):
+    """启动加载界面：覆盖在主窗口上，显示初始化进度"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("HP Scan Tool")
+        self.setFixedSize(420, 220)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setModal(True)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+
+        # 背景色
+        self.setStyleSheet(f"""
+            QDialog {{
+                background: #FFFFFF;
+                border: 1px solid #E2E8F0;
+                border-radius: {RADIUS['lg']}px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(16)
+
+        # 标题
+        title = QLabel("HP Scan Tool v4.0")
+        title.setFont(QFont(_FONT_FAMILY, 18, QFont.Bold))
+        title.setStyleSheet(f"color: {COLORS['text_primary']};")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # 当前步骤
+        self.step_label = QLabel("正在初始化...")
+        self.step_label.setFont(QFont(_FONT_FAMILY, 11))
+        self.step_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.step_label.setAlignment(Qt.AlignCenter)
+        self.step_label.setMinimumHeight(24)
+        layout.addWidget(self.step_label)
+
+        # 进度条
+        self.progress = QProgressBar()
+        self.progress.setMinimumHeight(10)
+        self.progress.setMaximumHeight(10)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 0)  # 不确定模式
+        self.progress.setStyleSheet(f"""
+            QProgressBar {{
+                background: #F1F5F9;
+                border: none;
+                border-radius: 5px;
+            }}
+            QProgressBar::chunk {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                                            stop:0 {COLORS['primary']},
+                                            stop:1 {COLORS['primary_light']});
+                border-radius: 5px;
+            }}
+        """)
+        layout.addWidget(self.progress)
+
+        # 详细状态
+        self.detail_label = QLabel("")
+        self.detail_label.setFont(QFont(_FONT_FAMILY, 9))
+        self.detail_label.setStyleSheet(f"color: {COLORS['text_muted']};")
+        self.detail_label.setAlignment(Qt.AlignCenter)
+        self.detail_label.setMinimumHeight(18)
+        layout.addWidget(self.detail_label)
+
+        layout.addStretch()
+
+    def set_step(self, text: str):
+        """设置当前步骤文本"""
+        self.step_label.setText(text)
+        QApplication.processEvents()
+
+    def set_detail(self, text: str):
+        """设置详细信息"""
+        self.detail_label.setText(text)
+        QApplication.processEvents()
+
+    def set_determinate(self, maximum: int):
+        """切换为确定进度模式"""
+        self.progress.setRange(0, maximum)
+        self.progress.setValue(0)
+
+    def set_value(self, value: int):
+        """更新进度值"""
+        self.progress.setValue(value)
+        QApplication.processEvents()
+
+
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow):
     """主窗口（UI 优化版）"""
@@ -496,7 +588,7 @@ class ScanApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # 业务逻辑层
+        # 业务逻辑层（快速）
         self.coordinator = ScanCoordinator()
         self.coordinator.load_config()
         self.cfg = self.coordinator.cfg
@@ -520,9 +612,28 @@ class ScanApp(QMainWindow):
         self.extra_dirs = self.cfg.get("extra_dirs", [])
         self.cards = []
 
+        # 先构建界面（隐藏状态）
         self._setup_ui()
         self._refresh_extra_dirs()
-        self._auto_discover()
+
+        # 显示加载界面（居中到屏幕）
+        self._loading = LoadingDialog(self)
+        self._loading.set_step("正在初始化...")
+        self._loading.set_detail("加载配置")
+        try:
+            screen = QApplication.primaryScreen()
+            if screen:
+                sg = screen.geometry()
+                self._loading.move(
+                    sg.center().x() - self._loading.width() // 2,
+                    sg.center().y() - self._loading.height() // 2,
+                )
+        except Exception:
+            pass
+        self._loading.show()
+
+        # 延迟 100ms 确保加载界面渲染后再开始设备探测
+        QTimer.singleShot(100, self._do_startup_scan)
 
     def _setup_ui(self):
         self.setWindowTitle("HP Scan Tool v4.0")
@@ -563,19 +674,6 @@ class ScanApp(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
 
-        # 恢复已保存的扫描仪
-        saved = self.coordinator.restore_saved_scanners()
-        if saved:
-            self._rebuild_cards()
-            self.status_bar.showMessage(f"已恢复 {len(saved)} 台扫描仪，正在探测...")
-
-            # 必须在后台探测设备能力，才能获取 has_adf/has_duplex
-            # 用 QTimer.singleShot 包装回调，确保 UI 更新在主线程执行
-            def _probe_main(results):
-                QTimer.singleShot(0, lambda: self._on_probe_results(results))
-
-            self.coordinator.probe_scanners_background(saved, _probe_main)
-
         # 进度条（嵌入状态栏）
         self.scan_progress = QProgressBar()
         self.scan_progress.setMaximumWidth(200)
@@ -585,6 +683,84 @@ class ScanApp(QMainWindow):
 
         # 淡入动画
         add_fade_animation(self, ANIM["slow"])
+
+    # ── 启动流程（由 LoadingDialog 驱动）──
+    def _do_startup_scan(self):
+        """逐步执行启动流程：恢复设备 → 探测能力 → 进入主界面"""
+        # 第1步：检查是否有已保存的扫描仪
+        saved = self.coordinator.restore_saved_scanners()
+        if not saved:
+            # 没有已保存的扫描仪，直接进入（后续自动发现）
+            self._loading.close()
+            self._loading = None
+            self.show()
+            self._auto_discover()
+            return
+
+        # 第2步：逐个探测设备能力（带进度）
+        self._loading.set_step("正在探测扫描仪...")
+        self._loading.set_determinate(len(saved))
+        self._rebuild_cards()
+
+        results = {}
+        errors = []
+
+        def _probe_one(scanner, idx):
+            """探测单台设备"""
+            try:
+                from escl_engine import fetch_capabilities
+                self._loading.set_detail(f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
+                fetch_capabilities(scanner)
+                results[scanner.ip or str(idx)] = {
+                    "has_adf": scanner.has_adf,
+                    "has_duplex": scanner.has_duplex,
+                    "max_width": scanner.max_width,
+                    "max_height": scanner.max_height,
+                    "escl_url": scanner.escl_url,
+                }
+            except Exception as e:
+                errors.append((scanner.display_name, str(e)))
+            finally:
+                self._loading.set_value(idx + 1)
+
+        # 在后台线程中逐个探测
+        # 使用 threading + 信号方式通知主线程
+        self._probe_done = False
+        self._probe_errors = []
+
+        def _probe_thread():
+            for idx, scanner in enumerate(saved):
+                _probe_one(scanner, idx)
+            self._probe_done = True
+            self._probe_errors = errors
+            QTimer.singleShot(0, self._on_startup_complete)
+
+        threading.Thread(target=_probe_thread, daemon=True).start()
+
+    def _on_startup_complete(self):
+        """启动流程完成，应用结果并进入主界面"""
+        # 更新卡片
+        self._rebuild_cards()
+
+        # 自动选择第一个扫描仪
+        if self.coordinator.scanners and self.selected_idx < 0:
+            self._on_card_clicked(0)
+
+        # 关闭加载界面，显示主窗口
+        if self._loading:
+            self._loading.close()
+            self._loading = None
+        self.show()
+
+        # 状态栏提示
+        count = len(self.coordinator.scanners)
+        if self._probe_errors:
+            self.status_bar.showMessage(f"就绪 — {count} 台扫描仪（部分探测失败）")
+        else:
+            self.status_bar.showMessage(f"就绪 — {count} 台扫描仪")
+
+        # 自动发现新设备（低优先级，不影响当前操作）
+        QTimer.singleShot(2000, self._auto_discover)
 
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
@@ -903,16 +1079,6 @@ class ScanApp(QMainWindow):
             QTimer.singleShot(0, self._on_discover_finished)
 
         self.coordinator.discover_scanners_background(_on_complete)
-
-    def _on_probe_results(self, results: dict):
-        """扫描仪探测完成，更新设备能力"""
-        if results:
-            self.coordinator.apply_probe_results(results)
-        self._rebuild_cards()
-        # 自动选择第一个扫描仪
-        if self.coordinator.scanners and self.selected_idx < 0:
-            self._on_card_clicked(0)
-        self.status_bar.showMessage(f"就绪 — {len(self.coordinator.scanners)} 台扫描仪")
 
     def _on_discover_finished(self):
         """发现完成更新 UI"""
@@ -2526,7 +2692,8 @@ def main():
     load_embedded_font()
 
     window = ScanApp()
-    window.show()
+    # 不立即 show()，由启动加载界面在探测完成后自动显示
+    # window.show()  # 已移至 _on_startup_complete()
 
     sys.exit(app.exec())
 
