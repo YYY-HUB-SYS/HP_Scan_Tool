@@ -855,7 +855,7 @@ class ScanApp(QMainWindow):
             msg += f"（{len(errors)} 台探测失败）"
         self.status_bar.showMessage(msg)
 
-        QTimer.singleShot(2000, self._auto_discover)
+        # 不再自动发起发现（避免覆盖扫描状态提示）
 
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
@@ -1436,6 +1436,7 @@ class ScanApp(QMainWindow):
 
         self.scan_btn.setText("扫描中...")
         self.scan_btn.setEnabled(False)
+        self.status_bar.showMessage("正在扫描...")
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
 
