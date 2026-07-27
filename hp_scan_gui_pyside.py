@@ -662,7 +662,7 @@ class ScanApp(QMainWindow):
 
         # 来源
         params_layout.addWidget(QLabel("来源:"), 3, 0)
-        self.source_combo = self._create_styled_combo(["平板", "ADF"])
+        self.source_combo = self._create_styled_combo(["平板"])
         self.source_combo.setCurrentText(self.source_val)
         self.source_combo.currentTextChanged.connect(self._on_source_changed)
         params_layout.addWidget(self.source_combo, 3, 1)
@@ -840,11 +840,11 @@ class ScanApp(QMainWindow):
         save_config(self.cfg)
 
     def _update_duplex_visibility(self):
-        """根据来源更新双面复选框可见性"""
-        has_adf = self.source_val == "ADF"
+        """根据来源更新双面复选框可见性（自动模式也视作可能使用ADF）"""
+        use_adf = self.source_val in ("ADF", "自动")
         has_duplex = self.selected and self.selected.has_duplex
-        self.duplex_check.setVisible(has_adf and has_duplex)
-        if not has_adf:
+        self.duplex_check.setVisible(use_adf and has_duplex)
+        if not use_adf:
             self.duplex_check.setChecked(False)
 
     def _browse(self):
