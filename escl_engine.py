@@ -518,6 +518,11 @@ def execute_scan(
 
         raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
     finally:
+        # 清理打印机上的扫描任务（防止任务累积导致409冲突）
+        try:
+            session.delete(job_uri, timeout=3)
+        except Exception:
+            pass
         session.close()
 
 
@@ -592,6 +597,10 @@ def execute_multipage_scan(
 
         return pages
     finally:
+        try:
+            session.delete(job_uri, timeout=3)
+        except Exception:
+            pass
         session.close()
 
 
