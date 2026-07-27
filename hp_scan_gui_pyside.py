@@ -134,12 +134,12 @@ def load_embedded_font():
 def pil_to_qpixmap(img):
     """Pillow Image 转 QPixmap"""
     if img.mode == "RGB":
-        qimg = QImage(img.data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format_RGB888)
     elif img.mode == "RGBA":
-        qimg = QImage(img.data, img.width, img.height, img.width * 4, QImage.Format_RGBA8888)
+        qimg = QImage(img.tobytes(), img.width, img.height, img.width * 4, QImage.Format_RGBA8888)
     else:
         img = img.convert("RGBA")
-        qimg = QImage(img.data, img.width, img.height, img.width * 4, QImage.Format_RGBA8888)
+        qimg = QImage(img.tobytes(), img.width, img.height, img.width * 4, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg.copy())
 
 
