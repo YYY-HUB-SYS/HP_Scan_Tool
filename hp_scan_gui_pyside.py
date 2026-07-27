@@ -2362,7 +2362,7 @@ class PreviewDialog(QDialog):
             if self._rotation:
                 img = img.rotate(self._rotation, expand=True)
             pixmap = pil_to_qpixmap(img)
-            self.image_viewer.set_image(pixmap, self._rotation)
+            self.image_viewer.set_image(pixmap, rotation=0)  # PIL已旋转，不重复
             w, h = img.size
             rot_text = f" (旋转 {self._rotation}°)" if self._rotation else ""
             self.info_label.setText(f"{w} × {h}{rot_text}")
@@ -2567,7 +2567,7 @@ class MultiPagePreviewDialog(QDialog):
             if rotation:
                 img = img.rotate(rotation, expand=True)
             pixmap = pil_to_qpixmap(img)
-            self.image_viewer.set_image(pixmap, rotation)
+            self.image_viewer.set_image(pixmap, rotation=0)  # PIL已旋转
             w, h = img.size
             rot_text = f" (旋转 {rotation}°)" if rotation else ""
             self.page_info_label.setText(
