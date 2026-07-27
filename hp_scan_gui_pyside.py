@@ -641,6 +641,79 @@ class LoadingDialog(QDialog):
         self.progress.setValue(value)
 
 
+# ────────── 扫描工作线程（QThread + Signal，彻底解决跨线程问题）─────
+class ScanWorker(QThread):
+    """扫描工作线程：纯 QThread，通过 Signal 与主线程通信"""
+    finished_signal = Signal(object)  # (data_bytes, ext) | None=失败
+    error_signal = Signal(str)
+    progress_signal = Signal(str)
+
+    def __init__(self, scanner, resolution, color_mode, output_format,
+                 source, duplex, cancel_event):
+        super().__init__()
+        self.scanner = scanner
+        self.resolution = resolution
+        self.color_mode = color_mode
+        self.output_format = output_format
+        self.source = source
+        self.duplex = duplex
+        self.cancel_event = cancel_event
+
+    def run(self):
+        try:
+            from escl_engine import execute_scan
+            data, ext = execute_scan(
+                scanner=self.scanner, resolution=self.resolution,
+                color_mode=self.color_mode, output_format=self.output_format,
+                source=self.source, duplex=self.duplex,
+                cancel_event=self.cancel_event,
+            )
+            if data and not self.cancel_event.is_set():
+                self.finished_signal.emit((data, ext))
+            else:
+                self.finished_signal.emit(None)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+        finally:
+            self.finished_signal.emit(None)
+
+
+class MultiPageScanWorker(QThread):
+    """多页扫描工作线程"""
+    finished_signal = Signal(object)  # [(data, ext), ...] or []
+    error_signal = Signal(str)
+    progress_signal = Signal(str, int)  # (msg, page_num)
+
+    def __init__(self, scanner, resolution, color_mode, output_format,
+                 source, duplex, cancel_event):
+        super().__init__()
+        self.scanner = scanner
+        self.resolution = resolution
+        self.color_mode = color_mode
+        self.output_format = output_format
+        self.source = source
+        self.duplex = duplex
+        self.cancel_event = cancel_event
+
+    def run(self):
+        try:
+            from escl_engine import execute_multipage_scan
+            pages = execute_multipage_scan(
+                scanner=self.scanner, resolution=self.resolution,
+                color_mode=self.color_mode, output_format=self.output_format,
+                source=self.source, duplex=self.duplex,
+                cancel_event=self.cancel_event,
+                progress_callback=lambda n, _: self.progress_signal.emit(
+                    f"已扫描 {n} 页", n),
+            )
+            if self.cancel_event.is_set():
+                self.finished_signal.emit([])
+            else:
+                self.finished_signal.emit(pages if pages else [])
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow):
     """主窗口（UI 优化版）"""
@@ -1448,32 +1521,71 @@ class ScanApp(QMainWindow):
         self.cancel_scan_btn.clicked.connect(self._cancel_scan)
         self.status_bar.addPermanentWidget(self.cancel_scan_btn)
 
-        def _scan_thread():
-            try:
-                # 自动检测 ADF 状态
-                actual_source, use_adf = self._detect_adf_source(scanner, source_val)
+        # 决定来源
+        actual_source, use_adf = self._detect_adf_source(scanner, source_val)
+        if use_adf:
+            self.status_bar.showMessage("ADF扫描：输稿器自动进纸，请稍候...")
+            self._start_multipage_worker(scanner, out_dir, actual_source)
+        else:
+            self.status_bar.showMessage("平板扫描进行中，约5-10秒完成...")
+            self._start_single_worker(scanner, out_dir, actual_source)
 
-                if self._scan_cancel_event.is_set():
-                    return
+    def _start_single_worker(self, scanner, out_dir, source_val):
+        """启动单页扫描 QThread"""
+        self._worker = ScanWorker(
+            scanner, self.resolution_val,
+            COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+            self.output_format_val, source_val, self.duplex_val,
+            self._scan_cancel_event,
+        )
 
-                # 平板扫描：自动开始，约5-10秒完成
-                if not use_adf:
-                    QTimer.singleShot(0, lambda: self.status_bar.showMessage(
-                        "平板扫描进行中，约5-10秒完成..."))
-                else:
-                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF扫描：输稿器自动进纸，请稍候..."))
+        def _on_result(result):
+            self._worker = None
+            if result is None or not result[0]:
+                self.status_bar.showMessage("扫描取消或失败")
+                self._reset_scan_ui()
+                return
+            data, ext = result
+            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            cache_manager.register_job(job_id)
+            cache_path = cache_manager.write_page(job_id, 1, data, ext)
+            del data
+            output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+            self._reset_scan_ui()
+            self._show_preview(cache_path, ext, output_path, job_id, scanner)
 
-                if use_adf:
-                    self._do_multipage_scan(scanner, out_dir, actual_source, cancel_event=self._scan_cancel_event)
-                else:
-                    self._do_single_scan(scanner, out_dir, actual_source, cancel_event=self._scan_cancel_event)
-            except Exception as e:
-                if not self._scan_cancel_event.is_set():
-                    QTimer.singleShot(0, lambda: self._scan_error(f"{type(e).__name__}: {e}"))
-            finally:
-                QTimer.singleShot(0, self._reset_scan_ui)
+        self._worker.finished_signal.connect(_on_result)
+        self._worker.error_signal.connect(lambda e: self._scan_error(f"扫描失败: {e}"))
+        self._worker.start()
 
-        threading.Thread(target=_scan_thread, daemon=True).start()
+    def _start_multipage_worker(self, scanner, out_dir, source_val):
+        """启动多页扫描 QThread"""
+        self._worker = MultiPageScanWorker(
+            scanner, self.resolution_val,
+            COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
+            self.output_format_val, source_val, self.duplex_val,
+            self._scan_cancel_event,
+        )
+
+        def _on_result(pages):
+            self._worker = None
+            if not pages:
+                self.status_bar.showMessage("扫描取消或失败")
+                self._reset_scan_ui()
+                return
+            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            cache_manager.register_job(job_id)
+            ext = pages[0][1] if pages else self.output_format_val
+            for i, (data, ext) in enumerate(pages, 1):
+                cache_manager.write_page(job_id, i, data, ext)
+                del data
+            output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+            self._reset_scan_ui()
+            self._show_multi_preview(job_id, ext, output_path, len(pages), scanner)
+
+        self._worker.finished_signal.connect(_on_result)
+        self._worker.error_signal.connect(lambda e: self._scan_error(f"扫描失败: {e}"))
+        self._worker.start()
 
     def _detect_adf_source(self, scanner, user_source):
         """根据用户选择决定扫描来源"""
@@ -1487,88 +1599,13 @@ class ScanApp(QMainWindow):
         """取消扫描"""
         if hasattr(self, '_scan_cancel_event'):
             self._scan_cancel_event.set()
+        # 停止QThread worker（如果还在运行）
+        if hasattr(self, '_worker') and self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(3000)
+            self._worker = None
         self.status_bar.showMessage("扫描已取消")
         self._reset_scan_ui()
-
-    def _do_single_scan(self, scanner, out_dir, source_val, cancel_event=None):
-        """单页扫描"""
-        from escl_engine import execute_scan
-
-        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        cache_manager.register_job(job_id)
-
-        result = execute_scan(
-            scanner=scanner,
-            resolution=self.resolution_val,
-            color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
-            output_format=self.output_format_val,
-            source=source_val,
-            duplex=self.duplex_val,
-            cancel_event=cancel_event,
-        )
-
-        # 检查是否取消或无数据
-        if result is None or not isinstance(result, tuple) or len(result) != 2:
-            cache_manager.remove_job(job_id)
-            return
-        data, ext = result
-        if not data or (cancel_event and cancel_event.is_set()):
-            cache_manager.remove_job(job_id)
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("扫描失败：未获取到数据"))
-            return
-
-        cache_path = cache_manager.write_page(job_id, 1, data, ext)
-        del data
-
-        if is_blank_page(Image.open(cache_path)):
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("检测到空白页"))
-
-        output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-
-        # 直接保存模式
-        if self.direct_save_val:
-            self._direct_save(cache_path, ext, output_path, job_id, scanner)
-        else:
-            QTimer.singleShot(0, lambda: self._show_preview(cache_path, ext, output_path, job_id, scanner))
-
-    def _do_multipage_scan(self, scanner, out_dir, source_val, cancel_event=None):
-        """多页扫描"""
-        from escl_engine import execute_multipage_scan
-
-        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        cache_manager.register_job(job_id)
-
-        pages = execute_multipage_scan(
-            scanner=scanner,
-            resolution=self.resolution_val,
-            color_mode=COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
-            output_format=self.output_format_val,
-            source=source_val,
-            duplex=self.duplex_val,
-            cancel_event=cancel_event,
-        )
-
-        # 检查是否取消或无数据
-        if not pages or (cancel_event and cancel_event.is_set()):
-            cache_manager.remove_job(job_id)
-            return
-
-        ext = pages[0][1] if pages else self.output_format_val
-        for i, (data, ext) in enumerate(pages, 1):
-            cache_manager.write_page(job_id, i, data, ext)
-            del data
-
-        if len(pages) > 1:
-            self._detect_blank_pages(job_id, len(pages), ext)
-
-        output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-
-        # 直接保存模式
-        if self.direct_save_val:
-            self._direct_save_multipage(job_id, ext, output_path, len(pages), scanner)
-        else:
-            QTimer.singleShot(0, lambda: self._show_multi_preview(
-                job_id, ext, output_path, len(pages), scanner))
 
     def _safe_copy_file(self, src, dst, retries=3, delay=0.5):
         """安全复制文件，带重试机制"""
