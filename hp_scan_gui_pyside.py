@@ -2378,20 +2378,27 @@ class PreviewDialog(QDialog):
         self._show_image()
 
     def _auto_crop(self):
+        cache = self.cache_path
         try:
-            if not os.path.exists(self.cache_path):
+            if not cache or not os.path.exists(cache):
                 self.info_label.setText("裁边失败: 缓存文件不存在")
                 return
-            img = Image.open(self.cache_path)
+            # 读取原始字节避免文件锁
+            with open(cache, "rb") as f:
+                raw = f.read()
+            img = Image.open(io.BytesIO(raw))
             cropped = auto_crop(img)
             if cropped is not img:
-                fmt = self.ext.upper() if self.ext != "jpg" else "JPEG"
-                cropped.save(self.cache_path, format=fmt)
+                buf = io.BytesIO()
+                fmt = "JPEG" if self.ext in ("jpg", "jpeg") else self.ext.upper()
+                cropped.save(buf, format=fmt)
+                with open(cache, "wb") as f:
+                    f.write(buf.getvalue())
                 self._cropped = True
                 self._rotation = 0
                 self._show_image()
         except Exception as e:
-            self.info_label.setText(f"裁边失败: {e}")
+            self.info_label.setText(f"裁边失败: {type(e).__name__}")
 
     def _confirm(self):
         """保存"""
