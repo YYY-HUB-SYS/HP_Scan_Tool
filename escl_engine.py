@@ -174,18 +174,25 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
 
 def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
     """探测指定 IP 的 eSCL 服务，返回完整 eSCL 基础 URL"""
-    base = f"http://{ip}:{port}"
+    # 尝试 HTTP 和 HTTPS，多种端口组合
+    # HP LaserJet M232 等机型使用 HTTPS 443
+    probe_configs = [
+        (f"http://{ip}:80",   "HTTP:80"),
+        (f"https://{ip}:443", "HTTPS:443"),
+    ]
 
-    # 优先尝试 /eSCL/ 路径
-    for path in ("/eSCL/ScannerStatus", "/ScannerStatus"):
-        try:
-            r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
-            if r.status_code == 200:
-                if "/eSCL" in path:
-                    return f"{base}/eSCL/"
-                return f"{base}/"
-        except Exception:
-            continue
+    paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
+
+    for base, label in probe_configs:
+        for path in paths:
+            try:
+                r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
+                if r.status_code == 200:
+                    if "/eSCL" in path:
+                        return f"{base}/eSCL/"
+                    return f"{base}/"
+            except Exception:
+                continue
 
     return None
 
