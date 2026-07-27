@@ -124,20 +124,28 @@ def discover_all_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     并行使用 mDNS + WSD 发现扫描仪，按 IP 去重。
     替代单独调用 escl_engine.discover_scanners。
     """
-    import concurrent.futures
+    import threading
     from escl_engine import discover_scanners as discover_mdns
 
     results = []
+    errors = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        mdns_future = executor.submit(discover_mdns, timeout)
-        wsd_future = executor.submit(discover_wsd, timeout)
+    def _run_discover(target, name):
+        try:
+            result = target(timeout)
+            results.extend(result)
+        except Exception as e:
+            errors.append((name, e))
+            logger.warning("发现方式失败 (%s): %s", name, e)
 
-        for future in (mdns_future, wsd_future):
-            try:
-                results.extend(future.result())
-            except Exception as e:
-                logger.warning("发现方式失败: %s", e)
+    threads = [
+        threading.Thread(target=_run_discover, args=(discover_mdns, "mDNS"), daemon=True),
+        threading.Thread(target=_run_discover, args=(discover_wsd, "WSD"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(timeout + 2, 10))
 
     # 按 IP 去重（优先保留 mDNS 结果，因为通常更完整）
     seen_ips = set()

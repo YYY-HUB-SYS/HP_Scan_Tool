@@ -2503,10 +2503,17 @@ class HistoryDialog(QDialog):
 
 # ────────── 主入口 ──────────
 def main():
+    # 设置 DPI 感知（新版 API，避免 SetProcessDpiAwareness 报错）
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PerMonitorV2
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+    # 设置 Qt 属性抑制 DPI 警告
+    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
