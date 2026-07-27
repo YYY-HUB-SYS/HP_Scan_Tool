@@ -1476,35 +1476,18 @@ class ScanApp(QMainWindow):
         threading.Thread(target=_scan_thread, daemon=True).start()
 
     def _detect_adf_source(self, scanner, user_source):
-        """
-        根据用户选择和设备能力决定扫描来源（纯本地判断，无网络请求）。
-
-        逻辑:
-        1. 用户选择了 ADF 且设备有 → 直接使用
-        2. 用户选择了 Platen → 直接使用
-        3. 自动模式: 有ADF就用ADF，没有就用Platen
-        """
+        """根据用户选择和设备能力决定扫描来源（纯本地，无网络请求）"""
         if user_source == "Feeder" and scanner.has_adf:
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用 ADF 输稿器扫描"))
             return "Feeder", True
         if user_source == "Platen":
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("使用平板扫描"))
             return "Platen", False
-
-        # 自动模式：ADF优先（1秒快速检测装纸状态），失败则平板
-        if scanner.has_adf and scanner.escl_url:
-            try:
-                import requests
-                r = requests.get(
-                    f"{scanner.escl_url.rstrip('/')}/ScannerStatus",
-                    timeout=1, verify=False, allow_redirects=False,
-                )
-                if r.status_code == 200 and "ScannerAdfLoaded" in r.text:
-                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → ADF 已装载，使用输稿器"))
-                    return "Feeder", True
-            except Exception:
-                pass
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → ADF 未装载，使用平板"))
+        # 自动：有ADF直接用，没有就用平板
+        if scanner.has_adf:
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动模式 → 使用 ADF"))
+            return "Feeder", True
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动模式 → 使用平板"))
         return "Platen", False
 
     def _cancel_scan(self):
@@ -1537,7 +1520,6 @@ class ScanApp(QMainWindow):
             return
         data, ext = result
         if not data or (cancel_event and cancel_event.is_set()):
-            cache_manager.remove_job(job_id)
             cache_manager.remove_job(job_id)
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("扫描失败：未获取到数据"))
             return
