@@ -905,13 +905,12 @@ class ScanApp(QMainWindow):
         scroll.setWidget(self.cards_container)
         layout.addWidget(scroll)
 
-        # 「显示已停用」按钮（有停用设备时才显示）
-        self._show_disabled = False
-        self._show_disabled_btn = AnimatedButton("", button_type="secondary")
-        self._show_disabled_btn.setMaximumHeight(28)
-        self._show_disabled_btn.setVisible(False)
-        self._show_disabled_btn.clicked.connect(self._toggle_show_disabled)
-        layout.addWidget(self._show_disabled_btn)
+        # 停用设备计数标签（始终可见）
+        self._disabled_info = QLabel("已停用: 0 台")
+        self._disabled_info.setFont(QFont(_FONT_FAMILY, 9))
+        self._disabled_info.setStyleSheet(f"color: {COLORS['text_muted']}; padding: 2px 0;")
+        self._disabled_info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._disabled_info)
 
         parent_layout.addWidget(panel)
 
@@ -1210,7 +1209,7 @@ class ScanApp(QMainWindow):
             self.show()
 
     def _rebuild_cards(self):
-        """重建扫描仪卡片列表（过滤停用设备）"""
+        """重建扫描仪卡片列表（停用设备半透明置底）"""
         for card in self.cards:
             card.deleteLater()
         self.cards.clear()
@@ -1220,35 +1219,45 @@ class ScanApp(QMainWindow):
             if item.spacerItem():
                 self.cards_layout.removeItem(item)
 
-        show_disabled = getattr(self, '_show_disabled', False)
+        active_scanners = []
+        disabled_scanners = []
         for idx, scanner in enumerate(self.coordinator.scanners):
-            # 过滤停用的扫描仪（除非显示全部模式）
-            if not show_disabled and scanner.ip in self.disabled_ips:
-                continue
+            is_disabled = scanner.ip in self.disabled_ips
             card = ScannerCard(idx, scanner)
             card.clicked.connect(self._on_card_clicked)
             card.rename_requested.connect(self._on_rename_requested)
             card.move_up_requested.connect(self._on_move_up_requested)
             card.move_down_requested.connect(self._on_move_down_requested)
             card.toggle_disabled.connect(self._on_toggle_disabled)
-            self.cards_layout.addWidget(card)
             self.cards.append(card)
+            if is_disabled:
+                card.setEnabled(False)
+                card.setStyleSheet(f"""
+                    ScannerCard {{
+                        background: {COLORS['surface']};
+                        border: 1.5px dashed {COLORS['border']};
+                        border-radius: {RADIUS['lg']}px;
+                        opacity: 0.55;
+                    }}
+                """)
+                disabled_scanners.append(card)
+            else:
+                active_scanners.append(card)
+
+        # 活跃设备在上，停用设备在下方
+        for card in active_scanners:
+            self.cards_layout.addWidget(card)
+        for card in disabled_scanners:
+            self.cards_layout.addWidget(card)
 
         self.cards_layout.addStretch(1)
 
-        # 更新「显示全部」按钮文字
-        if hasattr(self, '_show_disabled_btn'):
-            if self._show_disabled:
-                self._show_disabled_btn.setText("隐藏已停用")
-            else:
-                cnt = len([s for s in self.coordinator.scanners if s.ip in self.disabled_ips])
-                self._show_disabled_btn.setVisible(cnt > 0)
-                self._show_disabled_btn.setText(f"显示已停用 ({cnt})")
+        self.cards_layout.addStretch(1)
 
-    def _toggle_show_disabled(self):
-        """切换显示/隐藏已停用设备"""
-        self._show_disabled = not self._show_disabled
-        self._rebuild_cards()
+        # 更新停用计数
+        cnt = len([s for s in self.coordinator.scanners if s.ip in self.disabled_ips])
+        if hasattr(self, '_disabled_info'):
+            self._disabled_info.setText(f"已停用: {cnt} 台")
 
     def _on_toggle_disabled(self, idx: int, disabled: bool):
         """停用/启用扫描仪"""
