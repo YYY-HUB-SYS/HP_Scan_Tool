@@ -703,8 +703,8 @@ def auto_crop(img: Image.Image, threshold: int = 240, padding: int = 5) -> Image
 def crop_to_a4(img: Image.Image, dpi: int = 300) -> Image.Image:
     """居中裁剪到 A4 (210x297mm)，消除扫描仪过扫白边"""
     w, h = img.size
-    a4_w = int(210 / 25.4 * dpi)  # A4 宽 @dpi
-    a4_h = int(297 / 25.4 * dpi)  # A4 高 @dpi
+    a4_w = min(int(210 / 25.4 * dpi), w)  # 不超过原图
+    a4_h = min(int(297 / 25.4 * dpi), h)
     left = max(0, (w - a4_w) // 2)
     top = max(0, (h - a4_h) // 2)
     return img.crop((left, top, left + a4_w, top + a4_h))
