@@ -103,8 +103,8 @@ class ScannerInfo:
     has_adf: bool = False
     has_duplex: bool = False
     has_platen: bool = True
-    max_width: int = 2448   # A4 210mm @300dpi - 2mm 冗余
-    max_height: int = 3480  # A4 297mm @300dpi - 2mm 冗余
+    max_width: int = 2480   # A4 210mm @300dpi
+    max_height: int = 3508  # A4 297mm @300dpi
     resolutions: list = field(default_factory=lambda: [75, 150, 200, 300, 600])
     color_modes: list = field(default_factory=lambda: ["RGB24", "Grayscale8"])
     formats: list = field(default_factory=lambda: ["image/jpeg", "application/pdf"])

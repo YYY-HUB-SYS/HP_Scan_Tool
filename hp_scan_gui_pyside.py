@@ -1550,22 +1550,7 @@ class ScanApp(QMainWindow):
             cache_manager.register_job(job_id)
             cache_path = cache_manager.write_page(job_id, 1, data, ext)
             del data
-            # A4 裁剪：消除扫描仪过扫白边
-            try:
-                from escl_engine import crop_to_a4
-                import io as _io
-                with open(cache_path, "rb") as _f:
-                    _raw = _f.read()
-                _img = Image.open(_io.BytesIO(_raw))
-                _c = crop_to_a4(_img, dpi=self.resolution_val)
-                if _c.size != _img.size:
-                    _c = _c.convert("RGB")
-                    _buf = _io.BytesIO()
-                    _c.save(_buf, format="JPEG")
-                    with open(cache_path, "wb") as _f:
-                        _f.write(_buf.getvalue())
-            except Exception:
-                pass
+            self._apply_post_scan_fixups(cache_path)
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
             self._reset_scan_ui()
             self._show_preview(cache_path, ext, output_path, job_id, scanner)
@@ -1595,22 +1580,7 @@ class ScanApp(QMainWindow):
             for i, (data, ext) in enumerate(pages, 1):
                 cache_path = cache_manager.write_page(job_id, i, data, ext)
                 del data
-                # A4 裁剪
-                try:
-                    from escl_engine import crop_to_a4
-                    import io as _io2
-                    with open(cache_path, "rb") as _f2:
-                        _raw2 = _f2.read()
-                    _img2 = Image.open(_io2.BytesIO(_raw2))
-                    _c2 = crop_to_a4(_img2, dpi=self.resolution_val)
-                    if _c2.size != _img2.size:
-                        _c2 = _c2.convert("RGB")
-                        _b2 = _io2.BytesIO()
-                        _c2.save(_b2, format="JPEG")
-                        with open(cache_path, "wb") as _f2:
-                            _f2.write(_b2.getvalue())
-                except Exception:
-                    pass
+                self._apply_post_scan_fixups(cache_path)
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
             self._reset_scan_ui()
             self._show_multi_preview(job_id, ext, output_path, len(pages), scanner)
@@ -1638,6 +1608,22 @@ class ScanApp(QMainWindow):
             self._worker = None
         self.status_bar.showMessage("扫描已取消")
         self._reset_scan_ui()
+
+    def _apply_post_scan_fixups(self, cache_path):
+        """扫描后处理：A4 裁剪（居中，不超过原图）"""
+        try:
+            from escl_engine import crop_to_a4
+            with open(cache_path, "rb") as f:
+                raw = f.read()
+            img = Image.open(io.BytesIO(raw))
+            cropped = crop_to_a4(img, dpi=self.resolution_val)
+            if cropped.size != img.size:
+                buf = io.BytesIO()
+                cropped.convert("RGB").save(buf, format="JPEG")
+                with open(cache_path, "wb") as f:
+                    f.write(buf.getvalue())
+        except Exception:
+            pass
 
     def _safe_copy_file(self, src, dst, retries=3, delay=0.5):
         """安全复制文件，带重试机制"""
