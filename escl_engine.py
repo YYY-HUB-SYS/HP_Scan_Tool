@@ -175,23 +175,42 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
 
 
 def probe_escl(ip: str, port: int = 80, timeout: float = 2.0) -> Optional[str]:
-    """探测指定 IP 的 eSCL 服务，返回完整 eSCL 基础 URL"""
+    """探测指定 IP 的 eSCL 服务（带休眠唤醒+重试）"""
     bases = [f"http://{ip}:80", f"https://{ip}:443"]
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
 
-    for base in bases:
-        for path in paths:
-            try:
-                r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
-                if r.status_code == 200:
-                    if "/eSCL" in path:
-                        return f"{base}/eSCL/"
-                    return f"{base}/"
-            except (requests.ConnectionError, requests.ReadTimeout):
-                break  # 不通就直接试下一个端口
-            except Exception:
-                continue
-    return None
+    def _try():
+        for base in bases:
+            for path in paths:
+                try:
+                    r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
+                    if r.status_code == 200:
+                        if "/eSCL" in path:
+                            return f"{base}/eSCL/"
+                        return f"{base}/"
+                except (requests.ConnectionError, requests.ReadTimeout):
+                    break
+                except Exception:
+                    continue
+        return None
+
+    # 第一次尝试（可能打印机在休眠）
+    result = _try()
+    if result:
+        return result
+
+    # TCP 唤醒 + 加重试
+    try:
+        import socket
+        s = socket.socket()
+        s.settimeout(0.5)
+        s.connect((ip, 80))
+        s.close()
+        time.sleep(1.5)  # 等待打印机完全唤醒
+    except Exception:
+        pass
+
+    return _try()
 
 
 # ==================== 能力查询 (node-hp-scan-to 协议) ====================
