@@ -6,8 +6,7 @@ echo ========================================
 echo.
 
 REM 生成时间戳 (格式: YYYY-MM-DD_HH-MM-SS)
-for /f "tokens=2 delims==" %%a in ('wmic os get localdatetime /value') do set "dt=%%a"
-set "TIMESTAMP=%dt:~0,4%-%dt:~4,2%-%dt:~6,2%_%dt:~8,2%-%dt:~10,2%-%dt:~12,2%"
+for /f "delims=" %%a in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'"') do set "TIMESTAMP=%%a"
 
 echo [%date% %time%] 开始存档...
 echo.
