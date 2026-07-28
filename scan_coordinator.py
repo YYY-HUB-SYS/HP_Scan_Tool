@@ -86,6 +86,40 @@ def save_config(cfg: dict):
         logger.debug("配置保存失败: %s", e)
 
 
+def _subnet_scan() -> list:
+    """子网扫描：快速探测 /24 网段中所有 HP 打印机（0.5s 超时/台）"""
+    import socket
+    import concurrent.futures
+    from escl_engine import ScannerInfo
+
+    printers = []
+
+    def _probe(ip):
+        try:
+            s = socket.socket()
+            s.settimeout(0.5)
+            s.connect((ip, 80))
+            s.close()
+            from escl_engine import probe_escl
+            url = probe_escl(ip, timeout=1.5)
+            if url:
+                return ScannerInfo(name=f"Scanner-{ip}", ip=ip, model="", escl_url=url)
+        except Exception:
+            pass
+        return None
+
+    # 探测 /24 网段 (17.17.171.*)
+    subnet = "17.17.171."
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
+        futures = [pool.submit(_probe, f"{subnet}{i}") for i in range(1, 255)]
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result:
+                printers.append(result)
+
+    return printers
+
+
 class ScanCoordinator:
     """
     扫描编排器 — 隔离业务逻辑，不依赖 tkinter。
@@ -172,6 +206,9 @@ class ScanCoordinator:
         """后台发现局域网扫描仪，完成后调用 on_complete(new_count, new_scanners)"""
         def _discover():
             discovered = discover_all_scanners(timeout=8.0)
+            # mDNS/WSD 失败时，子网扫描兜底
+            if not discovered:
+                discovered = _subnet_scan()
             with self._scanners_lock:
                 existing_ips = {s.ip for s in self.scanners if s.ip}
             new_scanners = []
