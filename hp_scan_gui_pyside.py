@@ -1015,7 +1015,7 @@ class ScanApp(QMainWindow):
 
         # 分辨率
         params_layout.addWidget(QLabel("分辨率:"), 0, 0)
-        self.resolution_combo = self._create_styled_combo(["150", "200", "300", "600", "1200"])
+        self.resolution_combo = self._create_styled_combo(["150", "200", "300", "600"])
         self.resolution_combo.setCurrentText(str(self.resolution_val))
         self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         params_layout.addWidget(self.resolution_combo, 0, 1)
