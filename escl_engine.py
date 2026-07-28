@@ -175,42 +175,46 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
 
 
 def probe_escl(ip: str, port: int = 80, timeout: float = 2.0) -> Optional[str]:
-    """探测指定 IP 的 eSCL 服务（带休眠唤醒+重试）"""
+    """探测指定 IP 的 eSCL 服务（休眠唤醒仅用于 ReadTimeout）"""
     bases = [f"http://{ip}:80", f"https://{ip}:443"]
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
 
     def _try():
+        last_err = None
         for base in bases:
             for path in paths:
                 try:
                     r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
                     if r.status_code == 200:
-                        if "/eSCL" in path:
-                            return f"{base}/eSCL/"
-                        return f"{base}/"
-                except (requests.ConnectionError, requests.ReadTimeout):
+                        return f"{base}/eSCL/" if "/eSCL" in path else f"{base}/", None
+                except requests.ConnectionError:
+                    break
+                except requests.ReadTimeout as e:
+                    last_err = e
                     break
                 except Exception:
                     continue
-        return None
+        return None, last_err
 
-    # 第一次尝试（可能打印机在休眠）
-    result = _try()
+    result, err = _try()
     if result:
         return result
 
-    # TCP 唤醒 + 加重试
-    try:
-        import socket
-        s = socket.socket()
-        s.settimeout(0.5)
-        s.connect((ip, 80))
-        s.close()
-        time.sleep(1.5)  # 等待打印机完全唤醒
-    except Exception:
-        pass
-
-    return _try()
+    # 仅 ReadTimeout 时才做唤醒重试（打印机可能休眠）
+    if err:
+        try:
+            import socket
+            s = socket.socket()
+            s.settimeout(0.5)
+            s.connect((ip, 80))
+            s.close()
+            time.sleep(1.5)
+            r, _ = _try()
+            if r:
+                return r
+        except Exception:
+            pass
+    return None
 
 
 # ==================== 能力查询 (node-hp-scan-to 协议) ====================
