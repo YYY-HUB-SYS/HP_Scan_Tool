@@ -1550,6 +1550,15 @@ class ScanApp(QMainWindow):
             cache_manager.register_job(job_id)
             cache_path = cache_manager.write_page(job_id, 1, data, ext)
             del data
+            # A4 裁剪：消除扫描仪过扫白边
+            try:
+                from escl_engine import crop_to_a4
+                img = Image.open(cache_path)
+                cropped = crop_to_a4(img, dpi=self.resolution_val)
+                if cropped.size != img.size:
+                    cropped.save(cache_path, format="JPEG")
+            except Exception:
+                pass
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
             self._reset_scan_ui()
             self._show_preview(cache_path, ext, output_path, job_id, scanner)
@@ -1577,8 +1586,17 @@ class ScanApp(QMainWindow):
             cache_manager.register_job(job_id)
             ext = pages[0][1] if pages else self.output_format_val
             for i, (data, ext) in enumerate(pages, 1):
-                cache_manager.write_page(job_id, i, data, ext)
+                cache_path = cache_manager.write_page(job_id, i, data, ext)
                 del data
+                # A4 裁剪
+                try:
+                    from escl_engine import crop_to_a4
+                    img = Image.open(cache_path)
+                    cropped = crop_to_a4(img, dpi=self.resolution_val)
+                    if cropped.size != img.size:
+                        cropped.save(cache_path, format="JPEG")
+                except Exception:
+                    pass
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
             self._reset_scan_ui()
             self._show_multi_preview(job_id, ext, output_path, len(pages), scanner)

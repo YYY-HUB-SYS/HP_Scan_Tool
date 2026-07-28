@@ -103,8 +103,8 @@ class ScannerInfo:
     has_adf: bool = False
     has_duplex: bool = False
     has_platen: bool = True
-    max_width: int = 2480   # A4 210mm @300dpi
-    max_height: int = 3508  # A4 297mm @300dpi
+    max_width: int = 2448   # A4 210mm @300dpi - 2mm 冗余
+    max_height: int = 3480  # A4 297mm @300dpi - 2mm 冗余
     resolutions: list = field(default_factory=lambda: [75, 150, 200, 300, 600])
     color_modes: list = field(default_factory=lambda: ["RGB24", "Grayscale8"])
     formats: list = field(default_factory=lambda: ["image/jpeg", "application/pdf"])
@@ -709,6 +709,16 @@ def auto_crop(img: Image.Image, threshold: int = 240, padding: int = 5) -> Image
     right = min(width - 1, right + padding)
 
     return img.crop((left, top, right + 1, bottom + 1))
+
+
+def crop_to_a4(img: Image.Image, dpi: int = 300) -> Image.Image:
+    """居中裁剪到 A4 (210x297mm)，消除扫描仪过扫白边"""
+    w, h = img.size
+    a4_w = int(210 / 25.4 * dpi)  # A4 宽 @dpi
+    a4_h = int(297 / 25.4 * dpi)  # A4 高 @dpi
+    left = max(0, (w - a4_w) // 2)
+    top = max(0, (h - a4_h) // 2)
+    return img.crop((left, top, left + a4_w, top + a4_h))
 
 
 def is_blank_page(img: Image.Image, threshold: float = 0.02) -> bool:
