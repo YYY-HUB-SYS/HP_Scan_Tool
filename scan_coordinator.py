@@ -171,15 +171,15 @@ class ScanCoordinator:
     def discover_scanners_background(self, on_complete):
         """后台发现局域网扫描仪，完成后调用 on_complete(new_count, new_scanners)"""
         def _discover():
-            discovered = discover_all_scanners(timeout=4.0)
+            discovered = discover_all_scanners(timeout=8.0)
             with self._scanners_lock:
                 existing_ips = {s.ip for s in self.scanners if s.ip}
             new_scanners = []
             for d in discovered:
                 if d.ip not in existing_ips:
-                    d.escl_url = probe_escl(d.ip, timeout=3.0) or ""
+                    d.escl_url = probe_escl(d.ip, timeout=4.0) or ""
                     if d.escl_url:
-                        d = fetch_capabilities(d, timeout=3.0)
+                        d = fetch_capabilities(d, timeout=4.0)
                     new_scanners.append(d)
                     existing_ips.add(d.ip)
 
