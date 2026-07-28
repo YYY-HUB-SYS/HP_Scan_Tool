@@ -131,6 +131,23 @@ def load_embedded_font():
         QFontDatabase.addApplicationFont(font_path)
 
 
+def save_as_a4_pdf(img, path, dpi=300):
+    """把图片居中放到 A4 画布上，保存为标准尺寸 PDF"""
+    a4_w = int(210 / 25.4 * dpi)  # A4 210mm @dpi
+    a4_h = int(297 / 25.4 * dpi)  # A4 297mm @dpi
+    w, h = img.size
+    if w != a4_w or h != a4_h:
+        canvas = Image.new("RGB", (a4_w, a4_h), "white")
+        x = (a4_w - w) // 2
+        y = (a4_h - h) // 2
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        canvas.paste(img, (x, y))
+        canvas.save(path, "PDF", resolution=dpi)
+    else:
+        img.convert("RGB").save(path, "PDF", resolution=dpi)
+
+
 def pil_to_qpixmap(img):
     """Pillow Image 转 QPixmap"""
     if img.mode == "RGB":
@@ -1645,7 +1662,7 @@ class ScanApp(QMainWindow):
             if ext == "pdf":
                 pdf_path = output_path if output_path.lower().endswith(".pdf") \
                            else output_path.rsplit(".", 1)[0] + ".pdf"
-                img.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
+                save_as_a4_pdf(img, pdf_path)
                 saved = pdf_path
             else:
                 final = output_path
@@ -2430,7 +2447,7 @@ class PreviewDialog(QDialog):
             if out_ext == "pdf":
                 pdf_path = save_path if save_path.lower().endswith(".pdf") \
                            else save_path.rsplit(".", 1)[0] + ".pdf"
-                img.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
+                save_as_a4_pdf(img, pdf_path)
                 saved = pdf_path
             else:
                 final = save_path
