@@ -1,17 +1,29 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+
+# PyInstaller
 *.spec
+build/
+dist/
+
+# 运行时配置文件（自动生成）
 scan_config.json
 cache_config.json
 history.json
-build/
-dist/
-dist2/
-dist3/
-dist4/
-dist5/
-dist6/
-dist7/
-dist8/
-dist9/
+profiles.json
+
+# 测试产物
 test_output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+Thumbs.db
+.DS_Store

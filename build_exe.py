@@ -1,5 +1,5 @@
 """
-PyInstaller 快速打包脚本
+PyInstaller 打包脚本 — HP Scan Tool v4.0 (PySide6)
 运行: python build_exe.py
 输出: dist/HP_Scan_Tool.exe（单文件便携版）
 """
@@ -13,13 +13,13 @@ DIST = os.path.join(HERE, "dist")
 
 # 确保 PyInstaller 已安装
 try:
-    import PyInstaller
+    import PyInstaller  # noqa: F401
 except ImportError:
     print("安装 PyInstaller...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller", "-q"])
 
 print("=" * 50)
-print("  惠普集成扫描工具 — 打包中")
+print("  惠普集成扫描工具 v4.0 — 打包中")
 print("=" * 50)
 
 # 构建命令
@@ -28,22 +28,28 @@ cmd = [
     "--onefile",
     "--windowed",
     "--name", "HP_Scan_Tool",
-    "--add-data", f"escl_engine.py{os.pathsep}.",
-    "--add-data", f"wia_engine.py{os.pathsep}.",
+    # 资源文件
+    "--add-data", f"resources{os.pathsep}resources",
+    # 项目内模块（确保打包包含）
+    "--hidden-import", "escl_engine",
+    "--hidden-import", "wia_engine",
+    "--hidden-import", "wsd_engine",
+    "--hidden-import", "listen_engine",
+    "--hidden-import", "scan_coordinator",
+    "--hidden-import", "cache_manager",
+    "--hidden-import", "history_manager",
+    "--hidden-import", "profile_manager",
+    # 第三方依赖
     "--hidden-import", "requests",
+    "--hidden-import", "urllib3",
     "--hidden-import", "zeroconf",
-    "--hidden-import", "customtkinter",
     "--hidden-import", "PIL",
+    "--hidden-import", "PIL.Image",
     "--hidden-import", "xml.etree.ElementTree",
-    "--hidden-import", "json",
-    "--hidden-import", "threading",
-    "--hidden-import", "tkinter",
-    "--hidden-import", "tkinter.ttk",
-    "--hidden-import", "tkinter.filedialog",
-    "--hidden-import", "tkinter.messagebox",
+    # 清理
     "--clean",
     "--noconfirm",
-    os.path.join(HERE, "hp_scan_gui.py"),
+    os.path.join(HERE, "hp_scan_gui_pyside.py"),
 ]
 
 print(f"\n命令: {' '.join(cmd)}\n")

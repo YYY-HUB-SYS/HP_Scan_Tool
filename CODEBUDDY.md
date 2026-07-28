@@ -3,7 +3,7 @@ This file provides guidance to CodeBuddy when working with code in this reposito
 
 ## Project Overview
 
-HP Scan Tool v3.3 — a Windows desktop scanning client for HP network printers. Uses eSCL/AirScan protocol for driverless network scanning, WIA as USB fallback, and WS-Discovery for device discovery. Built with CustomTkinter, packaged as single-file EXE via PyInstaller.
+HP Scan Tool v4.0 — a Windows desktop scanning client for HP network printers. Uses eSCL/AirScan protocol for driverless network scanning, WIA as USB fallback, and WS-Discovery for device discovery. Built with PySide6, packaged as single-file EXE via PyInstaller.
 
 ## Common Commands
 
@@ -12,7 +12,7 @@ HP Scan Tool v3.3 — a Windows desktop scanning client for HP network printers.
 pip install -r requirements.txt
 
 # Run GUI (development)
-python hp_scan_gui.py
+python hp_scan_gui_pyside.py
 
 # Run CLI
 python cli.py scan --ip 192.168.1.100 --resolution 300 --format pdf
@@ -38,22 +38,29 @@ pytest tests/test_cli.py::test_cmd_discover -v
 ### Layered Design
 
 ```
-hp_scan_gui.py (GUI Layer — CustomTkinter)
+hp_scan_gui_pyside.py (GUI Layer — PySide6)
   ├── ScanApp            — Main window: scanner management + params + scan trigger
+  ├── LoadingDialog      — Startup progress dialog
+  ├── ScanWorker         — QThread for single-page scan
+  ├── MultiPageScanWorker — QThread for multi-page ADF scan
+  ├── ScannerCard        — Scanner card component (select/rename/reorder/disable)
+  ├── ImageViewer        — Image preview with zoom/rotate
+  ├── AnimatedButton     — Button with press animation
   ├── PreviewDialog      — Single-page preview + filename confirm + save
   ├── MultiPagePreviewDialog — Multi-page: thumbnails + grouping + batch save
-  ├── ScannerCard        — Scanner card component (select/rename/reorder)
   └── HistoryDialog      — Scan history browser
 
-scan_coordinator.py (Business Layer — tkinter-independent)
+scan_coordinator.py (Business Layer — GUI-framework-independent)
   └── ScanCoordinator    — Config persistence / scanner discovery / scan execution / cache coordination
 
 escl_engine.py (Protocol Layer)  — eSCL/AirScan: discover/probe/capabilities/scan
 wia_engine.py (Protocol Layer)   — WIA USB fallback
 wsd_engine.py (Discovery Layer)  — WS-Discovery parallel to mDNS
+listen_engine.py (Listen Layer)  — Wait for printer panel trigger
 
 cache_manager.py (I/O Layer)     — Disk cache with FIFO eviction + active job protection
 history_manager.py (I/O Layer)   — JSON scan history log
+profile_manager.py (I/O Layer)   — Per-device scan parameter profiles
 cli.py (CLI Entry)               — argparse subcommands: scan/discover/status/history
 ```
 
@@ -71,15 +78,34 @@ Scanner → eSCL/WIA engine → raw bytes → cache_manager writes to disk
 
 ### Threading Model
 
-All IO operations run in background daemon threads. UI updates via `self.after(0, callback)`. Scanner list protected by `_scanners_lock`. Config writes are atomic (`.tmp` + `os.replace`).
+All IO operations run in background daemon threads. UI updates via `QTimer.singleShot(0, callback)`. Scanner list protected by `_scanners_lock`. Config writes are atomic (`.tmp` + `os.replace`).
+
+Scan operations use QThread workers (`ScanWorker`, `MultiPageScanWorker`) with Signal-based communication to main thread.
 
 ### Key Design Decisions
 
 - **Disk cache over memory**: Scan data written to `{Documents}/HP_Scans/.cache/{job_id}/`, thumbnails loaded for preview, cache cleared after save
 - **NextDocument polling**: Instead of polling Job URI (which returns 404 on M232 models), directly poll NextDocument endpoint — compatible with all tested HP models
 - **Dual discovery**: mDNS (zeroconf) + WSD (WS-Discovery) run in parallel, results merged by IP deduplication
-- **Platform-aware paths**: `sys._MEIPASS` for frozen EXE resources, `sys.executable` dir for config (avoids PyInstaller temp dir cleanup)
+- **Platform-aware paths**: `sys._MEIPASS` for frozen EXE resources, `resources/` dir for development
 - **Config atomicity**: All JSON writes use `.tmp` + `os.replace` to prevent corruption
+
+### Resource Structure
+
+```
+resources/
+├── fonts/
+│   └── NotoSansSC-Regular.ttf    # Embedded fallback font
+├── styles/
+│   └── app.qss                   # Qt stylesheet
+└── icons/
+    ├── app.ico                   # Application icon
+    ├── icon_16.png               # Taskbar icon 16px
+    ├── icon_32.png               # Taskbar icon 32px
+    └── icon_64.png               # Taskbar icon 64px
+```
+
+Resource path resolution: `get_resource_path()` adds `resources/` prefix in development mode, uses `sys._MEIPASS` in frozen mode.
 
 ### Deprecated/Stripped Code
 
@@ -101,12 +127,13 @@ Core data structure carrying scanner identity + capabilities. Created during dis
 - `scan_config.json` — User preferences (theme, resolution, format, output dir, saved IPs, nicknames, selected scanner)
 - `cache_config.json` — Cache tuning (limit, trigger ratio, cleanup size, stale hours)
 - `history.json` — Scan history log (auto-managed, max 500 entries)
+- `profiles.json` — Per-device scan parameter profiles
 
-All config files live in the EXE's directory (not `__file__` dir) for PyInstaller compatibility.
+All config files live in `%APPDATA%\HP_Scan_Tool\` (Windows standard app data directory). This ensures the EXE is fully portable — copy it anywhere and configs follow the user profile.
 
 ## Tech Stack
 
-Python 3.11+ / CustomTkinter 6.0 / Pillow / python-zeroconf / WSDiscovery / requests / pywin32 (WIA) / PyInstaller 6.0
+Python 3.11+ / PySide6 6.5+ / Pillow / python-zeroconf / WSDiscovery / requests / pywin32 (WIA) / PyInstaller 6.0
 
 ## Testing
 

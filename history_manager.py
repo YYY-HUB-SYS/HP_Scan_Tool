@@ -15,10 +15,11 @@ _app_dir = None
 def _get_app_dir():
     global _app_dir
     if _app_dir is None:
-        if getattr(sys, 'frozen', False):
-            _app_dir = os.path.dirname(sys.executable)
-        else:
-            _app_dir = os.path.dirname(os.path.abspath(__file__))
+        appdata = os.environ.get("APPDATA", "")
+        if not appdata:
+            appdata = os.path.expanduser("~")
+        _app_dir = os.path.join(appdata, "HP_Scan_Tool")
+        os.makedirs(_app_dir, exist_ok=True)
     return _app_dir
 
 

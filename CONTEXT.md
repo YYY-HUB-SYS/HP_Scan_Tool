@@ -14,12 +14,6 @@ Windows 本地扫描驱动接口，作为 eSCL 不可用时的降级方案。仅
 **ScanJob**
 一次扫描任务的生命周期：POST 创建 → 轮询状态 → GET NextDocument 获取图像数据。
 
-**曝光 (Exposure)**
-扫描后图像处理。模式：关闭（原始数据）、自动（直方图 1%-99% 拉伸）、手动（亮度/对比度/Gamma/阴影高光/RGB 通道增益 LUT 调整）。支持命名预设。
-
-**预览 (Preview)**
-扫描数据写入磁盘缓存后，用户在 PreviewDialog 中实时调整曝光效果（含直方图显示），确认后才复制到最终位置。多页 ADF 扫描采用批量预览模式。
-
 ## 发现与连接
 
 **mDNS 发现**
@@ -45,10 +39,13 @@ RGB24（彩色）、Grayscale8（灰度）、BlackAndWhite1（黑白）。
 ## 持久化
 
 **配置 (Config)**
-scan_config.json 文件，保存用户偏好：主题、分辨率、颜色模式、格式、来源、曝光参数、已保存的打印机 IP 列表和自定义名称。
+scan_config.json 文件，保存用户偏好：分辨率、颜色模式、格式、来源、已保存的打印机 IP 列表和自定义名称。
 
 **自定义名称 (Custom Name)**
 用户为打印机设置的别名，按 IP 关联，覆盖默认的设备名称。
+
+**配置文件 (Profile)**
+按设备 IP 保存的独立扫描参数（分辨率/颜色/格式/来源），切换设备时自动加载。
 
 ## 缓存与并发
 
@@ -69,25 +66,27 @@ scan_config.json 文件，保存用户偏好：主题、分辨率、颜色模式
 ## 多页扫描
 
 **批量预览 (Batch Preview)**
-多页 ADF 扫描全部完成后统一预览，用户可翻页查看/删除/调整曝光，最后一次性保存。
+多页 ADF 扫描全部完成后统一预览，用户可翻页查看/删除/调整，最后一次性保存。
 
 **页面分组 (Page Grouping)**
 PDF 格式支持自定义页面分组保存：用户可在页面间插入分割线，每组生成独立 PDF 文件。
 
 ## 平台抽象
 
-**平台引擎 (Platform Engine)**
-`platform_engine.py` 定义统一 `scan() → (bytes, ext)` 接口，运行时按 `sys.platform` 分发：Windows → WIA，macOS → ImageCapture/SANE。
+**资源路径 (Resource Path)**
+开发模式下从 `resources/` 目录加载资源，打包模式下从 `sys._MEIPASS` 加载。实现在 `get_resource_path()` 函数。
 
 ## 命令行
 
 **CLI**
 argparse 子命令模式：`hp_scan scan`、`hp_scan discover`、`hp_scan status`、`hp_scan history`。无 GUI 扫描入口，适合脚本集成。
 
-## 扩展功能
+## 扫描历史
 
-**曝光预设 (Exposure Preset)**
-命名的曝光参数组合，存储于 `presets.json`。内置预设（文字增强/照片还原/去灰底/旧文件修复）+ 用户自定义。
-
-**扫描历史 (Scan History)**
+**Scan History**
 每次扫描完成后记录元数据到 `history.json`（时间/设备/页数/路径/参数），GUI 提供历史列表。
+
+## 监听模式
+
+**Listen Mode**
+等待用户在打印机面板上选择「扫描到计算机」，打印机主动创建扫描任务，计算机轮询获取。实现在 `listen_engine.py`。

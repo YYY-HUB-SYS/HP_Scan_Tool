@@ -4,8 +4,6 @@
 功能: 磁盘缓存 / 并发扫描 / 多页ADF / WSD发现 / CLI / 双面扫描 / 页面旋转 / 自动裁边 / 空白页检测 / 监听模式 / 多目标输出 / 配置文件
 """
 
-import copy
-import ctypes
 import io
 import json
 import logging
@@ -14,7 +12,6 @@ import shutil
 import sys
 import threading
 import time
-import traceback
 from datetime import datetime
 from typing import Optional
 
@@ -28,7 +25,39 @@ from scan_coordinator import (
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
     COLOR_MODE_MAP, SOURCE_MAP,
 )
-from escl_engine import auto_crop, is_blank_page
+from escl_engine import auto_crop
+
+# ────────── 全局异常日志 ──────────
+def setup_exception_logging():
+    """设置全局异常日志，捕获未处理异常写入文件"""
+    import traceback
+    log_file = os.path.join(os.path.expanduser("~"), "Desktop", "hp_scan_debug.log")
+
+    def excepthook(exc_type, exc_value, exc_tb):
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*50}\n")
+            f.write(f"[{datetime.now()}] Unhandled Exception:\n")
+            f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+            f.write(f"{'='*50}\n")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = excepthook
+
+    # 同时配置logging写入文件
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        encoding="utf-8",
+    )
+
+setup_exception_logging()
+logger = logging.getLogger(__name__)
+logger.info("=" * 50)
+logger.info("程序启动")
+logger.info(f"frozen={getattr(sys, 'frozen', False)}")
+logger.info(f"executable={sys.executable}")
+logger.info(f"cwd={os.getcwd()}")
 
 # ────────── PySide6 导入 ──────────
 from PySide6.QtCore import (
@@ -107,12 +136,16 @@ _FONT_SIZE = 10
 
 
 def get_resource_path(relative_path):
-    """获取资源路径（PyInstaller 兼容）"""
+    """获取资源路径（PyInstaller 兼容）
+    
+    开发模式：从 resources/ 目录加载
+    打包模式：从 sys._MEIPASS 加载（PyInstaller 临时目录）
+    """
     if getattr(sys, 'frozen', False):
         base = sys._MEIPASS
     else:
         base = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, relative_path)
+    return os.path.join(base, "resources", relative_path)
 
 
 def load_stylesheet():
@@ -129,6 +162,7 @@ def load_embedded_font():
     font_path = get_resource_path(os.path.join("fonts", "NotoSansSC-Regular.ttf"))
     if os.path.exists(font_path):
         QFontDatabase.addApplicationFont(font_path)
+
 
 
 def save_as_a4_pdf(img, path, dpi=300):
@@ -735,6 +769,9 @@ class MultiPageScanWorker(QThread):
 class ScanApp(QMainWindow):
     """主窗口（UI 优化版）"""
 
+    # 跨线程信号：发现完成
+    discover_finished = Signal()
+
     def __init__(self):
         super().__init__()
 
@@ -766,6 +803,9 @@ class ScanApp(QMainWindow):
         # 先构建界面（隐藏状态）
         self._setup_ui()
         self._refresh_extra_dirs()
+
+        # 连接跨线程信号
+        self.discover_finished.connect(self._on_discover_finished)
 
         # 显示加载界面（居中到屏幕）
         self._loading = LoadingDialog(self)
@@ -803,7 +843,7 @@ class ScanApp(QMainWindow):
         load_embedded_font()
 
         # 设置窗口图标
-        icon_path = get_resource_path("icon_64.png")
+        icon_path = get_resource_path(os.path.join("icons", "icon_64.png"))
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -837,8 +877,9 @@ class ScanApp(QMainWindow):
 
     # ── 启动流程（由 LoadingDialog 驱动）──
     def _do_startup_scan(self):
-        """逐步执行启动流程：恢复设备 → 探测能力 → 进入主界面"""
-        # 抑制 SSL 警告（探测时大量 verify=False 请求）
+        """启动流程：立即显示已保存设备 → 后台并行探测能力"""
+        logger.info("_do_startup_scan 被调用")
+        # 抑制 SSL 警告
         try:
             import urllib3; urllib3.disable_warnings()
         except Exception:
@@ -848,59 +889,68 @@ class ScanApp(QMainWindow):
         except Exception:
             pass
 
-        # 第1步：检查是否有已保存的扫描仪
+        # 第1步：恢复已保存的扫描仪并立即显示
         saved = self.coordinator.restore_saved_scanners()
+        logger.info(f"恢复已保存扫描仪: {len(saved)} 台")
+        self._rebuild_cards()
+        QTimer.singleShot(0, self._finish_loading)
         if not saved:
-            QTimer.singleShot(0, self._finish_loading)
+            logger.info("无已保存扫描仪，直接进入主界面")
             return
 
-        # 第2步：逐个探测设备能力
-        self._loading.set_step("正在探测扫描仪...")
-        self._loading.set_determinate(len(saved))
-        self._rebuild_cards()
-
-        # 线程间共享的进度状态（后台线程只写，主线程轮询读）
+        # 第2步：后台并行探测设备能力（不阻塞UI）
         self._probe_state = {
             "current": 0, "total": len(saved),
             "detail": "", "done": False, "errors": [],
         }
 
-        # 主线程轮询器：每 100ms 读进度并更新 UI
+        # 主线程轮询器：每 200ms 更新状态栏
         def _poll():
             s = self._probe_state
             if s["done"]:
                 self._poll_timer.stop()
-                QTimer.singleShot(100, self._on_startup_complete)
+                self._rebuild_cards()  # 用探测到的能力更新卡片
+                # 自动选中第一台
+                if self.coordinator.scanners and self.selected_idx < 0:
+                    self._on_card_clicked(0)
+                count = len(self.coordinator.scanners)
+                self.status_bar.showMessage(f"就绪 — {count} 台扫描仪")
                 return
-            self._loading.set_detail(s["detail"])
-            self._loading.set_value(s["current"])
+            self.status_bar.showMessage(
+                f"正在探测 {s['detail']} ({s['current']}/{s['total']})")
 
         self._poll_timer = QTimer()
         self._poll_timer.timeout.connect(_poll)
-        self._poll_timer.start(100)
+        self._poll_timer.start(200)
 
-        # 看门狗：15s 后强制完成
-        QTimer.singleShot(15000, self._on_probe_watchdog)
+        # 看门狗：20s 后强制结束
+        QTimer.singleShot(20000, self._on_probe_watchdog)
 
-        # 后台线程：只做网络请求，绝不碰 UI
+        # 后台线程：并行探测所有设备
         def _probe_thread():
             from escl_engine import fetch_capabilities, probe_escl
-            for idx, scanner in enumerate(saved):
+            import concurrent.futures
+            def _probe_one(idx, scanner):
                 self._probe_state["current"] = idx
-                self._probe_state["detail"] = (
-                    f"正在探测 {scanner.display_name} ({idx + 1}/{len(saved)})")
+                self._probe_state["detail"] = scanner.display_name
                 try:
-                    # 先探测 eSCL URL（restore 回来的 scanner 没有 escl_url）
                     if not scanner.escl_url and scanner.ip:
-                        url = probe_escl(scanner.ip, timeout=4.0)
+                        url = probe_escl(scanner.ip, timeout=3.0)
                         if url:
                             scanner.escl_url = url
-                    # 再获取设备能力
                     if scanner.escl_url:
-                        fetch_capabilities(scanner, timeout=4.0)
+                        fetch_capabilities(scanner, timeout=3.0)
                 except Exception as e:
                     self._probe_state["errors"].append((scanner.display_name, str(e)))
                 self._probe_state["current"] = idx + 1
+
+            # 并行探测（最多4个并发）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [
+                    pool.submit(_probe_one, idx, s)
+                    for idx, s in enumerate(saved)
+                ]
+                concurrent.futures.wait(futures, timeout=20)
             self._probe_state["done"] = True
 
         threading.Thread(target=_probe_thread, daemon=True).start()
@@ -909,7 +959,6 @@ class ScanApp(QMainWindow):
         """看门狗触发：强制结束等待"""
         if hasattr(self, '_probe_state') and not self._probe_state.get("done"):
             self._probe_state["done"] = True
-            self._loading.set_detail("部分设备超时，跳过...")
 
     def _finish_loading(self):
         """无保存设备时：直接进入主界面，让用户点刷新"""
@@ -918,30 +967,6 @@ class ScanApp(QMainWindow):
             self._loading = None
         self.show()
         self.status_bar.showMessage("点击「刷新」搜索打印机，或「手动添加」输入IP")
-
-    def _on_startup_complete(self):
-        """启动流程完成，进入主界面"""
-        if hasattr(self, '_poll_timer'):
-            self._poll_timer.stop()
-
-        errors = self._probe_state.get("errors", [])
-        self._rebuild_cards()
-
-        if self.coordinator.scanners and self.selected_idx < 0:
-            self._on_card_clicked(0)
-
-        if self._loading:
-            self._loading.close()
-            self._loading = None
-        self.show()
-
-        count = len(self.coordinator.scanners)
-        msg = f"就绪 — {count} 台扫描仪"
-        if errors:
-            msg += f"（{len(errors)} 台探测失败）"
-        self.status_bar.showMessage(msg)
-
-        # 不再自动发起发现（避免覆盖扫描状态提示）
 
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
@@ -1255,23 +1280,29 @@ class ScanApp(QMainWindow):
     # ────────── 扫描仪管理 ──────────
     def _auto_discover(self):
         """自动发现扫描仪"""
+        logger.info("_auto_discover 被调用")
         # 防止重复点击
         if hasattr(self, '_discovering') and self._discovering:
+            logger.warning("_auto_discover 已在运行，跳过")
             return
         self._discovering = True
 
         self.status_bar.showMessage("正在发现扫描仪...")
+        logger.info("开始发现扫描仪...")
 
         def _on_complete(new_count, new_scanners):
+            logger.info(f"发现完成: {new_count} 台新设备")
             self._discovering = False
-            QTimer.singleShot(0, self._on_discover_finished)
+            self.discover_finished.emit()
 
         self.coordinator.discover_scanners_background(_on_complete)
 
     def _on_discover_finished(self):
         """发现完成更新 UI"""
+        logger.info("_on_discover_finished 被调用")
         self._rebuild_cards()
         count = len(self.coordinator.scanners)
+        logger.info(f"_rebuild_cards 完成: {count} 台扫描仪")
         self.status_bar.showMessage(f"发现 {count} 台扫描仪")
 
     def _rebuild_cards(self):
@@ -1778,25 +1809,6 @@ class ScanApp(QMainWindow):
 
         except Exception as e:
             self._scan_error(f"保存失败: {e}")
-
-    def _detect_blank_pages(self, job_id, page_count, ext):
-        """检测空白页"""
-        blank_pages = []
-        for i in range(1, page_count + 1):
-            try:
-                cache_path = os.path.join(
-                    cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
-                if os.path.exists(cache_path):
-                    img = Image.open(cache_path)
-                    if is_blank_page(img):
-                        blank_pages.append(i)
-            except Exception:
-                pass
-
-        if blank_pages:
-            page_str = ", ".join(str(p) for p in blank_pages[:10])
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage(
-                f"检测到 {len(blank_pages)} 页空白页: {page_str}"))
 
     def _reset_scan_ui(self):
         """重置扫描 UI"""

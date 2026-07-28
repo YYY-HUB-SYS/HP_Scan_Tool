@@ -17,7 +17,7 @@ python --version >nul 2>&1 || (
 
 python -c "import requests, PIL, zeroconf, PySide6" >nul 2>&1 || (
     echo [提示] 正在安装依赖...
-    pip install requests zeroconf Pillow pywin32 PySide6
+    pip install -r requirements.txt
 )
 
 REM CLI 模式：如果第一个参数是 scan/discover/status/history，走 CLI

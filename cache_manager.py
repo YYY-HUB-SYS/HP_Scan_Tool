@@ -47,10 +47,13 @@ _CONFIG_CACHE_TTL = 5.0  # 5 秒内复用
 
 
 def _app_dir():
-    """应用目录（PyInstaller 兼容）"""
-    if getattr(os.sys, 'frozen', False):
-        return os.path.dirname(os.sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    """配置目录：%APPDATA%\\HP_Scan_Tool\\（Windows 标准应用数据目录）"""
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        appdata = os.path.expanduser("~")
+    path = os.path.join(appdata, "HP_Scan_Tool")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def _cache_config_path():

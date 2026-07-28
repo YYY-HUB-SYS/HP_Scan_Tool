@@ -58,10 +58,14 @@ def _ip_label_for(s: ScannerInfo) -> str:
 
 
 def _app_dir():
-    """应用目录（PyInstaller 兼容）"""
-    if getattr(os.sys, 'frozen', False):
-        return os.path.dirname(os.sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    """配置目录：%APPDATA%\\HP_Scan_Tool\\（Windows 标准应用数据目录）"""
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        # 回退到用户主目录
+        appdata = os.path.expanduser("~")
+    path = os.path.join(appdata, "HP_Scan_Tool")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def load_config() -> dict:
@@ -171,15 +175,27 @@ class ScanCoordinator:
     def discover_scanners_background(self, on_complete):
         """后台发现局域网扫描仪，完成后调用 on_complete(new_count, new_scanners)"""
         def _discover():
-            discovered = discover_all_scanners(timeout=8.0)
+            logger.info("发现线程启动")
+            try:
+                discovered = discover_all_scanners(timeout=8.0)
+                logger.info(f"discover_all_scanners 返回 {len(discovered)} 台")
+                for d in discovered:
+                    logger.info(f"  发现: {d.name} ({d.ip})")
+            except Exception as e:
+                logger.error(f"discover_all_scanners 异常: {e}", exc_info=True)
+                discovered = []
             with self._scanners_lock:
                 existing_ips = {s.ip for s in self.scanners if s.ip}
             new_scanners = []
             for d in discovered:
                 if d.ip not in existing_ips:
-                    d.escl_url = probe_escl(d.ip, timeout=4.0) or ""
-                    if d.escl_url:
-                        d = fetch_capabilities(d, timeout=4.0)
+                    try:
+                        d.escl_url = probe_escl(d.ip, timeout=4.0) or ""
+                        logger.info(f"  probe_escl({d.ip}) -> {d.escl_url or '失败'}")
+                        if d.escl_url:
+                            d = fetch_capabilities(d, timeout=4.0)
+                    except Exception as e:
+                        logger.error(f"  探活失败 {d.ip}: {e}")
                     new_scanners.append(d)
                     existing_ips.add(d.ip)
 

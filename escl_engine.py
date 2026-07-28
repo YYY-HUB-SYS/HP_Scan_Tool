@@ -157,6 +157,7 @@ class _EsclListener(ServiceListener):
 
 def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     """mDNS 发现局域网 eSCL 扫描仪"""
+    logger.info(f"mDNS 发现启动 (timeout={timeout}s)")
     zc = Zeroconf()
     listener = _EsclListener()
 
@@ -166,11 +167,13 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     for st in svc_types:
         try:
             browsers.append(ServiceBrowser(zc, st, listener))
-        except Exception:
-            pass
+            logger.info(f"  启动 ServiceBrowser: {st}")
+        except Exception as e:
+            logger.warning(f"  ServiceBrowser 失败 {st}: {e}")
 
     time.sleep(timeout)
     zc.close()
+    logger.info(f"mDNS 发现完成: {len(listener.found)} 台")
     return listener.found
 
 

@@ -36,7 +36,7 @@ def discover_wsd(timeout: float = 4.0) -> list[ScannerInfo]:
         wsd.start()
 
         # 发送 Probe，等待 ProbeMatch
-        services = wsd.searchForServices(timeout=timeout)
+        services = wsd.searchServices(timeout=timeout)
 
         seen_ips = set()
         for svc in services:
@@ -127,12 +127,14 @@ def discover_all_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     import threading
     from escl_engine import discover_scanners as discover_mdns
 
+    logger.info(f"discover_all_scanners 启动 (timeout={timeout}s)")
     results = []
     errors = []
 
     def _run_discover(target, name):
         try:
             result = target(timeout)
+            logger.info(f"  {name} 发现 {len(result)} 台")
             results.extend(result)
         except Exception as e:
             errors.append((name, e))
@@ -155,4 +157,5 @@ def discover_all_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
             seen_ips.add(scanner.ip)
             unique.append(scanner)
 
+    logger.info(f"discover_all_scanners 完成: 共 {len(unique)} 台 (去重前 {len(results)} 台)")
     return unique
