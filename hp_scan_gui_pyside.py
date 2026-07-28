@@ -918,8 +918,6 @@ class ScanApp(QMainWindow):
             self._loading = None
         self.show()
         self.status_bar.showMessage("点击「刷新」搜索打印机，或「手动添加」输入IP")
-        # 后台静默尝试一次自动发现
-        self._auto_discover()
 
     def _on_startup_complete(self):
         """启动流程完成，进入主界面"""
