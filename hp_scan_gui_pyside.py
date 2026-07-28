@@ -912,15 +912,13 @@ class ScanApp(QMainWindow):
             self._loading.set_detail("部分设备超时，跳过...")
 
     def _finish_loading(self):
-        """无保存设备时：加载界面等待自动发现（最多20秒）"""
-        self._loading.set_step("正在发现扫描仪...")
-        self._loading.set_detail("通过 mDNS/WSD 搜索网络中的打印机")
-        self._startup_discover = True
-
-        # 看门狗：20秒后强制进入（即使没找到设备）
-        QTimer.singleShot(20000, self._on_startup_discover_watchdog)
-
-        # 启动自动发现
+        """无保存设备时：直接进入主界面，让用户点刷新"""
+        if self._loading:
+            self._loading.close()
+            self._loading = None
+        self.show()
+        self.status_bar.showMessage("点击「刷新」搜索打印机，或「手动添加」输入IP")
+        # 后台静默尝试一次自动发现
         self._auto_discover()
 
     def _on_startup_complete(self):
@@ -1272,38 +1270,11 @@ class ScanApp(QMainWindow):
 
         self.coordinator.discover_scanners_background(_on_complete)
 
-    def _on_startup_discover_watchdog(self):
-        """启动发现看门狗：超时后强制进入"""
-        if getattr(self, '_startup_discover', False):
-            self._startup_discover = False
-            if self._loading:
-                self._loading.close()
-                self._loading = None
-            self.show()
-            self.status_bar.showMessage("未发现扫描仪，请点击「刷新」或「手动添加」")
-
     def _on_discover_finished(self):
         """发现完成更新 UI"""
         self._rebuild_cards()
         count = len(self.coordinator.scanners)
         self.status_bar.showMessage(f"发现 {count} 台扫描仪")
-
-        # 启动发现模式：为空时递增间隔重试（给休眠打印机更多暖机时间）
-        if getattr(self, '_startup_discover', False):
-            retry = getattr(self, '_startup_retry', 0)
-            if count == 0 and retry < 2:
-                self._startup_retry = retry + 1
-                delay = (retry + 1) * 3000  # 3s, 6s
-                self._loading.set_detail(f"未发现，{delay//1000}秒后重试({retry+1}/2)...")
-                QTimer.singleShot(delay, self._auto_discover)
-                return
-            self._startup_discover = False
-            if self.coordinator.scanners:
-                self._on_card_clicked(0)
-            if self._loading:
-                self._loading.close()
-                self._loading = None
-            self.show()
 
     def _rebuild_cards(self):
         """重建扫描仪卡片列表（停用设备半透明置底）"""
