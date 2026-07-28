@@ -174,34 +174,23 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     return listener.found
 
 
-def probe_escl(ip: str, port: int = 80, timeout: float = 4.0) -> Optional[str]:
+def probe_escl(ip: str, port: int = 80, timeout: float = 2.0) -> Optional[str]:
     """探测指定 IP 的 eSCL 服务，返回完整 eSCL 基础 URL"""
-    # HP 打印机常见端口：HTTP 80, HTTPS 443, 备用 8080/8443/53048
-    probe_configs = [
-        (f"http://{ip}:80",      "HTTP:80"),
-        (f"https://{ip}:443",    "HTTPS:443"),
-        (f"https://{ip}:53048",  "HTTPS:53048"),
-        (f"http://{ip}:8080",    "HTTP:8080"),
-        (f"https://{ip}:8443",   "HTTPS:8443"),
-    ]
-
+    bases = [f"http://{ip}:80", f"https://{ip}:443"]
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
 
-    for base, label in probe_configs:
+    for base in bases:
         for path in paths:
             try:
                 r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
                 if r.status_code == 200:
-                    logger.info("probe_escl %s 成功: %s%s", ip, base, path)
                     if "/eSCL" in path:
                         return f"{base}/eSCL/"
                     return f"{base}/"
-            except requests.ConnectionError:
-                break  # 端口不通，不用再试该 base 的其他 path
+            except (requests.ConnectionError, requests.ReadTimeout):
+                break  # 不通就直接试下一个端口
             except Exception:
                 continue
-
-    logger.warning("probe_escl %s 失败: 所有端口均无响应", ip)
     return None
 
 
