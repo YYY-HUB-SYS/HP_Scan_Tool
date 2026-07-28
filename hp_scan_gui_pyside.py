@@ -1553,10 +1553,17 @@ class ScanApp(QMainWindow):
             # A4 裁剪：消除扫描仪过扫白边
             try:
                 from escl_engine import crop_to_a4
-                img = Image.open(cache_path)
-                cropped = crop_to_a4(img, dpi=self.resolution_val)
-                if cropped.size != img.size:
-                    cropped.save(cache_path, format="JPEG")
+                import io as _io
+                with open(cache_path, "rb") as _f:
+                    _raw = _f.read()
+                _img = Image.open(_io.BytesIO(_raw))
+                _c = crop_to_a4(_img, dpi=self.resolution_val)
+                if _c.size != _img.size:
+                    _c = _c.convert("RGB")
+                    _buf = _io.BytesIO()
+                    _c.save(_buf, format="JPEG")
+                    with open(cache_path, "wb") as _f:
+                        _f.write(_buf.getvalue())
             except Exception:
                 pass
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
@@ -1591,10 +1598,17 @@ class ScanApp(QMainWindow):
                 # A4 裁剪
                 try:
                     from escl_engine import crop_to_a4
-                    img = Image.open(cache_path)
-                    cropped = crop_to_a4(img, dpi=self.resolution_val)
-                    if cropped.size != img.size:
-                        cropped.save(cache_path, format="JPEG")
+                    import io as _io2
+                    with open(cache_path, "rb") as _f2:
+                        _raw2 = _f2.read()
+                    _img2 = Image.open(_io2.BytesIO(_raw2))
+                    _c2 = crop_to_a4(_img2, dpi=self.resolution_val)
+                    if _c2.size != _img2.size:
+                        _c2 = _c2.convert("RGB")
+                        _b2 = _io2.BytesIO()
+                        _c2.save(_b2, format="JPEG")
+                        with open(cache_path, "wb") as _f2:
+                            _f2.write(_b2.getvalue())
                 except Exception:
                     pass
             output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
