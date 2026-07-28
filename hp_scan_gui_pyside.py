@@ -1627,7 +1627,7 @@ class ScanApp(QMainWindow):
             if ext == "pdf":
                 pdf_path = output_path if output_path.lower().endswith(".pdf") \
                            else output_path.rsplit(".", 1)[0] + ".pdf"
-                img.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
+                img.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
                 saved = pdf_path
             else:
                 final = output_path
@@ -2412,7 +2412,7 @@ class PreviewDialog(QDialog):
             if out_ext == "pdf":
                 pdf_path = save_path if save_path.lower().endswith(".pdf") \
                            else save_path.rsplit(".", 1)[0] + ".pdf"
-                img.convert("RGB").save(pdf_path, "PDF", resolution=150.0)
+                img.convert("RGB").save(pdf_path, "PDF", resolution=300.0)
                 saved = pdf_path
             else:
                 final = save_path
