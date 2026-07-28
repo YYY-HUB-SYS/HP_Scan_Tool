@@ -1288,8 +1288,13 @@ class ScanApp(QMainWindow):
         count = len(self.coordinator.scanners)
         self.status_bar.showMessage(f"发现 {count} 台扫描仪")
 
-        # 启动发现模式：关闭加载界面，显示主窗口
+        # 启动发现模式：首次为空自动重试（休眠打印机需暖机）
         if getattr(self, '_startup_discover', False):
+            if count == 0 and not getattr(self, '_startup_retried', False):
+                self._startup_retried = True
+                self._loading.set_detail("未发现设备，正在重试...")
+                QTimer.singleShot(2000, self._auto_discover)
+                return
             self._startup_discover = False
             if self.coordinator.scanners:
                 self._on_card_clicked(0)
