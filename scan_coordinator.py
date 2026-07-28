@@ -87,10 +87,20 @@ def save_config(cfg: dict):
 
 
 def _subnet_scan() -> list:
-    """子网扫描：快速探测 /24 网段中所有 HP 打印机（0.5s 超时/台）"""
+    """子网扫描：探测本机同 /24 网段中的打印机（0.5s 超时/台）"""
     import socket
     import concurrent.futures
     from escl_engine import ScannerInfo
+
+    # 自动检测本机所在网段
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("17.17.0.1", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = "17.17.171.1"
+    prefix = ".".join(local_ip.split(".")[:3]) + "."
 
     printers = []
 
@@ -108,10 +118,8 @@ def _subnet_scan() -> list:
             pass
         return None
 
-    # 探测 /24 网段 (17.17.171.*)
-    subnet = "17.17.171."
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as pool:
-        futures = [pool.submit(_probe, f"{subnet}{i}") for i in range(1, 255)]
+        futures = [pool.submit(_probe, f"{prefix}{i}") for i in range(1, 255)]
         for f in concurrent.futures.as_completed(futures):
             result = f.result()
             if result:
