@@ -1520,8 +1520,9 @@ class ScanApp(QMainWindow):
         source_text = self.source_combo.currentText()
         if source_text == "ADF":
             source_val = "Feeder"
+        elif source_text == "自动":
+            source_val = "Auto"
         else:
-            # "平板" 和 "自动" 都走平板单页扫描
             source_val = "Platen"
 
         self.scan_btn.setText("扫描中...")
@@ -1611,7 +1612,23 @@ class ScanApp(QMainWindow):
         if user_source == "Feeder" and scanner.has_adf:
             QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF 输稿器扫描"))
             return "Feeder", True
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("平板扫描"))
+        if user_source == "Platen":
+            QTimer.singleShot(0, lambda: self.status_bar.showMessage("平板扫描"))
+            return "Platen", False
+        # 自动：1秒快速检测ADF是否有纸（仅通过ScannerStatus，无网络风险）
+        if scanner.has_adf and scanner.escl_url:
+            try:
+                import requests
+                r = requests.get(
+                    f"{scanner.escl_url.rstrip('/')}/ScannerStatus",
+                    timeout=1, verify=False,
+                )
+                if r.status_code == 200 and "ScannerAdfLoaded" in r.text:
+                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 检测到ADF有纸"))
+                    return "Feeder", True
+            except Exception:
+                pass
+        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 平板扫描"))
         return "Platen", False
 
     def _cancel_scan(self):
