@@ -177,7 +177,7 @@ class ScanCoordinator:
         def _discover():
             logger.info("发现线程启动")
             try:
-                discovered = discover_all_scanners(timeout=8.0)
+                discovered = discover_all_scanners(timeout=3.0)
                 logger.info(f"discover_all_scanners 返回 {len(discovered)} 台")
                 for d in discovered:
                     logger.info(f"  发现: {d.name} ({d.ip})")
@@ -187,17 +187,29 @@ class ScanCoordinator:
             with self._scanners_lock:
                 existing_ips = {s.ip for s in self.scanners if s.ip}
             new_scanners = []
-            for d in discovered:
-                if d.ip not in existing_ips:
-                    try:
-                        d.escl_url = probe_escl(d.ip, timeout=4.0) or ""
-                        logger.info(f"  probe_escl({d.ip}) -> {d.escl_url or '失败'}")
-                        if d.escl_url:
-                            d = fetch_capabilities(d, timeout=4.0)
-                    except Exception as e:
-                        logger.error(f"  探活失败 {d.ip}: {e}")
-                    new_scanners.append(d)
-                    existing_ips.add(d.ip)
+            
+            # 并行探活所有发现的打印机
+            def _probe_one(d):
+                if d.ip in existing_ips:
+                    return None
+                try:
+                    d.escl_url = probe_escl(d.ip, timeout=2.0) or ""
+                    logger.info(f"  probe_escl({d.ip}) -> {d.escl_url or '失败'}")
+                    if d.escl_url:
+                        d = fetch_capabilities(d, timeout=2.0)
+                    return d
+                except Exception as e:
+                    logger.error(f"  探活失败 {d.ip}: {e}")
+                    return d
+            
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(_probe_one, d) for d in discovered]
+                for future in concurrent.futures.as_completed(futures, timeout=15):
+                    result = future.result()
+                    if result is not None:
+                        new_scanners.append(result)
+                        existing_ips.add(result.ip)
 
             # 添加到内存列表
             with self._scanners_lock:
