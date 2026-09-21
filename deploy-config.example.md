@@ -26,7 +26,7 @@ DEFAULT_PRINTER_IP=x.x.x.x
 
 ```bash
 # 项目根目录（绝对路径）
-PROJECT_DIR=c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool
+PROJECT_DIR=<PROJECT_DIR>
 
 # 构建输出目录
 DIST_DIR=dist

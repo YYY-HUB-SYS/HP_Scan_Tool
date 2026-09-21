@@ -8,7 +8,7 @@
 
 HP Scan Tool 是一款面向惠普网络打印机的 Windows 桌面扫描客户端，通过 eSCL/AirScan 协议实现免驱网络扫描，WIA 作为降级方案。
 
-**项目路径**: `c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool`
+**项目路径**: `<PROJECT_DIR>`
 **Git 仓库**: 已初始化（`.git` 存在），remote 指向 <GIT_REPO>
 **技术栈**: Python 3.11+ / PySide6 / Pillow / python-zeroconf / WSDiscovery / requests / pywin32
 **打包**: PyInstaller 单文件 EXE（spec 文件已配置）
@@ -30,7 +30,7 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 ## 2. 文件结构
 
 ```
-c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool\
+<PROJECT_DIR>\
 ├── hp_scan_gui_pyside.py   # GUI 主程序 — ScanApp + PreviewDialog + MultiPagePreviewDialog + ScannerCard + HistoryDialog
 ├── escl_engine.py          # eSCL/AirScan 协议引擎 — 发现/探活/能力查询/扫描执行
 ├── wia_engine.py           # WIA 降级引擎 — 本地 USB 扫描仪
@@ -300,7 +300,7 @@ preset_manager.py (已停用)
 ### 8.1 开发环境运行
 
 ```bash
-cd c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool
+cd <PROJECT_DIR>
 pip install -r requirements.txt
 python hp_scan_gui_pyside.py
 ```
@@ -364,7 +364,7 @@ python cli.py history --limit 10
 ## 10. 测试
 
 ```bash
-cd c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool
+cd <PROJECT_DIR>
 pytest tests/ -v
 ```
 

@@ -3,8 +3,8 @@
 - 工具: hp_scan_tool
 - 会话ID: yqqofficepc-yqq-2026-09-21-1750
 - 时间: 2026-09-21 17:50
-- 主机: YQQ_Office_PC
-- 账户: YQQ
+- 主机: <HOSTNAME>
+- 账户: <USER>
 - 事项: 自查问题并推送至 <GIT_REPO>
 
 ## 本次变更
