@@ -16,7 +16,7 @@ GIT_BRANCH=main
 
 ```bash
 # 打印机所在网段（用于 mDNS 发现范围）
-LAN_SUBNET=17.17.171.0/24
+LAN_SUBNET=x.x.x.x/x
 
 # 默认打印机 IP 示例
 DEFAULT_PRINTER_IP=x.x.x.x
