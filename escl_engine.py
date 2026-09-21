@@ -377,7 +377,7 @@ def get_scanner_status(escl_url: str, timeout: float = 5.0) -> dict:
 
 # ==================== 扫描执行 ====================
 
-NS_SCAN = "http://schemas.hp.com/scanner/escl/2011/09"
+NS_SCAN = "http://schemas.hp.com/imaging/escl/2011/05/03"
 NS_PWG = "http://www.pwg.org/schemas/2010/12/sm"
 
 
@@ -395,25 +395,26 @@ def _build_scan_job_xml(
     # ADF 扫描需要设置 MaxScanPages 为较大值以支持多页
     max_pages_xml = f"<scan:MaxScanPages>{max_pages}</scan:MaxScanPages>" if source == "Feeder" else ""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
-<scan:ScanJob xmlns:scan="{NS_SCAN}" xmlns:pwg="{NS_PWG}">
+<scan:ScanSettings xmlns:scan="{NS_SCAN}" xmlns:pwg="{NS_PWG}">
+  <pwg:Version>2.0</pwg:Version>
   <pwg:DocumentFormat>{doc_format}</pwg:DocumentFormat>
-  <scan:InputSource>{source}</scan:InputSource>
+  <pwg:InputSource>{source}</pwg:InputSource>
   <scan:Intent>Document</scan:Intent>
-  <scan:ScanRegions>
-    <scan:ScanRegion>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
       <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
       <pwg:Width>{width}</pwg:Width>
       <pwg:Height>{height}</pwg:Height>
-      <scan:ScanRegionXOffset>0</scan:ScanRegionXOffset>
-      <scan:ScanRegionYOffset>0</scan:ScanRegionYOffset>
-    </scan:ScanRegion>
-  </scan:ScanRegions>
+      <pwg:XOffset>0</pwg:XOffset>
+      <pwg:YOffset>0</pwg:YOffset>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
   <scan:XResolution>{resolution}</scan:XResolution>
   <scan:YResolution>{resolution}</scan:YResolution>
   <scan:ColorMode>{color_mode}</scan:ColorMode>
   <scan:Duplex>{str(duplex).lower()}</scan:Duplex>
   {max_pages_xml}
-</scan:ScanJob>"""
+</scan:ScanSettings>"""
 
 
 # 格式映射：用户友好的名称 → MIME

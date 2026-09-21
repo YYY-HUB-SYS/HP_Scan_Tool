@@ -128,7 +128,7 @@ AIGC:
 | 优先级 | P0 |
 | 实现函数 | `escl_engine.py::probe_escl(ip, port, timeout)` |
 | 探测路径 | ① `/eSCL/ScannerStatus` → ② `/ScannerStatus`（根路径兜底） |
-| 返回 | eSCL 基础 URL（如 `http://17.17.171.111/eSCL/`）或 None |
+| 返回 | eSCL 基础 URL（如 `http://x.x.x.x/eSCL/`）或 None |
 | 超时 | 3-4 秒 |
 
 #### 2.2.3 手动添加
@@ -324,7 +324,7 @@ CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 ```
 ┌──────────────────────────────────────┐
 │ HP LaserJet MFP M232-M237            │ ← 名称行（加粗 13px，wraplength=260）
-│ IP 17.17.171.111  |  M232-M237       │ ← 信息行（11px 灰色）
+│ IP x.x.x.x  |  M232-M237       │ ← 信息行（11px 灰色）
 │ [eSCL] [平板] [600DPI]               │ ← 标签行（彩色圆角标签）
 └──────────────────────────────────────┘
 ```
@@ -603,12 +603,12 @@ MIME_EXT = {
   "output_format": "jpg",
   "output_dir": "D:\\Scans",
   "saved_ips": [
-    {"ip": "17.17.171.111", "model": "HP LaserJet MFP M232-M237"},
-    {"ip": "17.17.171.208", "model": "HP LaserJet MFP M232-M237"}
+    {"ip": "x.x.x.x", "model": "HP LaserJet MFP M232-M237"},
+    {"ip": "x.x.x.x", "model": "HP LaserJet MFP M232-M237"}
   ],
   "nicknames": {
-    "17.17.171.208": "财务室打印机",
-    "17.17.171.101": "三楼 HP 7720"
+    "x.x.x.x": "财务室打印机",
+    "x.x.x.x": "三楼 HP 7720"
   }
 }
 ```
@@ -638,7 +638,7 @@ MIME_EXT = {
 │                    │ 分辨率    颜色    格式    来源    │
 │ ┌────────────────┐ │ [300▼] [彩色▼] [jpg▼] [平板▼]  │
 │ │232dwc-2        │ │                                │
-│ │IP 17.17.171.208│ │ 保存到 [__________] [浏览]      │
+│ │IP x.x.x.x│ │ 保存到 [__________] [浏览]      │
 │ │[eSCL][ADF]     │ │                                │
 │ └────────────────┘ │ [查询能力][预览状态]    [扫描]   │
 │ ┌────────────────┐ │                                │
@@ -719,11 +719,11 @@ MIME_EXT = {
 
 | 机型 | IP | eSCL Server | ADF | 双面 | eSCL 扫描 | WIA 扫描 | 备注 |
 |------|----|-----------|-----|------|----------|---------|------|
-| HP OfficeJet Pro 7720 | 17.17.171.101 | nginx/2.62 | 有 | 支持 | ✅ | — | 完整 eSCL 支持，支持 job URI 轮询 |
-| HP LaserJet MFP M232-M237 | 17.17.171.111 | ApolloLedmServer/2.63 | 无 | 不支持 | ✅ | — | eSCL 扫描需 NextDocument 直接轮询 |
-| HP LaserJet MFP M232-M237 | 17.17.171.203 | ApolloLedmServer/2.63 | 无 | 不支持 | ✅ | — | 同上，ScannerCapabilities 返回 301→HTTPS |
-| HP LaserJet MFP M232-M237 | 17.17.171.208 | ApolloLedmServer/2.63 | 有 | 不支持 | ✅ | — | 同上 + ADF 输稿器 |
-| HP LaserJet M1216nfh | 17.17.171.201 | Marvell Mrvl-R1_0 | — | — | ❌ | ❌ | 不支持任何网络扫描协议，仅 JetDirect 打印 |
+| HP OfficeJet Pro 7720 | x.x.x.x | nginx/2.62 | 有 | 支持 | ✅ | — | 完整 eSCL 支持，支持 job URI 轮询 |
+| HP LaserJet MFP M232-M237 | x.x.x.x | ApolloLedmServer/2.63 | 无 | 不支持 | ✅ | — | eSCL 扫描需 NextDocument 直接轮询 |
+| HP LaserJet MFP M232-M237 | x.x.x.x | ApolloLedmServer/2.63 | 无 | 不支持 | ✅ | — | 同上，ScannerCapabilities 返回 301→HTTPS |
+| HP LaserJet MFP M232-M237 | x.x.x.x | ApolloLedmServer/2.63 | 有 | 不支持 | ✅ | — | 同上 + ADF 输稿器 |
+| HP LaserJet M1216nfh | x.x.x.x | Marvell Mrvl-R1_0 | — | — | ❌ | ❌ | 不支持任何网络扫描协议，仅 JetDirect 打印 |
 
 ### 9.2 兼容性判断决策树
 
@@ -749,7 +749,7 @@ MIME_EXT = {
 ### 10.1 构建命令
 
 ```bash
-cd D:\agent_PR\HP_Scan_Tool
+cd <PROJECT_DIR>
 python build_exe.py
 ```
 
@@ -758,7 +758,7 @@ python build_exe.py
 ### 10.2 开发运行
 
 ```bash
-cd D:\agent_PR\HP_Scan_Tool
+cd <PROJECT_DIR>
 pip install -r requirements.txt
 python hp_scan_gui.py
 ```
@@ -866,7 +866,7 @@ python hp_scan_gui.py
 | 平板扫描 | 选中 M232 → 默认"平板" → 点"扫描" | 8-12 秒完成，生成 JPG |
 | ADF 扫描 | 选中 232dwc-2 → 放入纸张 → 扫描 | 自动切换 Feeder，逐张吸入 |
 | ADF 空载 | 选中 232dwc-2 → 不放纸 → 扫描 | 自动切换 Platen，平板扫描 |
-| 手动添加 | 输入 17.17.171.111 → 探测 | eSCL 探通，追加到列表 |
+| 手动添加 | 输入 x.x.x.x → 探测 | eSCL 探通，追加到列表 |
 | 手动添加无效IP | 输入 1.2.3.4 → 探测 | 提示"不支持 eSCL" |
 | 重命名 | 右键 232dwc-2 → 输入"财务室" → 确认 | 卡片名称变为"财务室"，重启保留 |
 | 主题切换 | light→dark→light | 全局控件联动，无低对比度 |

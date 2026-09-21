@@ -9,7 +9,7 @@
 HP Scan Tool 是一款面向惠普网络打印机的 Windows 桌面扫描客户端，通过 eSCL/AirScan 协议实现免驱网络扫描，WIA 作为降级方案。
 
 **项目路径**: `c:\Users\YQQ-Agent\Desktop\PC传输专用\HP_Scan_Tool`
-**Git 仓库**: 已初始化（`.git` 存在），remote 指向 `Papachong/HP_Scan_Tool`
+**Git 仓库**: 已初始化（`.git` 存在），remote 指向 <GIT_REPO>
 **技术栈**: Python 3.11+ / PySide6 / Pillow / python-zeroconf / WSDiscovery / requests / pywin32
 **打包**: PyInstaller 单文件 EXE（spec 文件已配置）
 
