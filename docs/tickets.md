@@ -1,4 +1,4 @@
-# HP Scan Tool v3.3 — 实施票据
+# HP Scan Tool v4.0 — 实施票据
 
 按依赖顺序排列，blocker 在前。
 

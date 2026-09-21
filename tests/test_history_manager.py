@@ -1,5 +1,5 @@
 """
-history_manager 单元测试 — HP Scan Tool v3.3
+history_manager 单元测试 — HP Scan Tool v4.0
 覆盖: 追加/列表/清空 / 500 条上限 / 线程安全 / 自动时间戳
 """
 

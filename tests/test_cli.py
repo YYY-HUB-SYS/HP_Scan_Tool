@@ -1,5 +1,5 @@
 """
-cli.py 单元测试 — HP Scan Tool v3.3
+cli.py 单元测试 — HP Scan Tool v4.0
 覆盖: argparse 子命令解析 / 默认值 / choices 验证
 不测试实际命令执行（需要网络），只测试参数解析。
 """

@@ -1,5 +1,5 @@
 """
-WSD (WS-Discovery) 引擎 — 并行发现局域网扫描仪
+WSD (WS-Discovery) 引擎 — HP Scan Tool v4.0 — 并行发现局域网扫描仪
 Phase 1: 仅发现，复用 escl_engine.probe_escl 获取 eSCL URL
 依赖: WSDiscovery (pip install WSDiscovery)
 """

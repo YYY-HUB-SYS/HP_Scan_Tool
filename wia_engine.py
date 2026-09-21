@@ -1,5 +1,5 @@
 """
-WIA 扫描引擎 — 降级方案
+WIA 扫描引擎 — HP Scan Tool v4.0 — 降级方案
 参考 pyautoscan：当 eSCL 不可用时，使用 Windows WIA 驱动扫描。
 
 返回类型与 eSCL 引擎对齐：wia_scan / try_wia_scan 均返回 (bytes, ext)。

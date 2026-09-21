@@ -1,5 +1,5 @@
 """
-pytest 共享 fixtures — HP Scan Tool v3.3 测试基础设施
+pytest 共享 fixtures — HP Scan Tool v4.0 测试基础设施
 """
 
 import os

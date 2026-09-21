@@ -203,7 +203,7 @@ def cmd_history(args):
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hp_scan",
-        description="惠普集成扫描工具 v3.3 — CLI 模式",
+        description="惠普集成扫描工具 v4.0 — CLI 模式",
     )
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 

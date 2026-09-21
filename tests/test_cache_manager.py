@@ -1,5 +1,5 @@
 """
-cache_manager 单元测试 — HP Scan Tool v3.3
+cache_manager 单元测试 — HP Scan Tool v4.0
 覆盖: 基本 CRUD / FIFO eviction / 活跃任务保护 / stale 清理 / 线程安全 / 配置 TTL
 """
 
