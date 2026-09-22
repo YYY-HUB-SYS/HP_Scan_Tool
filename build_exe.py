@@ -8,6 +8,10 @@ import os
 import subprocess
 import sys
 
+# Windows 控制台默认编码可能无法输出中文/emoji，强制使用 UTF-8
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
 
