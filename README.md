@@ -1,5 +1,7 @@
 # 🖨️ HP Scan Tool
 
+
+
 惠普集成扫描工具（HP Integrated Scan Tool）是一款面向惠普网络打印机的 Windows 桌面扫描客户端。通过 eSCL/AirScan 协议实现免驱网络扫描，WIA 作为本地 USB 降级方案，WS-Discovery 作为补充发现协议。
 
 ## 功能特性
