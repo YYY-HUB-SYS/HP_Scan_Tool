@@ -131,9 +131,10 @@ class TestServiceUnavailableIsRetried:
     ★ 2026-10-21 契约变更（503 的处置**按来源分流**）。
 
     实测 503 有两个来源，成因不同 ⇒ 处置也必须不同：
-      ① 设备还没从上一个 ScanJob 收尾（**Platen 也会收到**）—— 实测
-         间隔 8~10 秒后不再复现 ⇒ **等一会儿真的会成功** ⇒ 有界退避重试
-         （2/4/8 秒，共 14 秒，等待可取消），重试用尽才抛可读错误；
+      ① 设备还没从上一个 ScanJob 收尾干净（**Platen 也会收到**）—— 真机
+         实测 **2.27 秒**后自愈 ⇒ **等一会儿真的会成功** ⇒ 有界退避重试
+         （2/4 秒，共 6 秒，等待可取消；★ 2026-10-21 由 2/4/8、14 秒降档），
+         重试用尽才抛可读错误；
       ② 输稿器空载（Feeder）—— 设备在等纸 ⇒ **等多久都不会成功**
          ⇒ **不重试**，第一次就抛"放纸后请重试"。
 
@@ -151,10 +152,10 @@ class TestServiceUnavailableIsRetried:
 
         msg = str(exc.value)
         assert "503" in msg
-        assert session.post.call_count == 4, "平板 503 必须重试（1 次 + 3 次退避）"
-        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0, 8.0]
+        assert session.post.call_count == 3, "平板 503 必须重试（1 次 + 2 次退避）"
+        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0]
         total = sum(c.args[0] for c in sleeper.call_args_list)
-        assert 0 < total <= 15.0, f"503 退避总时长必须有界: {total}s"
+        assert 0 < total <= 6.0, f"503 退避总时长必须有界: {total}s"
 
     def test_platen_503_message_does_not_point_at_feeder(self):
         """平板 503 ⇒ 文案不得出现「输稿器」（否则用户去白跑输稿器）"""

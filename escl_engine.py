@@ -457,7 +457,8 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
     return scanner
 
 
-def probe_scanner_status(escl_url: str, timeout: float = 5.0) -> tuple:
+def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
+                         include_jobs: bool = False) -> tuple:
     """
     查询扫描仪状态，返回 (探测是否成功, 状态字典)。
 
@@ -470,11 +471,24 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0) -> tuple:
     返回：
         (True,  {"state": "Idle", "adf_loaded": False})   探测成功
         (False, {"state": "Unknown", "adf_loaded": False}) 探测失败
+
+    ★ session（可选）：复用调用方已有的会话（生产环境走建 job 的那个
+      Session）⇒ 不新开连接、不重试握手；不传则沿用模块级 requests.get。
+    ★ include_jobs（可选，默认 False）：额外解析 `scan:Jobs` / `scan:JobInfo`
+      ⇒ 多出两个键 `pending_jobs`（未完成 job 数）与 `job_states`（其状态）。
+      **默认 False** ⇒ 返回契约与既有调用方（cli.py / scan_coordinator.py）
+      完全不变（键集合仍是 {"state", "adf_loaded"}）。
     """
     status = {"state": "Unknown", "adf_loaded": False}
+    if include_jobs:
+        status["pending_jobs"] = 0
+        status["job_states"] = []
     try:
-        r = requests.get(escl_url.rstrip("/") + "/ScannerStatus",
-                         timeout=timeout, verify=False)
+        url = escl_url.rstrip("/") + "/ScannerStatus"
+        if session is not None:
+            r = session.get(url, timeout=timeout, verify=False)
+        else:
+            r = requests.get(url, timeout=timeout, verify=False)
         if r.status_code != 200:
             return False, status
         root = ET.fromstring(r.text)
@@ -484,10 +498,67 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0) -> tuple:
                 status["state"] = el.text.strip()
             if t == "AdfState" and el.text:
                 status["adf_loaded"] = "Loaded" in (el.text.strip() or "")
+        if include_jobs:
+            job_states = _parse_pending_job_states(root)
+            status["pending_jobs"] = len(job_states)
+            status["job_states"] = job_states
         return True, status
     except (requests.RequestException, ET.ParseError) as e:
         logger.debug("状态查询失败: %s", e)
         return False, status
+
+
+# ScanJob 的**终态**（这些状态说明这个 job 已经结束了，不再挡着新建 job）。
+_TERMINAL_JOB_STATES = {"completed", "canceled", "cancelled", "error",
+                         "failed", "aborted"}
+
+
+def _job_is_unfinished(job_state: str, images_to_transfer: int) -> bool:
+    """
+    这个 ScanJob 是否**还没结束**（= 还挡着新建 job）。
+
+    判据（真机实测形态）：
+      - 状态非终态（Pending / Processing / Scanning / Transferring…）⇒ 未完成；
+      - 状态是终态但 `JobImagesToTransfer > 0` ⇒ 设备还有图没交出去 ⇒ 未完成
+        （真机第一轮实测到的残留 job 形态：ImagesToTransfer=1）；
+      - `Completed` ⇒ 那个 job 已经做完了（顶多是张没取走的旧图，**不挡路**）
+        ⇒ 不算未完成；
+      - `Canceled` 且没有待传图像 ⇒ 设备只是在收尾 ⇒ 不算未完成
+        （真机第二轮：DELETE 之后设备回 Idle，2.27 秒后建 job 就成功）。
+    """
+    st = (job_state or "").strip().lower()
+    if st and st not in _TERMINAL_JOB_STATES:
+        return True
+    if st == "completed":
+        return False
+    return images_to_transfer > 0
+
+
+def _parse_pending_job_states(root) -> list:
+    """
+    从已解析的 ScannerStatus 文档里挑出**未完成**的 ScanJob 状态列表。
+
+    真机实测形态：`scan:Jobs` / `scan:JobInfo` 里挂着那个还没结束的 job，
+    `JobImagesToTransfer` 还 > 0（设备还有图没交出去）。
+    """
+    pending = []
+    for el in root.iter():
+        if _strip_ns(el) != "JobInfo":
+            continue
+        state = ""
+        images = 0
+        for child in el.iter():
+            t = _strip_ns(child)
+            if t == "JobState" and child.text:
+                state = child.text.strip()
+            elif t == "JobImagesToTransfer" and child.text:
+                try:
+                    images = int(str(child.text).strip())
+                except (TypeError, ValueError):
+                    images = 0
+        if _job_is_unfinished(state, images):
+            pending.append(state or "Unknown")
+    return pending
 
 
 def get_scanner_status(escl_url: str, timeout: float = 5.0) -> dict:
@@ -584,18 +655,22 @@ _CONFLICT_MESSAGE = (
 # 503 的有界退避**按来源分流**（2026-10-21 主控拍板）。
 #
 # ★ 判据（两种 503 的成因不同，处置也必须不同）：
-#   ① Platen（平板）/ 来源未知 —— 503 来自"设备还在收尾上一个 ScanJob"。
-#      实测 2026-10-21（E2E 真机 17.17.171.111）：上一个 ScanJob 刚被 DELETE，
-#      紧接着的建 job 请求就收到 503；设备侧复核上一个 job 仍是
-#      `JobState=Canceled` ⇒ 设备确实还在收尾，间隔 8~10 秒后不再复现。
-#      ⇒ **等一会儿真的会成功** ⇒ 退避重试对用户有价值（不用手动再点一次）。
-#      退避 2/4/8 秒共 14 秒，**刚好覆盖**这个 8~10 秒窗口；写法与 409 一致
-#      （有限次数 + 有限退避 + 等待可被用户取消）。
+#   ① Platen（平板）/ 来源未知 —— 503 来自"设备还没从上一个 ScanJob 收尾干净"。
+#      真机复验（2026-10-21，DELETE 掉上一个 job 之后紧接着建 job）：
+#      **2.27 秒就成功**，压根没收到 503 ⇒ 瞬时收尾只要 ~2.3 秒。
+#      ⇒ 退避 2+4 秒（6 秒）足够覆盖这个窗口；再长就是白等。
 #   ② Feeder（输稿器）—— 503 来自"输稿器空载、设备在等纸"。
 #      实测 2026-10-20（D1 基准）：输稿器空载时，创建任务阶段就返回 503。
 #      ⇒ **等多久都不会成功**（除非用户中途放纸，而 UI 不会提示他去放）⇒
-#      退避 14 秒是**白等** ⇒ **不重试**，拿到 503 立刻抛可执行错误。
-_SERVICE_UNAVAILABLE_BACKOFF_SECONDS = (2.0, 4.0, 8.0)   # 平板 / 来源未知
+#      退避是**白等** ⇒ **不重试**，拿到 503 立刻抛可执行错误。
+#
+# ★ 2026-10-21 改：档位由 2+4+8（14 秒）降为 **2+4（6 秒）**。
+#   依据：① 瞬时收尾实测只需 2.27 秒 ⇒ 14 秒偏长；
+#         ② 真正难缠的"设备上残留未完成 job"场景**等多久都不会自愈**
+#            （设备侧 TTL 15~20 分钟）⇒ 靠**退避**解决不了，靠的是
+#            **退避用尽后查设备状态 + 给出"去面板取消"的正确指引**
+#            （见 `_probe_pending_job` 与下面的 pending 版文案）。
+_SERVICE_UNAVAILABLE_BACKOFF_SECONDS = (2.0, 4.0)        # 平板 / 来源未知
 _SERVICE_UNAVAILABLE_BACKOFF_SECONDS_FEEDER = ()          # 输稿器空载：不重试
 
 # 503 的错误文案：**必须按扫描来源给不同的下一步指引**。
@@ -621,6 +696,37 @@ _SERVICE_UNAVAILABLE_MESSAGE_FEEDER = (
     "打印机当前不可用（HTTP 503，来源：输稿器）：输稿器里没有纸，"
     "设备正在等纸（不是设备故障）。"
     "请往输稿器里放入纸张，放纸后请重试。"
+)
+
+# 503 的错误文案：**设备上确有未完成 ScanJob** 时的版本
+# （2026-10-21 真机复验后新增）。
+#
+# ★ 为什么必须分这一版（真机两轮实测）：
+#   503 的主要成因是"**设备上存在一个未完成的 ScanJob**"（残留的、或正在
+#   处理的），**不是**"设备还在收尾上一个 job"：
+#     - 第一轮：探针把上一个 job 留在设备上没删 ⇒ 设备状态 Processing、
+#       ScannerStatus 里该 job 仍在、ImagesToTransfer=1 ⇒ 建新 job 持续 503，
+#       **退避 14 秒也没恢复**（设备侧 TTL 15~20 分钟）；
+#     - 第二轮：DELETE 正确执行后（设备回 Idle）⇒ 紧接着建 job 2.27 秒就成功。
+#   ⇒ 对"残留 job"这个**主要**场景，"请稍候重试"是**无效指引**（干等没用），
+#     用户真正该做的是"**到打印机面板上取消那个任务**"。
+#   ⇒ 反之，若设备上**没有**未完成 job（真的只是瞬时收尾）⇒ 保留"请稍候重试"。
+#
+# 平板那条仍然**不得**出现「输稿器」（会把用户指到错误的方向）。
+#
+# ★ pending 版**不含**"已自动重试 N 次"：查到未完成 job 时是**立刻**抛错的
+#   （压根没退避过），写上重试次数就是假话。
+_SERVICE_UNAVAILABLE_MESSAGE_PLEN_PENDING = (
+    "打印机当前不可用（HTTP 503，来源：平板）：打印机上有一个未完成的"
+    "扫描任务，请到打印机面板上取消该任务（或等它结束后再重试）。"
+    "已停止自动等待——该任务不会很快自行结束。"
+)
+# 输稿器 + 残留 job ⇒ **两件事都要说**：先取消任务，纸也还是要放
+#（输稿器空载确实是 503 的成因之一 ⇒ "放纸"指引不能丢）。
+_SERVICE_UNAVAILABLE_MESSAGE_FEEDER_PENDING = (
+    "打印机当前不可用（HTTP 503，来源：输稿器）：打印机上有一个未完成的"
+    "扫描任务，请到打印机面板上取消该任务（或等它结束后再重试）；"
+    "输稿器扫描还需确认已放入纸张（放纸后请重试）。"
 )
 
 # 传输层失败（连不上 / 超时）的用户文案。
@@ -701,25 +807,76 @@ def _service_unavailable_backoff(source: str) -> tuple:
     上方的注释）：
 
     - Feeder（输稿器）⇒ **空 tuple = 不重试**：503 来自"输稿器空载、等纸"，
-      等多久都不会成功 ⇒ 立刻报错，别让用户白等 14 秒；
-    - Platen（平板）/ 来源未知 ⇒ (2, 4, 8) 秒：503 来自"设备还在收尾上一个
-      ScanJob"，实测 8~10 秒后自愈 ⇒ 等是真的会成功。
+      等多久都不会成功 ⇒ 立刻报错，别让用户白等；
+    - Platen（平板）/ 来源未知 ⇒ (2, 4) 秒（共 6 秒）：503 来自"设备还没从上一个
+      ScanJob 收尾干净"，实测 **2.27 秒**就自愈 ⇒ 6 秒足够覆盖。
     """
     if (source or "").strip().lower() == "feeder":
         return _SERVICE_UNAVAILABLE_BACKOFF_SECONDS_FEEDER
     return _SERVICE_UNAVAILABLE_BACKOFF_SECONDS
 
 
-def _service_unavailable_message(source: str, retries: int = 0) -> str:
+# 查设备状态的**超时上限**：状态查询只是失败路径上的诊断动作，**不得**变成
+# 阻塞式的长时间等待 ⇒ 硬上限 3 秒。
+_STATUS_PROBE_TIMEOUT = 3.0
+
+
+def _probe_pending_job(session, escl_url: str,
+                       timeout: float = _STATUS_PROBE_TIMEOUT):
+    """
+    查设备上有没有**未完成**的 ScanJob（复用既有的 ScannerStatus 探测）。
+
+    返回 True / False / None：
+      True  —— 设备上确有未完成的 ScanJob（用户该去打印机面板取消它）；
+      False —— 查到了，但设备上没有未完成 job（真的只是瞬时收尾）；
+      None  —— **查不到**（查询失败 / 超时 / XML 畸形 / 非 200）。
+
+    ★ 容错铁律：这里的**任何**异常都在内部吞掉 ⇒ 绝不让"查状态失败"变成
+      "用户看到崩溃"（调用方对 None 与 False 的处理是一样的：都退回旧文案）。
+    ★ 只在**已经收到 503** 之后才被调用（第一次 503 时探一次，整条失败路径
+      只探这一次）⇒ 正常路径零开销。
+    ★ 探测**不回答**"要不要重试"（那是来源分流的职责），只回答
+      "等下去有没有意义" ⇒ True 时调用方应**立即报错**（继续等必然失败）。
+    """
+    try:
+        ok, status = probe_scanner_status(
+            escl_url, timeout=timeout, session=session, include_jobs=True)
+    except Exception as e:            # 兜底：任何意外都不得冒泡给用户
+        logger.debug("设备状态查询异常（忽略）: %s", e)
+        return None
+    if not ok:
+        return None
+    try:
+        pending = int(status.get("pending_jobs") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pending > 0:
+        logger.info("设备上有未完成的 ScanJob（%s 个）", pending)
+    return pending > 0
+
+
+def _service_unavailable_message(source: str, retries: int = 0,
+                                 pending_job: bool = False) -> str:
     """
     按扫描来源给出**不同**的 503 指引。
 
     - Feeder（输稿器）⇒ 设备在等纸 ⇒ 保留"放纸后请重试"（**不重试**，
       所以文案里不提"已自动重试"）；
-    - 其它（Platen 平板 / 未知来源）⇒ 设备多半还在收尾上一个 job
+    - 其它（Platen 平板 / 未知来源）⇒ 设备多半还没从上一个 job 收尾干净
       ⇒ 指引是"设备尚未就绪，请稍候重试"，**不得**把用户指向输稿器。
+
+    ★ pending_job=True（设备上确有未完成的 ScanJob）："请稍候重试"是
+      **无效指引**（真机实测：退避 14 秒也没恢复，TTL 15~20 分钟）⇒ 换成
+      "到打印机面板上取消该任务"。来源差异仍然保留（输稿器那条仍带放纸指引）。
+    ★ pending 版**不提**"已自动重试 N 次"：探测到未完成 job 时是**立刻**抛的，
+      压根没退避过。
     """
-    if (source or "").strip().lower() == "feeder":
+    is_feeder = (source or "").strip().lower() == "feeder"
+    if pending_job:
+        if is_feeder:
+            return _SERVICE_UNAVAILABLE_MESSAGE_FEEDER_PENDING
+        return _SERVICE_UNAVAILABLE_MESSAGE_PLEN_PENDING
+    if is_feeder:
         return _SERVICE_UNAVAILABLE_MESSAGE_FEEDER
     return _SERVICE_UNAVAILABLE_MESSAGE_PLEN.format(retries=retries)
 
@@ -796,6 +953,9 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     conflict_retry = 0
     unavailable_retry = 0
     unavailable_backoff = _service_unavailable_backoff(source)
+    # 503 的设备状态**整条失败路径只探一次**（在**第一次** 503 时探）。
+    probed_pending = False
+    pending_job = False
     while True:
         if r.status_code == 409:
             # 打印机上残留一个未完成的 ScanJob（此前某次扫描异常中断留下的）。
@@ -817,15 +977,45 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
         if r.status_code == 503:
             # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
             # 阶段就返回 503（设备在等纸），不是扫描超时。
-            # 实测 2026-10-21：source=Platen 时**同样**会收到 503 —— 原因是
-            # 设备还没从上一个 ScanJob 收尾（ScannerStatus 复核上一个 job
-            # 仍是 JobState=Canceled），间隔 8~10 秒后不再复现。
+            # 实测 2026-10-21（真机两轮复验）：503 的**主要**成因是"设备上
+            # 存在一个未完成的 ScanJob"（残留的 / 正在处理的）：
+            #   - 探针把上一个 job 留在设备上没删 ⇒ 设备状态 Processing、
+            #     ScannerStatus 里该 job 仍在、ImagesToTransfer=1 ⇒ 建新 job
+            #     持续 503，**退避 14 秒也没恢复**（TTL 15~20 分钟）；
+            #   - DELETE 正确执行后（设备回 Idle）⇒ 紧接着建 job 2.27 秒就成功。
             # ⇒ 退避档位**按来源分流**（判据见 `_service_unavailable_backoff`）：
-            #   平板/未知 → (2,4,8) 秒重试（等得到，会自愈）；
+            #   平板/未知 → (2,4) 秒重试（瞬时收尾实测 2.27 秒自愈，6 秒够）；
             #   输稿器   → 不重试（等不到，立刻告诉用户去放纸）。
+            #
+            # ★ 2026-10-21 主控拍板：**探测前移到第一次 503**（不是退避用尽后）。
+            #   时序：
+            #     第一次 503 ⇒ 先探一次设备状态（≤3 秒、容错、只探这一次）
+            #       ├─ 探到**未完成 job** ⇒ 建新 job **必然失败**（真机实测：
+            #       │   退避 14 秒也没恢复，TTL 15~20 分钟）⇒ 继续退避是**白等**
+            #       │   ⇒ **立即抛错**，文案指向"到打印机面板上取消该任务"
+            #       │   （平板与输稿器一视同仁；输稿器那条仍保留放纸指引）。
+            #       └─ 探测失败/查不到 ⇒ 按来源走原有退避（平板 2+4=6 秒；
+            #           输稿器不退避）⇒ 退避用尽后再抛原来的错。
+            #   ⇒ 「残留 job」场景从"等 6 秒还失败"变成"立刻告诉用户该做什么"；
+            #     「瞬时收尾」场景仍是 6 秒内自动恢复 —— 两类场景都不吃亏。
+            if not probed_pending:
+                probed_pending = True
+                # 用户已取消 ⇒ 不必再花一次 HTTP 去查状态（取消优先）。
+                if cancel_event is not None and cancel_event.is_set():
+                    raise ScanJobCancelled("扫描已取消（等待打印机就绪时中断）")
+                # ★ 只在**已经收到 503** 的失败路径上才探状态（正常路径零开销）；
+                #   查询失败/超时/畸形一律被吞掉（见 `_probe_pending_job`）
+                #   ⇒ 绝不让"查状态失败"变成用户看到的崩溃。
+                pending_job = _probe_pending_job(session, base)
+                if pending_job:
+                    raise ScanDeviceError(
+                        _service_unavailable_message(source, unavailable_retry,
+                                                     True))
             if unavailable_retry >= len(unavailable_backoff):
+                # 走到这里说明**没有**探测到未完成 job（探测到就已立刻抛了）
                 raise ScanDeviceError(
-                    _service_unavailable_message(source, unavailable_retry))
+                    _service_unavailable_message(source, unavailable_retry,
+                                                 pending_job))
             delay = unavailable_backoff[unavailable_retry]
             unavailable_retry += 1
             logger.info("打印机暂不可用 (503)，%s 秒后重试: %s", delay, scanner.ip)

@@ -109,8 +109,9 @@ class TestServiceUnavailableRetries:
     """
     503 的退避**按来源分流**（2026-10-21 主控拍板）：
 
-    - Platen / 来源未知：503 来自"设备还在收尾上一个 ScanJob"（实测 8~10 秒
-      后自愈）⇒ **重试**（有界：最多 3 次、2/4/8 秒、共 14 秒、等待可取消）；
+    - Platen / 来源未知：503 来自"设备还没从上一个 ScanJob 收尾干净"
+      （真机实测 **2.27 秒**就自愈）⇒ **重试**（有界：最多 2 次、2/4 秒、
+      共 6 秒、等待可取消；★ 2026-10-21 由 2/4/8、14 秒降档）；
     - Feeder：503 来自"输稿器空载、设备在等纸"⇒ **不重试**，立刻报错。
 
     断言必须能**区分**"重试了"与"没重试" ⇒ 一律断言 `session.post.call_count`
@@ -127,11 +128,11 @@ class TestServiceUnavailableRetries:
 
         posts = session.post.call_count
         total_wait = sum(c.args[0] for c in sleeper.call_args_list)
-        assert posts == 4, f"平板 503 必须重试（1 次 + 3 次退避），实际 {posts} 次"
+        assert posts == 3, f"平板 503 必须重试（1 次 + 2 次退避），实际 {posts} 次"
         assert sleeper.called, "平板 503 必须有退避等待"
-        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0, 8.0], \
+        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0], \
             "退避入参必须逐个锁定"
-        assert 0 < total_wait <= 15.0, \
+        assert 0 < total_wait <= 6.0, \
             f"503 退避总时长必须有界（实际 {total_wait}s）"
 
     def test_feeder_503_is_not_retried(self):
@@ -165,7 +166,7 @@ class TestServiceUnavailableRetries:
             with pytest.raises(ScanDeviceError):
                 _create(feeder, source="Feeder")
 
-        assert platen.post.call_count == 4
+        assert platen.post.call_count == 3
         assert feeder.post.call_count == 1
         assert platen.post.call_count != feeder.post.call_count, \
             "平板与输稿器的 503 处置必须不同"
