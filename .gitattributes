@@ -1,0 +1,27 @@
+# 换行与文本属性 — HP Scan Tool
+#
+# 仓库约定：**所有文本文件在工作区必须是 CRLF**（Windows 桌面应用，Windows 记事本/PowerShell 默认）。
+#
+# 为什么显式写这个文件：
+#   仓库同时存在 `core.autocrlf=true`（全局 git 配置）与编辑器/脚本写出的 LF 文件。
+#   `autocrlf` 只在 **checkout 时** 把 LF 转成 CRLF；工具在 checkout 之后写出的文件仍是 LF，
+#   于是工作区出现「同一仓库一半 CRLF、一半 LF、一部分混合」的分裂状态。
+#   显式声明 `eol=crlf` 后，git 在 **每次 checkout 都强制** 工作区为 CRLF，
+#   且在 add 时把 blob 统一归一化为 LF（git 的标准内部存储形式）。
+#
+# 二进制文件必须显式排除，否则 `text=auto` 的自动探测可能把它们误判。
+
+* text=auto eol=crlf
+
+# 二进制资源：不参与换行转换
+*.ttf   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.exe   binary
+*.pyc   binary
+*.db    binary
+*.lock  binary
