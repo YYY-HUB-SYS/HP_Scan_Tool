@@ -52,7 +52,7 @@ AIGC:
 | 免驱 | 需安装厂商数百MB驱动包 | eSCL 协议纯 HTTP/XML，零驱动 |
 | 零配置 | IP 地址难记、Web 界面操作繁琐 | mDNS 自动发现 + 历史记录秒加载 |
 | 现代 UI | HP Smart 臃肿、Web 界面卡顿 | CustomTkinter 本地原生窗口，深色/浅色双主题 |
-| 单文件便携 | 需要安装步骤和管理员权限 | 22MB 单文件 EXE，U 盘即走 |
+| 单文件便携 | 需要安装步骤和管理员权限 | 62MB 单文件 EXE，U 盘即走 |
 
 ### 1.3 目标用户画像
 
@@ -405,11 +405,10 @@ HP_Scan_Tool/
 │
 ├── build_exe.py            # PyInstaller 打包脚本
 ├── requirements.txt        # pip 依赖声明
-├── HP_Scan_Tool.spec       # PyInstaller spec（自动生成）
 ├── run.bat                 # 开发环境启动脚本
 ├── PRD.md                  # 本文件
 └── dist/
-    └── HP_Scan_Tool.exe    # 最终交付物（~22MB）
+    └── HP_Scan_Tool.exe    # 最终交付物（~62MB）
 ```
 
 ### 3.3 线程模型

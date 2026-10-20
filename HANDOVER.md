@@ -95,9 +95,7 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 hp_scan_gui_pyside.py (GUI 层 — PySide6)
   ├── ScanApp                  — 主窗口：扫描仪管理 + 参数配置 + 扫描启动
   ├── LoadingDialog            — 启动进度对话框
-  ├── ScanWorker               — 单页扫描 QThread
-  ├── MultiPageScanWorker      — 多页扫描 QThread
-  ├── ScannerCard              — 扫描仪卡片组件（选中/重命名/禁用）
+      ├── ScannerCard              — 扫描仪卡片组件（选中/重命名/禁用）
   ├── ImageViewer              — 图片预览（缩放/旋转）
   ├── AnimatedButton           — 按压动画按钮
   ├── PreviewDialog            — 单页预览 + 文件名确认 + 保存
