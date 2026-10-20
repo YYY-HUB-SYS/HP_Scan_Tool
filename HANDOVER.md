@@ -11,7 +11,7 @@ HP Scan Tool 是一款面向惠普网络打印机的 Windows 桌面扫描客户�
 **项目路径**: `<PROJECT_DIR>`
 **Git 仓库**: 已初始化（`.git` 存在），remote 指向 <GIT_REPO>
 **技术栈**: Python 3.11+ / PySide6 / Pillow / python-zeroconf / WSDiscovery / requests / pywin32
-**打包**: PyInstaller 单文件 EXE（spec 文件已配置）
+**打包**: PyInstaller 单文件 EXE（由 `build_exe.py` 统一构建，无独立 spec 文件）
 
 ### 1.1 当前状态（2026-09-21 v4.0）
 
@@ -42,7 +42,6 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 ├── profile_manager.py      # 扫描配置文件管理器 — 按设备 IP 保存独立参数
 ├── cli.py                  # CLI 命令行入口 — scan/discover/status/history 子命令
 ├── build_exe.py            # PyInstaller 打包脚本
-├── HP_Scan_Tool.spec       # PyInstaller spec 文件
 ├── app.ico                 # 多尺寸图标（16-256px，手写 ICO）
 ├── icon_16.png             # 任务栏图标 16px（代码绘制几何图形）
 ├── icon_32.png             # 任务栏图标 32px（代码绘制几何图形）
@@ -235,7 +234,7 @@ preset_manager.py (已停用)
 
 - 动态 import 的模块必须加入 hiddenimports
 - EXE 被占用时用 `--distpath` 指定不同目录绕过文件锁
-- spec 的 datas 打包字体/图标文件
+- 字体/图标由 `build_exe.py` 的 `--add-data resources;resources` 一并打包
 - 单文件 EXE 约 62MB（2026-10-20 实测 64,968,184 字节）
 
 ---
@@ -314,13 +313,13 @@ python hp_scan_gui_pyside.py
 
 ```bash
 python build_exe.py
-# 或手动:
-pyinstaller HP_Scan_Tool.spec --distpath dist9
 ```
+
+`build_exe.py` 是唯一的打包入口（`--onefile` 单文件模式）。仓库不再保留独立的 `.spec` 文件——它此前是 onedir 配置，与 CI 实际运行的 onefile 模式冲突，且长期未被使用。
 
 输出：`dist/HP_Scan_Tool.exe`（单文件便携版）
 
-注意：打包前确认 spec 文件的 datas 和 hiddenimports 与当前代码一致。
+注意：打包前确认 `build_exe.py` 里的 `--add-data` 资源路径与 `--hidden-import` 模块列表与当前代码一致（新增项目内模块时需补进 hidden-imports）。
 
 ### 8.3 CLI 模式
 
