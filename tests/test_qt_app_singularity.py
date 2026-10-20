@@ -80,17 +80,32 @@ def test_no_test_module_instantiates_qcoreapplication():
     （`del` + `gc.collect()` 之后 `QCoreApplication.instance()` 依然返回它
     —— PySide6 一直持有）⇒ 它会**长期占住** application 的位置，
     后续 `QApplication.instance()` 每次都取到它。
-    """
-    import re
 
+    ★★ 用 **AST 判据**而不是正则（复审 I2 —— 旧判据是**假网**）
+    ------------------------------------------------------------------
+    旧实现用正则 `QCoreApplication\\s*\\(\\s*\\[` ⇒ 只认**列表字面量**实参，
+    于是 `QCoreApplication(sys.argv)` / `QCoreApplication(argv)` /
+    `QCoreApplication()` **全部漏网**。
+    复审的变异测试 M4 实测：把某个 fixture 改成 `QCoreApplication(sys.argv)`
+    ⇒ 守护**仍然 4 passed**（假绿），而全量测试在 ~58% 处 **0xC0000409 硬崩**
+    ⇒ 这条守护当时**抓不住**它要防的东西。
+    ⇒ 现在改成：AST 里任何对 `QCoreApplication` 的**调用**（`ast.Call`）都算违规；
+      `QCoreApplication.instance()` 是**属性访问**（读已有实例），不算调用。
+    """
     offenders = []
     for path in sorted(TESTS_DIR.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        if re.search(r"QCoreApplication\s*\(\s*\[", text):
-            offenders.append(path.name)
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "id", None) or getattr(func, "attr", None)
+            if name == "QCoreApplication":
+                offenders.append("%s:%d" % (path.name, node.lineno))
+                break
     assert offenders == [], (
         "这些测试文件自己 new 了 QCoreApplication（PySide6 不会释放它 ⇒ "
-        "它会长期占住 application 的位置）：%s"
+        "它会长期占住 application 的位置；任何实参形式都算违规）：%s"
         % offenders
     )
 
@@ -135,3 +150,74 @@ def test_module_qapp_fixtures_reuse_session_instance():
     assert offenders == [], (
         "这些文件的 qapp fixture 没有复用会话级 qt_app：%s" % offenders
     )
+
+
+def test_widget_creation_without_requesting_qt_app_does_not_crash():
+    """
+    ★ 回归 I3：**不请求** `qt_app` 的用例直接创建 widget，也**不得**硬崩。
+
+    旧实现只在"用例**显式请求** fixture"时才有 QApplication ⇒ 复审的最小复现
+    （当前进程里直接建 widget）仍是 0xC0000409 硬崩 ⇒ 守护网有缺口。
+    ⇒ 这里跑一个**子进程 pytest**，它只含一个**不请求任何 fixture**的用例
+      （直接创建 QCheckBox），断言退出码为 0
+      ⇒ 证明会话级保护对"不请求"的用例同样生效。
+
+    ★ 为什么探针文件放在 `tests/` 目录里、且由**子进程自己**创建：
+      - pytest 按**目录层级**加载 conftest ⇒ 探针必须在 `tests/` 下才会
+        加载到 `tests/conftest.py`（用 `-p conftest` 插件方式加载会让
+        conftest 被加载**两次**，导入期建的沙箱目录互相打架 ⇒ 报
+        FileNotFoundError，本轮实测踩过）。
+      - 文件**由子进程创建**（父进程的收集阶段早已结束）⇒ 并行跑的其它
+        pytest 不会在收集阶段把它捡走 ⇒ 不会给别的测试制造假失败。
+      - 名字以 `_tmp_` 开头 ⇒ 不匹配 `test_*.py` ⇒ 默认收集不会碰它。
+      - 子进程 finally 里删掉 ⇒ 仓库目录不残留。
+    """
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    repo_root = str(TESTS_DIR.parent)
+    maker = (
+        "import os, sys, subprocess\n"
+        "tests_dir = sys.argv[1]\n"
+        "repo_root = sys.argv[2]\n"
+        "probe = os.path.join(tests_dir, '_tmp_qapp_probe_%d.py' % os.getpid())\n"
+        "with open(probe, 'w', encoding='utf-8') as f:\n"
+        "    f.write('from PySide6.QtWidgets import QCheckBox\\n\\n')\n"
+        "    f.write('def test_widget_without_requesting_any_fixture():\\n')\n"
+        "    f.write(\"    cb = QCheckBox('x')\\n\")\n"
+        "    f.write('    cb.setChecked(True)\\n')\n"
+        "    f.write('    assert cb.isChecked()\\n')\n"
+        "rc = 1\n"
+        "try:\n"
+        "    rc = subprocess.call([sys.executable, '-m', 'pytest', '-q',\n"
+        "        '--no-header', '-p', 'no:cacheprovider', probe], cwd=repo_root)\n"
+        "finally:\n"
+        "    try:\n"
+        "        os.remove(probe)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "sys.exit(rc)\n"
+    )
+    tmp_dir = tempfile.mkdtemp(prefix="hp_qapp_maker_")
+    maker_path = os.path.join(tmp_dir, "maker.py")
+    with open(maker_path, "w", encoding="utf-8") as f:
+        f.write(maker)
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        proc = subprocess.run(
+            [sys.executable, maker_path, str(TESTS_DIR), repo_root],
+            cwd=repo_root, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180)
+    finally:
+        try:
+            os.remove(maker_path)
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+    assert proc.returncode == 0, (
+        "不请求任何 fixture 的用例创建 widget 仍然崩了（exit=%s）:\n%s"
+        % (proc.returncode, ((proc.stdout or "") + (proc.stderr or ""))[-2000:]))

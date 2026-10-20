@@ -58,6 +58,48 @@ def _cleanup_session_appdata():
 
 # ── Qt application 唯一性（会话级，全项目共用一个） ────────────────────────
 
+def _ensure_qapplication():
+    """
+    进程内**唯一**的 QApplication（offscreen）；不存在则创建，已存在则复用。
+
+    ★ 为什么抽成模块级函数（而不是只写在 fixture 里）：
+      会话级 autouse fixture 与显式的 `qt_app` fixture 必须返回**同一个实例**
+      ⇒ 两边都调它。
+    """
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if not isinstance(app, QApplication):
+        core = QCoreApplication.instance()
+        if core is not None:
+            raise RuntimeError(
+                "进程里已存在 QCoreApplication（%s）—— QCoreApplication 与 "
+                "QApplication 不能混用。请改用 tests/conftest.py 的会话级 "
+                "qt_app fixture，不要自己 new application 实例。"
+                % type(core).__name__)
+        app = QApplication([])
+    return app
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _qapplication_session_guard():
+    """
+    ★ 会话一启动就保证进程里有唯一的 QApplication（**不依赖用例是否请求 fixture**）。
+
+    ★ 为什么必须有这条（复审 I3）：
+      旧实现只在"用例**显式请求** `qt_app`"时才有 QApplication ⇒
+      一个**不请求任何 fixture**、直接创建 widget 的用例仍会
+      `Cannot create a QWidget without QApplication` ⇒ 进程 `0xC0000409` 硬崩。
+      复审实测的最小复现：子进程退出码 **4294967295**（= `0xC0000409`）。
+      ⇒ 这里用 session 级 **autouse** fixture，把"进程里必须有 QApplication"
+      变成**不依赖用例写法**的性质。
+      （守护测试：`tests/test_qt_app_singularity.py`
+        的 `test_widget_creation_without_requesting_qt_app_does_not_crash`。）
+    """
+    return _ensure_qapplication()
+
+
 @pytest.fixture(scope="session")
 def qt_app():
     """
@@ -79,25 +121,12 @@ def qt_app():
     `0xC0000409` 硬崩（pytest 连 traceback 都来不及打）。
 
     ★ 契约
-      - 全项目**只有**本 fixture 能创建 application 实例。
+      - 全项目**只有**本文件能创建 application 实例。
       - 任何测试文件都不得自己 `QCoreApplication(...)` / `QApplication(...)`。
       - 若进程里已存在 QCoreApplication，这里**立刻**抛可读错误，
         而不是让后续某个 widget 静默崩溃。
     """
-    from PySide6.QtCore import QCoreApplication
-    from PySide6.QtWidgets import QApplication
-
-    app = QApplication.instance()
-    if not isinstance(app, QApplication):
-        core = QCoreApplication.instance()
-        if core is not None:
-            raise RuntimeError(
-                "进程里已存在 QCoreApplication（%s）—— QCoreApplication 与 "
-                "QApplication 不能混用。请改用 tests/conftest.py 的会话级 "
-                "qt_app fixture，不要自己 new application 实例。"
-                % type(core).__name__)
-        app = QApplication([])
-    return app
+    return _ensure_qapplication()
 
 
 @pytest.fixture(autouse=True)
