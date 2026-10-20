@@ -123,8 +123,9 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
 
 
 def save_pages(job_id: str, ext: str, output_path: str,
-               page_specs, groups, extra_dirs=None,
-               device_name: str = "", device_ip: str = "") -> list:
+               page_specs: list[tuple[str, int]], groups: list[list[int]],
+               extra_dirs=None,
+               device_name: str = "", device_ip: str = "") -> list[str]:
     """
     多页保存（可分组）。
 

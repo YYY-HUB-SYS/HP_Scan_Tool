@@ -59,7 +59,8 @@ class TestSaveSingle:
         out = str(tmp_path / "out.jpg")
         saved = save_manager.save_single(jpg, "jpg", out)
         assert os.path.exists(saved)
-        assert Image.open(saved).size == (100, 200)
+        with Image.open(saved) as im:
+            assert im.size == (100, 200)
 
     def test_extension_corrected_when_mismatch(self, tmp_path, jpg, isolated):
         out = str(tmp_path / "out.png")
@@ -70,7 +71,8 @@ class TestSaveSingle:
     def test_rotation_applied(self, tmp_path, jpg, isolated):
         out = str(tmp_path / "out.jpg")
         saved = save_manager.save_single(jpg, "jpg", out, rotation=90)
-        assert Image.open(saved).size == (200, 100)
+        with Image.open(saved) as im:
+            assert im.size == (200, 100)
 
 
 class TestSavePages:
@@ -143,12 +145,20 @@ class TestFinalize:
         assert not os.path.isdir(os.path.join(cache_root, job_id))
 
     def test_cache_removed_when_source_is_the_cache_file(self, tmp_path, jpg, isolated):
-        """保存源就是缓存文件本身时，缓存目录也必须被真正删除。
+        """保存源就是缓存文件本身时，保存后缓存目录也必须被真正删除。
 
-        Windows 上文件句柄未关闭时 shutil.rmtree 删不掉目录，而
-        cache_manager.remove_job 的 ignore_errors=True 会静默吞掉错误。
-        改造前的 GUI 有 14 处 Image.open 不关句柄，其中 4 处紧跟
-        remove_job，导致每次保存后缓存目录都残留。
+        守护的是用户可见行为："保存完成后，缓存目录确实被删掉"
+        （即 cache_manager.remove_job 确实生效了）。
+
+        注意：本用例**不能**证明 "with Image.open(...) 是句柄释放的必要条件"。
+        Pillow 13.0.0 的 ImageFile.load() 在 _exclusive_fp 且
+        _close_exclusive_fp_after_loading 时会执行 fp.close()，而 copy() /
+        rotate() / convert() / save() 全部会触发 load —— 图片只要被读过一次，
+        独占文件句柄就已释放。实测把 save_manager 里 3 处 with 全部去掉，
+        本用例仍然通过（review 变异测试 M1：16 项全绿）。
+
+        改造前 GUI 内 13 处 Image.open 不关句柄（hp_scan_gui_pyside.py），
+        其中 4 处紧跟 remove_job。
         """
         cache_root, _ = isolated
         job_id = "job_self"
@@ -161,7 +171,12 @@ class TestFinalize:
         assert not os.path.isdir(os.path.join(cache_root, job_id))
 
     def test_cache_removed_after_pdf_save_from_cache(self, tmp_path, jpg, isolated):
-        """PDF 分支会真正打开缓存图片，句柄必须已关闭才能删掉缓存目录"""
+        """PDF 分支保存后，缓存目录也必须被真正删除。
+
+        守护的是用户可见行为："PDF 保存完成后，缓存目录确实被删掉"。
+        同样不能证明 "with 是句柄释放的必要条件"——Pillow 在 load() 之后
+        即关闭独占句柄，去掉 with 本用例依然通过（见 review 变异 M1）。
+        """
         cache_root, _ = isolated
         job_id = "job_pdf"
         cache_manager.register_job(job_id)
