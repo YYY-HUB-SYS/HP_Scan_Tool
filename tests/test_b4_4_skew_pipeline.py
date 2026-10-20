@@ -14,6 +14,7 @@
 import io
 import json
 import os
+import sys
 import threading
 from unittest import mock
 
@@ -26,6 +27,13 @@ import save_manager
 import scan_coordinator
 import skew_detect
 from scan_coordinator import ScanCancelled, ScanCoordinator
+
+# 共享的"真实斜页"夹具（见 skew_fixtures 模块 docstring：为什么不能直接
+# `rotate(fillcolor=255)` —— Pillow 对 RGB 的标量 fillcolor 是打包整数 ⇒ 纯红）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skew_fixtures import (  # noqa: E402
+    add_text_rows, assert_corners_white, corner_pixels, rotate_white,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_SAMPLE = os.path.join(PROJECT_ROOT, ".verify_out", "D1_platen",
@@ -103,8 +111,18 @@ def _jpeg_bytes(img: Image.Image, quality: int = 95) -> bytes:
 
 
 def _skewed_bytes(page: Image.Image, angle: float) -> bytes:
-    """把真机件程序旋转 angle 度 ⇒ 斜页字节（angle>0 = 逆时针）"""
-    return _jpeg_bytes(page.rotate(angle, expand=True, fillcolor=255))
+    """把真机件程序旋转 angle 度 ⇒ 斜页字节（angle>0 = 逆时针）
+
+    ★ 真机件近乎空白（ink ≈ 0.00022，**低于**检测下限 0.005）⇒ 必须在页面上
+      **合成文字行结构**，否则 `estimate_skew` 根本检测不到角度（返回 None）。
+    ★ 旋转填充必须是**白**：
+      Pillow 对 **RGB** 图像的**标量** `fillcolor=255` 解释为**打包整数**
+      ⇒ 255 = (255,0,0) **纯红**。
+      红框会造成两个假象：
+        ① 红框是极强的行/列结构 ⇒ "检测出的角度"其实来自红框而非页面内容
+        ② 纠偏时若也用红填充，残留红角会**掩盖**残余误差 ⇒ "纠偏后更直"恒成立
+    """
+    return _jpeg_bytes(rotate_white(add_text_rows(page), angle))
 
 
 def _blank_bytes(size=(640, 480)) -> bytes:
@@ -690,6 +708,53 @@ class TestApplyDeskewOnSave:
         with Image.open(out + ".jpg") as im:
             angle = skew_detect.estimate_skew(im)
         assert angle is None or abs(angle) <= 0.6, f"单页保存没纠偏（{angle}）"
+
+    def test_deskewed_output_corners_are_white_not_red(self, tmp_path,
+                                                        cache_root, small_page):
+        """★★ 回归锁死 P1：纠偏后的产物**四角必须是白**，不是纯红。
+
+        缺陷背景：Pillow 对 **RGB** 图像的**标量** `fillcolor=255` 解释为
+        **打包整数** ⇒ 255 = (255,0,0) **纯红**（只有 1/L 模式才是白）。
+        ⇒ 曾经每一张被自动纠偏的 RGB 页，四角都被补成纯红色块
+          （实测 5° 斜角时占页面 4.36%），JPEG 与 PDF 产物都中招。
+
+        这条断言把"填充色"这个**极易被改回去**的细节钉住。
+        """
+        job = "job_corners"
+        data = _skewed_bytes(small_page, 3.0)
+        cache_file = _write_cache_page(cache_root, job, 1, data,
+                                       deskew_angle=-3.0)
+        out = _out_base(tmp_path, "corners")
+        save_manager.save_single(cache_file, "jpg", out, job_id=job)
+        with Image.open(out + ".jpg") as im:
+            corners = corner_pixels(im.convert("RGB"))
+        assert corners, "取不到角像素"
+        for c in corners:
+            assert all(abs(v - 255) <= 8 for v in c[:3]), (
+                "纠偏后四角应是白，实际 %s（标量 fillcolor=255 在 RGB 下是纯红）"
+                % (corners,))
+
+    def test_deskewed_pdf_output_corners_are_white_not_red(self, tmp_path,
+                                                           cache_root, small_page):
+        """★★ 回归锁死 P1（PDF 路径）：PDF 内嵌图的四角也必须是白。"""
+        job = "job_corners_pdf"
+        data = _skewed_bytes(small_page, 3.0)
+        cache_file = _write_cache_page(cache_root, job, 1, data,
+                                       deskew_angle=-3.0)
+        out = _out_base(tmp_path, "corners_pdf")
+        save_manager.save_pages(job, "pdf", out, [(cache_file, 0)], [[0]])
+        pdf = _out_path(out, "pdf")
+        assert os.path.exists(pdf)
+        from pypdf import PdfReader
+        reader = PdfReader(pdf)
+        assert len(reader.pages) == 1
+        imgs = reader.pages[0].images
+        assert imgs, "PDF 里没有内嵌图"
+        with Image.open(io.BytesIO(imgs[0].data)) as im:
+            corners = corner_pixels(im.convert("RGB"))
+        for c in corners:
+            assert all(abs(v - 255) <= 8 for v in c[:3]), (
+                "PDF 内嵌图四角应是白，实际 %s" % (corners,))
 
     def test_deskew_keeps_canvas_size(self, tmp_path, cache_root, small_page):
         """不 expand ⇒ 画布尺寸不变（只多了一圈补白）。"""

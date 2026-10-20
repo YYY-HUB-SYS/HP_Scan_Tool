@@ -508,7 +508,8 @@ def _expose_and_rotate(img: Image.Image, rotation: int, exposure,
             rgb = img.convert("RGB")
             img.close()
             img = rgb
-        # 不 expand（画布尺寸不变），四角填白（fillcolor=255）
+        # 不 expand（画布尺寸不变）；四角填白由 skew_detect.deskew_image 按图像模式自动选
+        # （★ RGB 不能传标量 255 —— Pillow 会当成打包整数 (255,0,0) 纯红）
         skewed = skew_detect.deskew_image(img, angle)
         if skewed is not img:
             img.close()
@@ -580,6 +581,10 @@ def _save_a4_pdf(img, path, dpi=300):
 
 def _write_image(img, path, ext, dpi=300):
     """按扩展名落盘一张图片"""
+    # 输出目录可能还不存在（PDF 分支会建，图片分支原先不会 ⇒ 目录缺失时整批失败）
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     if ext == "pdf":
         _save_a4_pdf(img, path, dpi=dpi)
     elif ext in ("jpg", "jpeg"):

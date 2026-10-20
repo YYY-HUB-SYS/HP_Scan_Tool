@@ -244,14 +244,36 @@ def estimate_skew(img, max_angle=8.0, coarse=2.0, fine=0.5,
     return best_angle
 
 
-def deskew_image(img, angle, fillcolor=255):
+def deskew_image(img, angle, fillcolor=None):
     """按 `estimate_skew` 返回的纠偏量旋转图像（Pillow `rotate` 逆时针为正）。
 
     `angle` 为 None（或 0）时原样返回；不改变画布尺寸。
+
+    ★ `fillcolor` 缺省时按**图像模式**自动取白：
+        - mode "1" / "L"  → 255（灰度白）
+        - mode "RGB"      → (255, 255, 255)
+        - mode "RGBA"     → (255, 255, 255, 255)
+        - mode "P"        → 先转 RGB 再旋转（调色板索引不是颜色）
+
+    ★★ 为什么要按模式选：Pillow 对 **RGB/RGBA** 的**标量** `fillcolor`
+    解释为**打包整数** —— 255 会变成 `(255, 0, 0)` **纯红**（不是白！），
+    只有 1/L 模式下 255 才是白。
+    ⇒ 曾经 RGB 页被自动纠偏后**四角是纯红色块**（实测 5° 斜角时占页面 4.36%）。
     """
     if img is None or angle is None:
         return img
     angle = float(angle)
     if abs(angle) < 1e-9:
         return img
+    mode = getattr(img, "mode", "RGB")
+    if mode == "P":
+        # 调色板图：标量 fillcolor 是**调色板索引**，不是颜色 ⇒ 先转 RGB
+        img = img.convert("RGB")
+    if fillcolor is None:
+        if mode in ("1", "L"):
+            fillcolor = 255
+        elif mode == "RGBA":
+            fillcolor = (255, 255, 255, 255)
+        else:
+            fillcolor = (255, 255, 255)
     return img.rotate(angle, resample=Image.BICUBIC, fillcolor=fillcolor)

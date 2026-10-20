@@ -15,6 +15,7 @@
 
 import io
 import os
+import sys
 
 import pytest
 from PIL import Image
@@ -24,6 +25,13 @@ import doc_merge
 import page_meta
 import save_manager
 from document_session import new_session
+
+# 共享的"真实斜页"夹具（见 skew_fixtures 模块 docstring：为什么不能直接
+# `rotate(fillcolor=255)` —— Pillow 对 RGB 的标量 fillcolor 是打包整数 ⇒ 纯红）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from skew_fixtures import (  # noqa: E402
+    add_text_rows, corner_pixels, rotate_white,
+)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_SAMPLE = os.path.join(PROJECT_ROOT, ".verify_out", "D1_platen",
@@ -89,8 +97,14 @@ def _solid_bytes(color, size=(600, 800)) -> bytes:
 
 
 def _skewed_bytes(page: Image.Image, angle: float) -> bytes:
-    """把真机件程序旋转 angle 度 ⇒ 斜页字节（angle>0 = 逆时针）"""
-    return _jpeg_bytes(page.rotate(angle, expand=True, fillcolor=255))
+    """把真机件程序旋转 angle 度 ⇒ 斜页字节（angle>0 = 逆时针）
+
+    ★ 真机件近乎空白（ink ≈ 0.00022 < 检测下限 0.005）⇒ 需合成文字行结构
+    ★ 旋转填充必须**白**：Pillow 对 RGB 的标量 fillcolor=255 是**打包整数**
+      ⇒ (255,0,0) 纯红；红框会替代内容成为"检测力来源"，并在纠偏后残留红角、
+      掩盖残余误差。
+    """
+    return _jpeg_bytes(rotate_white(add_text_rows(page), angle))
 
 
 def _write_job_pages(cache_root, job_id, pages, deskew_angle=0.0,

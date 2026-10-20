@@ -711,10 +711,26 @@ class SessionStore:
                         #   使 remove_pages_from 的删除在落盘后**消失**。
                         #   标志由 remove_pages_from 置位（并随 payload 持久化，
                         #   所以"落盘 → 删页 → 再落盘""重启后删页"两条路都成立）。
-                        if getattr(session, "full_rewrite", False):
+                        #
+                        # ★ 判定要**同时看内存与磁盘**两份标志：
+                        #   只看内存 ⇒ 陈旧副本（自己没删过页）保存时会把磁盘上的删除复活，
+                        #   并把磁盘标志重置为 False ⇒ 连锁失效。
+                        disk_rw = bool(existing.get("full_rewrite"))
+                        mem_rw = bool(getattr(session, "full_rewrite", False))
+                        if disk_rw or mem_rw:
                             logger.debug("会话发生过删页，改为整体覆盖写: %s", path)
                             merge = False
+                            # 标志不因陈旧副本而被清掉（否则下一次保存又会把删除复活）
+                            payload["full_rewrite"] = True
                         else:
+                            # 陈旧副本（磁盘上的 updated_at 更新）不得覆盖更新的磁盘状态
+                            disk_updated = float(existing.get("updated_at") or 0.0)
+                            mine = float(getattr(session, "updated_at", 0.0) or 0.0)
+                            if mine < disk_updated:
+                                logger.warning(
+                                    "会话副本已过期（磁盘 updated_at=%.3f > 本副本 %.3f），"
+                                    "本次不写入: %s", disk_updated, mine, path)
+                                return
                             payload = _merge_payload(existing, payload)
                     config_io.atomic_write_json(path, payload)
             except config_io.ConfigLockTimeout as e:
