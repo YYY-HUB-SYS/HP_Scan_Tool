@@ -180,11 +180,28 @@ class DocumentSession:
     reverse_back: bool = True         # 双面：背面是否反转（默认反转）
     pages: list = field(default_factory=list)   # list[PageRef]
     #: 页面列表是否"以本对象为准"（= 发生过删页）。
-    #: SessionStore.save() 默认 merge=True（只进不退），会把磁盘上多出来的页**复活** ——
-    #: 一旦本会话删过页，就必须整体覆盖写。删页由 remove_pages_from 置位此标志。
+    #: SessionStore.save() 默认 merge=True，若不照顾删页意图会把磁盘上多出来的页
+    #: **复活** —— 一旦本会话删过页，落盘时必须**逐页尊重**这次删除。
+    #: 标志由 remove_pages_from 置位（并随 payload 持久化，
+    #: 所以"落盘 → 删页 → 再落盘""重启后删页"两条路都成立）。
     full_rewrite: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
+
+    #: 本副本的**基线快照**（**不写进文件**，随对象存活）：
+    #: 本副本"读到"的那份磁盘内容（页内容 + 标量）。
+    #:
+    #: 用途：落盘时做**三方合并**（base=基线 / mine=本副本 / theirs=磁盘当前），
+    #: 从而回答"磁盘相对**我**的基线改了什么" —— 这是判断"谁是陈旧副本"的
+    #: **唯一可靠依据**。
+    #:
+    #: ★ 为什么不能用 updated_at 时间戳：
+    #:   并发写时 updated_at 反映的是"谁先调用 add_pages"，**与内容谁更新无关**；
+    #:   且 Windows 上 time.time() 的分辨率约 15.6ms，比两个写者的间隔还粗
+    #:   ⇒ "比大小"的结论等同于掷骰子，后写者的整批数据会被静默丢弃。
+    #:
+    #: None = 不知道基线（手工构造的对象）⇒ 退化为"本副本优先"的旧行为。
+    base_snapshot: Optional[dict] = field(default=None, repr=False, compare=False)
 
     # ── 便捷属性 ──
 
@@ -278,8 +295,9 @@ class DocumentSession:
             return []
         self.pages = [p for p in self.pages
                       if not (p.job_id == jid and p.page_no >= cut)]
-        # ★ 这次删除必须能活过落盘：SessionStore.save() 默认 merge=True（只进不退），
-        #   会把磁盘上多出来的页**复活** ⇒ 置位 full_rewrite，让 save() 走整体覆盖。
+        # ★ 这次删除必须能活过落盘：SessionStore.save() 默认 merge=True，
+        #   若不照顾删页意图会把磁盘上多出来的页**复活** ⇒ 置位 full_rewrite，
+        #   save() 落盘时按"逐页三方合并"尊重这次删除（我删的页不留在磁盘上）。
         self.full_rewrite = True
         self.updated_at = time.time()
         if drop_cache:
@@ -368,7 +386,7 @@ class DocumentSession:
         if exposure is not None and not isinstance(exposure, dict):
             raise ValueError("exposure 必须是对象或 null")
         pages = [PageRef.from_dict(p) for p in (data.get("pages") or [])]
-        return cls(
+        session = cls(
             session_id=str(data.get("session_id", "")),
             mode=mode,
             state=state,
@@ -382,6 +400,10 @@ class DocumentSession:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             updated_at=float(data.get("updated_at", 0.0) or 0.0),
         )
+        # ★ 基线 = 刚读到的这份磁盘内容 ⇒ 之后落盘时能分辨
+        #   "磁盘相对我改了啥" 与 "我相对磁盘改了啥"（三方合并的 base）。
+        session.base_snapshot = _snapshot_of(data)
+        return session
 
 
 # ── 会话工厂 ────────────────────────────────────────────────────────────
@@ -399,7 +421,7 @@ def new_session(mode: str = "single", output_path: str = "", ext: str = "pdf",
     if mode not in MODES:
         raise ValueError(f"未知的会话模式: {mode!r}")
     now = time.time()
-    return DocumentSession(
+    session = DocumentSession(
         session_id=session_id or new_session_id(),
         mode=mode,
         state="scanning",
@@ -412,6 +434,9 @@ def new_session(mode: str = "single", output_path: str = "", ext: str = "pdf",
         created_at=now,
         updated_at=now,
     )
+    # ★ 新会话的基线 = "磁盘上还没有这个会话"（页为空、标量为默认值）
+    session.base_snapshot = _snapshot_of(session.to_dict())
+    return session
 
 
 def sessions_dir() -> str:
@@ -477,45 +502,124 @@ def _backup_corrupt(path: str) -> Optional[str]:
     return backup
 
 
+#: 参与三方合并的标量字段
+#: （pages / created_at / updated_at / full_rewrite 另有专门规则，不在此列）
+_MERGE_FIELDS = ("mode", "state", "output_path", "ext", "dpi",
+                 "exposure", "reverse_back")
+
+
 def _page_key(page: dict) -> tuple:
     """页的合并键：(job_id, page_no, side)"""
     return (page.get("job_id"), page.get("page_no"), page.get("side"))
 
 
-def _merge_payload(base: dict, incoming: dict) -> dict:
+def _snapshot_of(payload: dict) -> dict:
     """
-    合并两份会话内容（**只进不退**）。
+    把一份会话 payload 变成**基线快照**（页内容 + 标量）。
 
-    - 页：按 (job_id, page_no, side) 合并。同一页以**后来者**为准
-      （这样可以更新手动旋转 / 纠偏角 / 强制保存标记），
-      base 独有而 incoming 没有的页**保留** ⇒ 并发追加批次不丢更新。
-    - 标量字段：以 incoming 为准（后写者赢）。
-    - created_at：保留最早的（会话只创建一次）。
-    - updated_at：取两者的较大值（单调不减）。
+    基线 = "本副本读到的那份磁盘内容" ⇒ 落盘时可以做三方合并：
+    base=基线、mine=本副本、theirs=磁盘当前。
+
+    ★ 为什么不拿 updated_at 当基线：并发写下它只反映"谁先调用 add_pages"，
+      与"内容谁更新"无关（详见 DocumentSession.base_snapshot 的说明）。
     """
-    merged = dict(incoming)
+    pages: dict = {}
+    for p in (payload.get("pages") or []):
+        pages[_page_key(p)] = dict(p)
+    return {
+        "pages": pages,
+        "fields": {f: payload.get(f) for f in _MERGE_FIELDS},
+    }
+
+
+def _merge_payload(base: Optional[dict], mine: dict, disk: dict) -> dict:
+    """
+    **三方合并**：base=本副本的基线快照，mine=本副本内容，disk=磁盘当前内容。
+
+    ── 为什么不用"updated_at 比大小"（旧实现）────────────────────────
+    旧实现：`if mine.updated_at < disk.updated_at: return`（整批放弃写入）。
+      ① 并发写下 updated_at 反映的是"**谁先调用 add_pages**"，与"内容谁更新"
+         无关 ⇒ 后落盘的副本可能整批数据被静默丢弃（用户侧："这批页不见了"）；
+      ② Windows 上 time.time() 分辨率约 15.6ms，比两个写者的间隔还粗
+         ⇒ 比较结论等同于掷骰子（实测 40 轮里红 7 次）；
+      ③ 时间戳表达不了"磁盘删过页" ⇒ 陈旧副本会把删掉的页**复活**。
+
+    ── 页的判定（逐键三方）──────────────────────────────────────────
+      ① base 有、我有、磁盘没有 ⇒ **磁盘删过它** ⇒ 不复活（丢弃我的那份）
+      ② base 有、我没有、磁盘还有 ⇒ **我删过它** ⇒ 删除优先（丢弃磁盘那份）
+      ③ 其余 ⇒ 并发追加 ⇒ **两边都保留**
+         同一页的内容：相对 base 我没改过 ⇒ 用磁盘的（别把磁盘上更新的
+         纠偏角/手动旋转改回去）；我改过 ⇒ 用我的。
+
+    ── 标量的判定（同理）────────────────────────────────────────────
+      - 我相对 base 没改过 ⇒ 以**磁盘**为准（不覆盖更新的磁盘状态）
+      - 只有我改过 ⇒ 以我为准
+      - 双方都改过且不同 ⇒ 以磁盘为准（保守：宁可不动，也不覆盖磁盘上的新状态）
+
+    `base` 为 None（不知道基线，例如手工构造的对象）⇒ 退化为旧行为"本副本优先"。
+    """
+    merged = dict(mine)
+    base_pages = ((base or {}).get("pages") or {})
+    base_fields = ((base or {}).get("fields") or {})
+
+    mine_pages: dict = {}
+    for p in (mine.get("pages") or []):
+        mine_pages[_page_key(p)] = dict(p)
+    disk_pages: dict = {}
+    for p in (disk.get("pages") or []):
+        disk_pages[_page_key(p)] = dict(p)
+
+    # ① 磁盘删过、而我手里还留着的页 ⇒ 不复活
+    dropped = {k for k in base_pages
+               if k in mine_pages and k not in disk_pages}
+    # ② 我删过、而磁盘上还留着的页 ⇒ 删除优先
+    dropped |= {k for k in base_pages
+                if k not in mine_pages and k in disk_pages}
+
     pages: list = []
     index: dict = {}
-    for p in (base.get("pages") or []):
-        key = _page_key(p)
-        if key in index:
+    for key, p in disk_pages.items():
+        if key in dropped:
             continue
         index[key] = len(pages)
         pages.append(dict(p))
-    for p in (incoming.get("pages") or []):
-        key = _page_key(p)
+    for key, p in mine_pages.items():
+        if key in dropped:
+            continue
         if key in index:
+            base_p = base_pages.get(key)
+            disk_p = disk_pages[key]
+            # 我没改过这一页（内容与基线一致）⇒ 保留磁盘上的版本，
+            # 免得陈旧副本把磁盘上更新的纠偏角/手动旋转改回去
+            if base_p is not None and p == base_p and disk_p != base_p:
+                continue
             pages[index[key]] = dict(p)
         else:
             index[key] = len(pages)
             pages.append(dict(p))
     merged["pages"] = pages
-    merged["created_at"] = base.get("created_at", incoming.get("created_at", 0.0))
+
+    # 标量：三方合并（陈旧副本不得覆盖更新的磁盘状态）
+    for f in _MERGE_FIELDS:
+        if not base_fields:
+            continue                       # 没有基线 ⇒ 保持"本副本赢"
+        bv = base_fields.get(f)
+        mv = mine.get(f)
+        dv = disk.get(f)
+        if mv == bv:
+            merged[f] = dv                # 我没动过 ⇒ 磁盘的（更新的）值赢
+        elif dv == bv:
+            merged[f] = mv                # 只有我动过 ⇒ 我的值赢
+        else:
+            merged[f] = dv                # 双方都改过 ⇒ 以磁盘为准
+            logger.warning("会话字段 %s 双方都改过，以磁盘为准: %s", f, dv)
+
+    merged["created_at"] = disk.get("created_at", mine.get("created_at", 0.0))
     try:
-        merged["updated_at"] = max(float(base.get("updated_at") or 0.0),
-                                  float(incoming.get("updated_at") or 0.0))
+        merged["updated_at"] = max(float(disk.get("updated_at") or 0.0),
+                                   float(mine.get("updated_at") or 0.0))
     except (TypeError, ValueError):
-        merged["updated_at"] = incoming.get("updated_at", 0.0)
+        merged["updated_at"] = mine.get("updated_at", 0.0)
     return merged
 
 
@@ -683,11 +787,16 @@ class SessionStore:
         """
         保存会话（原子写 + 跨进程排他锁，锁住整个"读-改-写"事务）。
 
-        - `merge=True`（默认）：与磁盘上的现有内容**合并**（只进不退），
-          ⇒ 两个 store 并发写同一个会话时**不丢更新**。
-          代价：不能靠 save() 删掉某一页（需要删页时用 merge=False 整体覆盖）。
-          ⇒ 但 `remove_pages_from()` 会置位 `session.full_rewrite`，此时 save() **自动**
-            改走整体覆盖，调用方不需要自己记得传 merge=False。
+        - `merge=True`（默认）：与磁盘上的现有内容做**三方合并**
+          （base=本副本的基线 / mine=本副本 / theirs=磁盘当前）⇒
+            ① 并发追加的批次**不丢**（两个 store 同时保存 ⇒ 两批页都在）；
+            ② 磁盘上删掉的页**不会被陈旧副本复活**；
+            ③ 磁盘上更新的状态（本副本没动过的字段）**不会被覆盖**。
+          ⇒ "谁是陈旧副本"由**基线差异**判定，**不用 updated_at 时间戳**
+            （并发下时间戳与内容新旧无关，且 Windows 分辨率约 15.6ms ⇒ 掷骰子）。
+          ⇒ 删页：`remove_pages_from()` 置位的 `session.full_rewrite` 会被
+            **逐页尊重**（我删掉的页不会因为磁盘上还留着就被保留下来）；
+            直接手改 `session.pages` 而不走 remove_pages_from 仍不会删页。
         - `merge=False`：整体覆盖（丢弃磁盘上的旧内容）。
         - 原文件已损坏 ⇒ **跳过写入**（原文与备份都保留），绝不静默清空。
         - 写失败不抛异常（避免 GUI 因配置写失败而崩），只记 error 日志。
@@ -697,6 +806,7 @@ class SessionStore:
         path = self.path_for(session.session_id)
         os.makedirs(self.base_dir, exist_ok=True)
         payload = session.to_dict()
+        base_snapshot = getattr(session, "base_snapshot", None)
         with _write_lock(path):
             try:
                 with config_io.config_write_lock(path):
@@ -706,33 +816,24 @@ class SessionStore:
                                      path)
                         return
                     if merge and existing is not None:
-                        # ★ 会话删过页 ⇒ 必须整体覆盖。
-                        #   merge=True 会把磁盘上多出来的页"复活"（只进不退），
-                        #   使 remove_pages_from 的删除在落盘后**消失**。
-                        #   标志由 remove_pages_from 置位（并随 payload 持久化，
-                        #   所以"落盘 → 删页 → 再落盘""重启后删页"两条路都成立）。
-                        #
-                        # ★ 判定要**同时看内存与磁盘**两份标志：
-                        #   只看内存 ⇒ 陈旧副本（自己没删过页）保存时会把磁盘上的删除复活，
-                        #   并把磁盘标志重置为 False ⇒ 连锁失效。
+                        # ★ 三方合并（取代旧的"updated_at 比大小 + 整体覆盖"）。
+                        #   旧逻辑的毛病：
+                        #     ① updated_at 与"内容谁更新"无关 ⇒ 并发追加被整批丢弃；
+                        #     ② 磁盘上 full_rewrite=True 时走"整体覆盖"分支，
+                        #        "过期副本保护"根本没机会执行 ⇒ 陈旧副本把删掉的页复活。
                         disk_rw = bool(existing.get("full_rewrite"))
                         mem_rw = bool(getattr(session, "full_rewrite", False))
-                        if disk_rw or mem_rw:
-                            logger.debug("会话发生过删页，改为整体覆盖写: %s", path)
-                            merge = False
-                            # 标志不因陈旧副本而被清掉（否则下一次保存又会把删除复活）
-                            payload["full_rewrite"] = True
-                        else:
-                            # 陈旧副本（磁盘上的 updated_at 更新）不得覆盖更新的磁盘状态
-                            disk_updated = float(existing.get("updated_at") or 0.0)
-                            mine = float(getattr(session, "updated_at", 0.0) or 0.0)
-                            if mine < disk_updated:
-                                logger.warning(
-                                    "会话副本已过期（磁盘 updated_at=%.3f > 本副本 %.3f），"
-                                    "本次不写入: %s", disk_updated, mine, path)
-                                return
-                            payload = _merge_payload(existing, payload)
+                        payload = _merge_payload(base_snapshot, payload, existing)
+                        # 删页标志必须留在磁盘上：删过页的会话恒为 True，
+                        # 陈旧副本保存**不得**把它清零（否则删除被复活）
+                        payload["full_rewrite"] = bool(disk_rw or mem_rw)
+                        if mem_rw:
+                            logger.debug("会话发生过删页，已按删页意图逐页合并: %s", path)
                     config_io.atomic_write_json(path, payload)
+                    # ★ 落盘成功 ⇒ 推进基线：此后"我读到的磁盘内容"= 我写上去的内容
+                    #   （基线只含**我自己**的页 —— 别的写者追加的页不是我的，
+                    #     不能算成"我删过"，否则下一次保存会把它们误删）
+                    session.base_snapshot = _snapshot_of(session.to_dict())
             except config_io.ConfigLockTimeout as e:
                 logger.error("会话保存被跳过（拿不到跨进程锁，本次未写入）: %s（%s）",
                              path, e)

@@ -325,6 +325,149 @@ class TestConcurrentWrites:
         assert len(data["pages"]) == 2
 
 
+# ── 5b. 陈旧副本保护（基线三方合并）────────────────────────────────────
+
+
+class TestStaleCopyProtection:
+    """
+    「谁是陈旧副本」必须由**基线差异**判定，不能用 `updated_at` 时间戳。
+
+    ★ 背景（真实数据丢失缺陷，已实测复现）：
+      旧实现的 `SessionStore.save()` 用 `updated_at` 比大小判断"本副本是否过期"，
+      过期就**整批放弃写入**（记一条 warning，磁盘不动）。但并发写时：
+        - `updated_at` 只反映"**谁先调用 add_pages**"，与"内容谁更新"无关；
+        - Windows 上 `time.time()` 分辨率约 15.6ms，比两个写者的间隔还粗
+          ⇒ 比较结论等同于掷骰子（实测 40 轮里红 7 次）。
+      ⇒ 后落盘的副本整批页被静默丢弃（用户侧："这一批扫描的页不见了"），
+        且**没有任何报错**。
+
+    ★ 另一条（verifier 复审抓出、此前完全没修）：磁盘上 `full_rewrite=True` 时，
+      旧代码走的是"整体覆盖"分支 ⇒ "过期副本保护"根本没机会执行
+      ⇒ 陈旧副本把删掉的页**复活**。
+
+    ⇒ 新判据：**基线差异**（本副本读到的那份磁盘内容 vs 磁盘当前内容），
+      逐页 / 逐字段做三方合并（base / mine / theirs）。
+    """
+
+    def test_concurrent_append_keeps_both_batches(self, store):
+        """★ 回归护栏（确定性版）：后落盘的副本**不得**把自己的那批页丢掉。
+
+        ⚠️ 为什么显式固定两个副本的 `updated_at`：
+          真实缺陷的触发条件是"两个副本的 updated_at 不相等、且落盘顺序与改动
+          顺序相反"。Windows 上 `time.time()` 分辨率约 15.6ms ⇒ 真并发时两个
+          副本常常拿到**同一个**时间戳 ⇒ 缺陷随机复现（实测 40 轮红 7 次）。
+          这里把两个副本的 `updated_at` 显式固定成"本副本改动更早"，
+          **确定性地**构造出触发条件 —— 不靠 sleep、不靠运气、不靠时钟分辨率。
+        """
+        sid = "sess_concurrent_append"
+        base = new_session(mode="batch", session_id=sid)
+        store.save(base)
+        t0 = base.updated_at            # 磁盘上这份内容的 updated_at
+
+        a = SessionStore().load(sid)
+        b = SessionStore().load(sid)
+        assert a is not None and b is not None
+
+        a.add_pages("job_a", ["a1.jpg"])
+        b.add_pages("job_b", ["b1.jpg"])
+        a.updated_at = t0 + 1.0         # 本副本的改动更早
+        b.updated_at = t0 + 2.0         # 另一副本的改动更晚
+
+        store.save(b)                   # 改动更晚的副本**先**落盘
+        store.save(a)                   # 改动更早的副本**后**落盘（旧逻辑在此丢数据）
+
+        disk = SessionStore().load(sid)
+        assert disk is not None
+        assert disk.total_pages == 2, (
+            "并发追加的页被整批丢弃了：%s"
+            % [(p.job_id, p.page_no) for p in disk.pages])
+        assert set(disk.referenced_job_ids) == {"job_a", "job_b"}
+
+    def test_stale_copy_does_not_resurrect_deleted_pages(self, store):
+        """★ 回归护栏（verifier 抓出的 P2）：磁盘已删页 ⇒ 陈旧副本保存**不得**复活。
+
+        旧实现的分支结构：磁盘上 `full_rewrite=True` 时走"整体覆盖"分支，
+        "过期副本保护"根本没机会执行 ⇒ 陈旧副本把删掉的页原样写回去。
+        """
+        sid = "sess_stale_resurrect"
+        s = new_session(mode="batch", session_id=sid)
+        s.add_pages("jobA", ["p1.jpg", "p2.jpg", "p3.jpg"])
+        store.save(s)
+
+        snapshot = SessionStore().load(sid)     # 删页前的独立快照（陈旧副本）
+        deleter = SessionStore().load(sid)      # 另一个写者执行删页
+        deleter.remove_pages_from("jobA", 2)
+        store.save(deleter)                     # 磁盘: [1] + full_rewrite=True
+
+        store.save(snapshot)            # 陈旧副本保存 ⇒ 不得复活 2、3
+
+        disk = SessionStore().load(sid)
+        assert disk is not None
+        assert [p.page_no for p in disk.pages] == [1], (
+            "陈旧副本把已删的页复活了：%s" % [p.page_no for p in disk.pages])
+        assert disk.full_rewrite is True, "陈旧副本把删页标志清零了"
+
+    def test_deleting_writer_does_not_drop_concurrent_append(self, store):
+        """★ 回归护栏：删页的一方落盘时，另一方并发追加的页**不能**被一起丢掉。
+
+        旧实现：磁盘上 `full_rewrite=True` ⇒ "整体覆盖" ⇒ 追加方的页被丢弃
+        （又一次真实数据丢失）。新实现逐页三方合并 ⇒ 删除与追加**同时**成立。
+        """
+        sid = "sess_delete_vs_append"
+        s = new_session(mode="batch", session_id=sid)
+        s.add_pages("jobA", ["p1.jpg", "p2.jpg"])
+        store.save(s)
+
+        deleter = SessionStore().load(sid)
+        appender = SessionStore().load(sid)
+        appender.add_pages("jobB", ["b1.jpg"])    # 并发追加
+        deleter.remove_pages_from("jobA", 2)       # 并发删页
+
+        store.save(appender)   # 追加方先落盘（磁盘: jobA/1, jobA/2, jobB/1）
+        store.save(deleter)     # 删页方后落盘（旧实现整体覆盖 ⇒ jobB/1 被丢）
+
+        disk = SessionStore().load(sid)
+        assert disk is not None
+        assert len(disk.pages) == 2, (
+            "页数不对：%s" % [(p.job_id, p.page_no) for p in disk.pages])
+        assert set(disk.referenced_job_ids) == {"jobA", "jobB"}
+        assert not any(p.job_id == "jobA" and p.page_no == 2 for p in disk.pages), (
+            "已删的页被复活了：%s" % [(p.job_id, p.page_no) for p in disk.pages])
+
+    def test_stale_copy_keeps_newer_disk_state_and_still_lands_own_pages(self, store):
+        """★ 意图锁 + 回归护栏：陈旧副本**不得**覆盖磁盘上更新的状态，
+        但**自己**新追加的页必须落盘。
+
+        旧实现靠"整批放弃写入"侥幸保住了磁盘状态，代价是把自己的新页也一起
+        丢掉（这正是并发追加丢数据的根因）。新实现改为三方合并：
+          - 我相对基线没动过的字段 ⇒ 以磁盘为准（不覆盖更新的磁盘状态）
+          - 我新加的页 ⇒ 落盘（并发追加不丢）
+        """
+        sid = "sess_stale_state"
+        base = new_session(mode="batch", session_id=sid)
+        base.add_pages("jobA", ["a1.jpg"])
+        store.save(base)
+        t0 = base.updated_at
+
+        stale = SessionStore().load(sid)         # 陈旧副本的基线
+        fresh = SessionStore().load(sid)         # 另一个写者：把状态往前推
+        fresh.set_state("paused")
+        store.save(fresh)                        # 磁盘上状态 = paused
+
+        stale.add_pages("jobB", ["b1.jpg"])       # 陈旧副本自己也有新页
+        stale.updated_at = t0 - 1.0              # 显式固定：本副本比磁盘上的更新更旧
+        store.save(stale)
+
+        disk = SessionStore().load(sid)
+        assert disk is not None
+        assert disk.state == "paused", (
+            "陈旧副本把磁盘上更新的状态覆盖回了 %s" % disk.state)
+        assert disk.total_pages == 2, (
+            "陈旧副本自己新追加的页被整批丢弃了：%s"
+            % [(p.job_id, p.page_no) for p in disk.pages])
+        assert set(disk.referenced_job_ids) == {"jobA", "jobB"}
+
+
 # ── 6. job 去重 ─────────────────────────────────────────────────────────
 
 
