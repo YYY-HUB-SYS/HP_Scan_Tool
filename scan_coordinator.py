@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -53,6 +54,66 @@ SOURCE_MAP = {
 
 # 默认输出目录
 DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
+
+# ── 唯一命名（批次 5）───────────────────────────────────────────────
+# ★ 根因（本机实测，不是推断）：Windows **系统时钟粒度 15.625ms**
+#   （实测 `time.get_clock_info('time').resolution == 0.015625`）⇒
+#   相邻两次 `datetime.now().strftime("%f")` 的结果 **99.5% 完全相同**
+#   ⇒ 任何"把时间戳当唯一键"的地方都会撞名（上一轮把 `%Y%m%d_%H%M%S`
+#   改成 `%Y%m%d_%H%M%S_%f` **并不足以避免撞名**）。
+#   ⇒ 时间戳只负责**可读性**，唯一性一律由 uuid4 决定（**与时钟无关**）。
+
+#: job_id 里唯一成分的长度（uuid4 前 N 位十六进制）
+_JOB_ID_UNIQUE_LEN = 8
+#: 输出文件名里唯一成分的长度
+_OUTPUT_UNIQUE_LEN = 6
+
+
+def _unique_token(length: int) -> str:
+    """
+    生成唯一成分（uuid4 前 N 位十六进制）。
+
+    ★ uuid4 取自操作系统随机源（Windows: CryptGenRandom / getrandom），
+      **与时钟分辨率完全无关** ⇒ 同一时钟 tick 内连取 N 次也不会相同。
+    """
+    return uuid.uuid4().hex[:length]
+
+
+def new_job_id() -> str:
+    """
+    生成一个**真正唯一**的 job_id。
+
+    ★ 为什么 job_id 的唯一性是"产物级"问题：job_id **就是缓存目录名**
+      （`cache_manager._job_dir(job_id)`），页文件 `page_001.jpg` 写在里面
+      ⇒ 同一 tick 内起的两次扫描若拿到同一个 job_id ⇒ **共用一个缓存目录**
+      ⇒ 后一次 `write_page`（`open(path, "wb")`）把前一次的页**覆盖**
+      ⇒ **丢的是扫描产物**（用户侧："刚才那批页不见了"），**且零报错**。
+
+    格式：`<YYYYMMDD_HHMMSS>_<uuid4 前 8 位>`
+      · 与 `document_session.new_session_id()` 的 `sess_{ts}_{uuid4().hex[:8]}`
+        同一套仓库惯例（时间戳在前 = 可读性，唯一成分在后 = 唯一性）
+      · 时间戳部分只负责可读性；唯一性由 uuid4 决定 ⇒ **与时钟分辨率无关**
+      · 只含 ``[0-9a-f_]`` ⇒ 可安全用作目录名 / page_meta 的 key
+    """
+    return "%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
+                     _unique_token(_JOB_ID_UNIQUE_LEN))
+
+
+def new_output_name(ext: str) -> str:
+    """
+    生成默认输出文件名：``HP_Scan_<YYYYMMDD_HHMMSS>_<uuid4 前 6 位>.<ext>``。
+
+    ★ 同一 tick 的两次扫描算出同一个文件名 ⇒ 后者**静默覆盖**前者的产物。
+    ★ **不用**「撞名加 -1/-2 序号」：输出名已有**分组编号**规则
+      （`save_manager.build_output_name` 的 `{base}_{组号}_{组内号}`，
+      组号是 3 位零填充）⇒ 序号会与组号混淆。
+      改用 **6 位十六进制**后缀（形态与 3 位组号**不可能混淆**），
+      且它落在**基名**里 ⇒ `build_output_name` 的分组编号规则**一字未改**。
+    ★ 唯一性由 uuid4 决定 ⇒ **与时钟分辨率完全无关**。
+    """
+    return "HP_Scan_%s_%s.%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                 _unique_token(_OUTPUT_UNIQUE_LEN), ext)
+
 
 # ── 用户可见提示文案（F-3）──
 # ① 能力查询**失败/超时**（capabilities_known=False）⇒ 能力未知 ⇒ 按用户
@@ -734,7 +795,7 @@ class ScanCoordinator(QObject):
         color_mode = COLOR_MODE_MAP.get(color_mode_ui, "RGB24")
 
         if job_id is None:
-            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            job_id = new_job_id()
         cache_manager.register_job(job_id)
 
         # job 的保护生命周期（F-4）：
@@ -802,11 +863,11 @@ class ScanCoordinator(QObject):
                     self._report_page_meta_failure(job_id, 1)
                 self._note_skew(job_id, 1, angle, path, skew_streak, settings)
 
-            # 文件名精度到**毫秒**（原先只到秒 ⇒ 同一秒内完成的两批会互相覆盖）
-            # 与本文件 job_id 的口径（%Y%m%d_%H%M%S_%f）保持一致
-            output_path = os.path.join(
-                output_dir,
-                f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
+            # 文件名里带**唯一成分**（uuid4）⇒ 同一时钟 tick 内的两次扫描
+            # 不会算出同一个文件名 ⇒ 后者不再**静默覆盖**前者的产物。
+            # ★ 不用「撞名加 -1/-2 序号」：输出名已有分组编号规则
+            #   （build_output_name 的 {base}_{组号}_{组内号}）⇒ 序号会与组号混淆。
+            output_path = os.path.join(output_dir, new_output_name(ext))
 
             result = ScanResult(
                 job_id=job_id, ext=ext, page_count=len(cached_paths),
@@ -835,7 +896,7 @@ class ScanCoordinator(QObject):
 
     def start_scan(self, scanner, params: dict) -> str:
         """异步启动扫描，立即返回 job_id。结果通过信号通知。"""
-        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        job_id = new_job_id()
         cancel_event = threading.Event()
         with QMutexLocker(self._cancel_mutex):
             self._cancel_events[job_id] = cancel_event
