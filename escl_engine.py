@@ -9,7 +9,6 @@ eSCL (AirScan) 扫描引擎 — 合并版
 import copy
 import io
 import logging
-import struct
 import time
 import xml.etree.ElementTree as ET
 
@@ -29,7 +28,8 @@ __all__ = [
     "fetch_capabilities", "get_scanner_status", "probe_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
     "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
-    "REQUEST_FORMAT", "ScanJobCancelled",
+    "REQUEST_FORMAT", "ScanCancelled", "ScanJobCancelled", "ScanDeviceError",
+    "SCAN_TIMEOUT_MESSAGE", "FIRST_PAGE_TIMEOUT_MESSAGE",
 ]
 
 
@@ -39,55 +39,17 @@ def _strip_ns(el) -> str:
     return t.split("}")[-1] if "}" in t else t
 
 
-def _fix_jpeg_header(data: bytes) -> bytes:
-    """
-    修复 HP 扫描仪 JPEG 头部高度元数据错误。
-
-    部分 HP 机型在 JPEG SOF 段中报告的高度值与实际图像数据不匹配，
-    导致图像底部被裁剪或显示异常。此函数检测并修复该问题。
-
-    参考: node-hp-scan-to 的 JpegUtil 实现。
-    """
-    # 检查是否为 JPEG（SOI 标记 FF D8）
-    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
-        return data
-
-    # 从实际图像数据获取真实高度
-    try:
-        img = Image.open(io.BytesIO(data))
-        actual_height = img.height
-    except Exception:
-        return data
-
-    # 解析 JPEG 标记，查找 SOF0/SOF2 (Start of Frame)
-    pos = 2  # 跳过 SOI
-    while pos < len(data) - 1:
-        if data[pos] != 0xFF:
-            pos += 1
-            continue
-        marker = data[pos + 1]
-        # SOF0 (基线 DCT) 或 SOF2 (渐进 DCT)
-        if marker in (0xC0, 0xC2):
-            # SOF 段结构: FF C0 [长度2] [精度1] [高度2] [宽度2] ...
-            if pos + 9 < len(data):
-                header_height = struct.unpack(">H", data[pos + 5:pos + 7])[0]
-                if header_height != actual_height:
-                    # 修复高度值
-                    data = bytearray(data)
-                    data[pos + 5:pos + 7] = struct.pack(">H", actual_height)
-                    data = bytes(data)
-                    logging.debug(
-                        "JPEG 头部修复: 高度 %d → %d", header_height, actual_height
-                    )
-            break
-        # 跳过当前标记段
-        if pos + 3 < len(data):
-            seg_len = struct.unpack(">H", data[pos + 2:pos + 4])[0]
-            pos += 2 + seg_len
-        else:
-            break
-
-    return data
+# 注（2026-10-21）：这里**曾经**有一个 `_fix_jpeg_header()`
+#   （"修复 HP 机型 JPEG 头高度元数据错误"），已删除。
+#   原因：它比对的两边来自**同一处** SOF 段 —— PIL 的 `Image.height` 本身就是
+#   从 SOF 读出来的，而它自己解析的 `header_height` 也是 SOF 的高度字段 ⇒
+#   `header_height != actual_height` **恒为假** ⇒ 从未修补过任何字节。
+#   实测（2026-10-21）：把 SOF 高度改成 900 后 PIL 同样报 900，
+#   `_fix_jpeg_header(bad) == bad`（逐字节相同）。
+#   删除它同时消除了"eSCL 路径调它、listen 路径不调"的**隐性分叉**风险
+#   （今天两者行为等价只是因为它是 no-op；一旦有人把它"修好"就会分叉）。
+#   真正要修 HP 的高度元数据问题，需要一个**独立于 SOF** 的真值来源
+#   （例如按熵编码数据实际覆盖的 MCU 行数反推），不是这里的比较逻辑能做的。
 
 
 # ==================== 数据结构 ====================
@@ -186,7 +148,8 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     return listener.found
 
 
-def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0) -> Optional[str]:
+def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0,
+               extra_ports=()) -> Optional[str]:
     """
     探测指定 IP 的 eSCL 服务（休眠唤醒仅用于 ReadTimeout）。
 
@@ -206,6 +169,16 @@ def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0) -> Opt
       - `port=443` ⇒ 候选 `http://{ip}:443`、`https://{ip}:443`
         （与上面那组**不相同** ⇒ 不再是重复探测）；
       - 其它端口 P ⇒ 候选 `http://{ip}:P`、`https://{ip}:P`（非标端口设备可探）。
+
+    ★ `extra_ports`（2026-10-21 新增）：**并入同一轮**候选表的额外端口。
+      背景：CLI 原来分两轮探测 —— 第 1 轮 `probe_escl(ip)`（候选 http:80 +
+      https:443），第 2 轮 `probe_escl(ip, port=443)`（候选 http:443 +
+      https:443）。第 2 轮的 `https://{ip}:443` 与第 1 轮**整块重叠**
+      ⇒ 同一个 URL 被重复请求（实测 404 形态 2 次、拒连/超时形态 1 次），
+      每台不可达设备多 2~4 次 HTTP 尝试 + 最多约 10 秒延迟。
+      现在改成：额外要覆盖的端口用 `extra_ports` 传进来，**一次性**并入
+      候选表（已存在的 base 自动去重）⇒ 零重复，覆盖面不缩水。
+      默认 `extra_ports=()` ⇒ 既有调用方行为**逐字不变**。
     """
     try:
         port_no = int(port) if port is not None else None
@@ -218,6 +191,20 @@ def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0) -> Opt
     else:
         bases = [f"http://{ip}:{port_no}", f"https://{ip}:{port_no}"]
         wake_port = port_no
+
+    # 额外端口并入同一轮候选（去重 ⇒ 同一 base 不会被请求两次）
+    for extra in (extra_ports or ()):
+        try:
+            extra_no = int(extra)
+        except (TypeError, ValueError):
+            continue
+        if not extra_no:
+            continue
+        for scheme in ("http", "https"):
+            base = f"{scheme}://{ip}:{extra_no}"
+            if base not in bases:
+                bases.append(base)
+
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
 
     def _try():
@@ -596,9 +583,40 @@ _CONFLICT_MESSAGE = (
     "请在打印机面板上取消该任务，或稍后重试；若持续失败可重启打印机。"
 )
 
+# 超时文案：必须写清"设备没响应"这件事本身 + 用户能做的下一步。
+# 单独提成常量（而不是就地写在 raise 里）—— CLI 的错误呈现测试要断言
+# 的就是**生产环境真正抛出的这段文字**。
+SCAN_TIMEOUT_MESSAGE = (
+    "扫描超时：未能在限定时间内获取扫描数据。"
+    "请确认打印机已开机并完成初始化、面板上没有其它任务在执行；"
+    "若设备刚从休眠唤醒，请稍后重试。"
+)
+FIRST_PAGE_TIMEOUT_MESSAGE = (
+    "扫描超时：未能获取第一页数据。"
+    "请确认打印机已开机并完成初始化、面板上没有其它任务在执行；"
+    "若设备刚从休眠唤醒，请稍后重试。"
+)
 
-class ScanJobCancelled(RuntimeError):
+
+class ScanCancelled(RuntimeError):
+    """扫描被用户取消 —— eSCL / 监听 / WIA 三条引擎路径**统一**的取消信号。
+
+    协调器靠识别"取消"与"失败"的区别来决定发 `scan_cancelled` 还是
+    `scan_failed`：取消必须抛本异常（或其子类），不能当成普通失败。
+    """
+
+
+class ScanJobCancelled(ScanCancelled):
     """创建扫描任务期间被用户取消（409 退避等待过程中收到取消信号）。"""
+
+
+class ScanDeviceError(RuntimeError):
+    """设备 / 协议类**可操作**错误：消息里已写清用户下一步该做什么。
+
+    与"意外错误"（代码 bug、依赖缺失、网络环境异常等）区分开：
+    CLI 遇到本异常时把消息**原样**呈现给用户即可，不必再甩 traceback；
+    意外错误才保留 traceback 便于排障。
+    """
 
 
 def _sleep_cancellable(seconds, cancel_event=None, slice_seconds=0.2):
@@ -632,7 +650,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     """
     escl_url = scanner.escl_url
     if not escl_url:
-        raise RuntimeError("未配置 eSCL URL")
+        raise ScanDeviceError("未配置 eSCL URL")
 
     base = escl_url.rstrip("/")
     fmt = (output_format or "jpg").lower()
@@ -640,7 +658,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
         # ★ 不静默降级：不支持的输出格式必须显式报错。
         #   旧实现直接回退 ("image/jpeg", "jpg")，用户要的 bmp 无声消失，
         #   产出的是 .jpg 而用户以为拿到了 .bmp（历史缺陷 M-28）。
-        raise RuntimeError(
+        raise ScanDeviceError(
             f"不支持的输出格式: {output_format}（支持: "
             f"{'、'.join(sorted(REQUEST_FORMAT))}）")
     mime, ext = REQUEST_FORMAT[fmt]
@@ -674,17 +692,17 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
             if r.status_code != 409:
                 break
         else:
-            raise RuntimeError(_CONFLICT_MESSAGE)
+            raise ScanDeviceError(_CONFLICT_MESSAGE)
     if r.status_code == 503:
         # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
         # 阶段就返回 503（设备在等纸），不是扫描超时。给出用户可执行动作。
-        raise RuntimeError(
+        raise ScanDeviceError(
             "打印机当前不可用（HTTP 503）。"
             "若选择的是输稿器(ADF)扫描，请确认输稿器里已放入纸张后重试；"
             "否则请等待设备空闲后重试。"
         )
     if r.status_code not in (200, 201, 202):
-        raise RuntimeError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
+        raise ScanDeviceError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
 
     job_uri = r.headers.get("Location", "")
     if not job_uri:
@@ -698,7 +716,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
             pass
 
     if not job_uri:
-        raise RuntimeError("无法获取 ScanJob URI")
+        raise ScanDeviceError("无法获取 ScanJob URI")
 
     if not job_uri.startswith("http"):
         host = base.split("://")[1].split("/")[0]
@@ -747,12 +765,12 @@ def execute_scan(
             try:
                 r = session.get(nd_url, timeout=15)
                 if r.status_code == 200:
-                    return _fix_jpeg_header(r.content), ext
+                    return r.content, ext
                 elif r.status_code == 503:
                     pass  # 扫描进行中
                 elif r.status_code == 410:
                     # 扫描已完成但数据已过期（打印机已返回过200但客户端没取到）
-                    raise RuntimeError("扫描数据已过期（HTTP 410），请放纸后重试")
+                    raise ScanDeviceError("扫描数据已过期（HTTP 410），请放纸后重试")
             except requests.RequestException:
                 pass
 
@@ -762,7 +780,7 @@ def execute_scan(
                     return None, ext
                 time.sleep(0.1)
 
-        raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
+        raise ScanDeviceError(SCAN_TIMEOUT_MESSAGE)
     finally:
         # 清理打印机上的扫描任务（防止任务累积导致409冲突）
         if job_uri:
@@ -824,7 +842,7 @@ def execute_multipage_scan(
                 try:
                     r = session.get(nd_url, timeout=15)
                     if r.status_code == 200:
-                        pages.append((_fix_jpeg_header(r.content), ext))
+                        pages.append((r.content, ext))
                         if progress_callback:
                             progress_callback(len(pages), len(pages))
                         time.sleep(0.3)
@@ -846,7 +864,7 @@ def execute_multipage_scan(
                 # 单页超时
                 if pages:
                     break  # 已有页面，结束扫描
-                raise RuntimeError("扫描超时：未能获取第一页数据")
+                raise ScanDeviceError(FIRST_PAGE_TIMEOUT_MESSAGE)
 
         return pages
     finally:

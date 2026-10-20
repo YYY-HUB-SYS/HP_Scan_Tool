@@ -10,6 +10,14 @@ import os
 import tempfile
 from typing import Optional
 
+# 复用协议层的唯一事实源：
+#   - REQUEST_FORMAT：输出格式 → 落盘扩展名的**归一**规则（jpeg→jpg、tif→tiff）
+#     —— WIA 侧原来直接 lower() 回显，导致同一用户意图在两条引擎路径
+#        落盘的扩展名不同（.jpeg vs .jpg、.tif vs .tiff）。
+#   - ScanCancelled：三条引擎路径统一的取消信号（协调器靠它区分
+#     "取消"与"失败"，发 scan_cancelled 而不是 scan_failed）。
+from escl_engine import REQUEST_FORMAT, ScanCancelled
+
 __all__ = ["list_wia_scanners", "wia_scan", "try_wia_scan"]
 
 logger = logging.getLogger(__name__)
@@ -93,7 +101,30 @@ def _set_item_props(item, resolution: int, color_mode: int):
                 logger.debug("WIA 属性设置失败 [%s]: %s", prop.Name, e)
 
 
-def _save_wia_image(img, ext: str) -> bytes:
+def _normalize_ext(output_format: str) -> str:
+    """
+    把用户选的输出格式归一成落盘扩展名（与 eSCL 路径**同一张表**）。
+
+    REQUEST_FORMAT 是协议层的唯一事实源：jpeg→jpg、tif→tiff。
+    不在表里的格式（如 bmp —— WIA 自己的 GUID 表支持它）保持原样回显，
+    交给 WIA 的格式表决定。
+    """
+    fmt = (output_format or "jpg").lower()
+    return REQUEST_FORMAT.get(fmt, (None, fmt))[1]
+
+
+def _check_cancel(cancel_event):
+    """
+    取消信号检查点。已取消 ⇒ 抛 ScanCancelled。
+
+    与 eSCL 路径的 cancel_event 语义一致：取消抛异常（不是返回 None），
+    调用方据此发 scan_cancelled 而不是 scan_failed。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise ScanCancelled("WIA 扫描已取消")
+
+
+def _save_wia_image(img, ext: str, cancel_event=None) -> bytes:
     """
     将 WIA Image 对象转换为 bytes。
     先尝试 WIA ImageProcess 格式转换，再保存到临时文件，最后用 PIL 读取字节。
@@ -107,6 +138,9 @@ def _save_wia_image(img, ext: str) -> bytes:
     # 内部实际使用的格式：pdf → jpg（图片字节），其余原样
     save_ext = "jpg" if ext == "pdf" else ext
 
+    # 格式转换（ImageProcess）也可能耗时 —— 转换前先看取消信号
+    _check_cancel(cancel_event)
+
     # 尝试 WIA 格式转换
     try:
         if save_ext in _WIA_FORMAT_GUID:
@@ -115,6 +149,8 @@ def _save_wia_image(img, ext: str) -> bytes:
             img_proc.Filters.Add(img_proc.FilterInfos["Convert"].FilterID)
             img_proc.Filters[1].Properties["FormatID"].Value = _WIA_FORMAT_GUID[save_ext]
             img = img_proc.Apply(img)
+    except ScanCancelled:
+        raise
     except Exception:
         pass  # 格式转换失败，用原始 img 继续
 
@@ -122,8 +158,12 @@ def _save_wia_image(img, ext: str) -> bytes:
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{save_ext}")
     os.close(tmp_fd)
     try:
+        # 写盘是耗时点 —— 落笔前先看取消信号
+        _check_cancel(cancel_event)
         try:
             img.SaveFile(tmp_path)
+        except ScanCancelled:
+            raise
         except Exception:
             # 降级：用 PIL 从 FileData 读取
             from PIL import Image
@@ -137,7 +177,10 @@ def _save_wia_image(img, ext: str) -> bytes:
                 raise
 
         with open(tmp_path, "rb") as f:
-            return f.read()
+            out = f.read()
+        # 读盘完成后再查一次：避免取消后仍把数据交给上层
+        _check_cancel(cancel_event)
+        return out
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -148,28 +191,49 @@ def wia_scan(
     resolution: int = 300,
     color_mode: int = 1,  # 1=Color, 2=Grayscale, 4=BlackWhite
     output_format: str = "jpg",
+    cancel_event=None,
 ) -> tuple[bytes, str]:
     """
     使用 WIA 执行扫描，返回 (数据, 扩展名)。
     与 eSCL execute_scan 返回类型对齐。
+
+    cancel_event：可选的取消信号（threading.Event），语义与 eSCL 路径一致：
+      - 取消时抛 ScanCancelled（**不是**返回 None）—— 调用方据此区分
+        "用户取消"与"扫描失败"（协调器发 scan_cancelled 而不是 scan_failed）；
+      - 检查点覆盖：连接设备前、每个扫描项前后、COM Transfer() 返回后、
+        格式转换前、写盘前、读盘后。
+        COM 的 Transfer() 本身是阻塞调用，**无法**在调用中途打断，
+        只能在它返回后立即响应取消（这是 WIA COM 的固有限制）。
     """
-    ext = output_format.lower()
+    ext = _normalize_ext(output_format)
+    _check_cancel(cancel_event)
     device = _connect_device(device_id)
 
     errors = []
     for item_idx, item in enumerate(device.Items):
+        # 每个扫描项开始前检查取消（跳过剩余项）
+        _check_cancel(cancel_event)
         _set_item_props(item, resolution, color_mode)
+        _check_cancel(cancel_event)
 
         try:
             img = item.Transfer()
+        except ScanCancelled:
+            raise
         except Exception as e:
             errors.append(f"Item {item_idx} Transfer 失败: {e}")
             logger.debug("WIA Item %d Transfer 失败: %s", item_idx, e)
             continue
 
+        # Transfer() 返回后立刻查取消：用户在这段等待里点了取消
+        _check_cancel(cancel_event)
+
         try:
-            data = _save_wia_image(img, ext)
+            data = _save_wia_image(img, ext, cancel_event=cancel_event)
             return data, ext
+        except ScanCancelled:
+            # 取消不是"这一项失败"——必须往上抛，不能吞成 errors
+            raise
         except Exception as e:
             errors.append(f"Item {item_idx} 保存失败: {e}")
             logger.debug("WIA Item %d 保存失败: %s", item_idx, e)
@@ -184,10 +248,14 @@ def try_wia_scan(
     resolution: int = 300,
     color_mode_name: str = "Color",
     output_format: str = "jpg",
+    cancel_event=None,
 ) -> Optional[tuple[bytes, str]]:
     """
     尝试用 WIA 扫描（使用第一个可用扫描仪）。
     成功返回 (bytes, ext)，失败返回 None。
+
+    cancel_event：取消信号。**取消时抛 ScanCancelled**（不是返回 None）——
+    取消与失败必须能区分开，否则调用方会把用户的取消动作报成扫描错误。
     """
     scanners = list_wia_scanners()
     if not scanners:
@@ -204,7 +272,11 @@ def try_wia_scan(
             resolution=resolution,
             color_mode=cm,
             output_format=output_format,
+            cancel_event=cancel_event,
         )
+    except ScanCancelled:
+        # 取消不是失败：原样往上抛
+        raise
     except Exception as e:
         logger.debug("WIA 扫描失败 [%s]: %s", scanner.get("name", "?"), e)
         return None

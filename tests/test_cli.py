@@ -57,9 +57,11 @@ class TestScanArgs:
             parser.parse_args(["scan"])
 
     def test_invalid_format(self):
+        # bmp：协议层 REQUEST_FORMAT 无此键 ⇒ 必须被 argparse 显式拒绝
+        # （tiff/jpeg/tif 是协议层支持的格式，已于 F-6 放开，见 test_cli_format_choices.py）
         parser = cli._build_parser()
         with pytest.raises(SystemExit):
-            parser.parse_args(["scan", "--ip", "1.2.3.4", "--format", "tiff"])
+            parser.parse_args(["scan", "--ip", "1.2.3.4", "--format", "bmp"])
 
     def test_invalid_color(self):
         parser = cli._build_parser()

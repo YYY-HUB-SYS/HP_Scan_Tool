@@ -6,10 +6,12 @@ CLI 命令行模式 — argparse 子命令入口
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
 import tempfile
+import traceback
 from datetime import datetime
 
 # 确保能导入同目录模块
@@ -18,10 +20,53 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
     get_scanner_status, execute_scan, ScannerInfo,
+    REQUEST_FORMAT, ScanCancelled, ScanDeviceError,
 )
 from wsd_engine import discover_all_scanners
 import history_manager
 import save_manager
+
+logger = logging.getLogger(__name__)
+
+# 设备 / 协议类"可操作"错误的特征词。
+#
+# 协议层（escl_engine）对这些失败已经写好了**用户下一步该做什么**
+# （409 → 去打印机面板取消任务 / 等 15-20 分钟；503 → 输稿器放纸；
+#  超时 → 确认设备已开机）。CLI 必须把这段话**原样**呈现给用户，
+# 而不是只甩一段 Python traceback。
+#
+# 判定顺序：① 异常类型是 ScanDeviceError（协议层显式标记的设备类错误）
+#           ② 消息命中下面的特征词（兼容协议层仍是普通 RuntimeError 的老路径）
+# 两者都不命中 ⇒ 视为"意外错误"，保留 traceback 便于排障。
+_ACTIONABLE_ERROR_MARKERS = (
+    "HTTP 409", "HTTP 503", "HTTP 410",
+    "创建扫描任务失败", "无法获取 ScanJob URI", "不支持的输出格式",
+    "扫描超时", "打印机", "输稿器", "eSCL", "ScanJob",
+)
+
+
+def _is_actionable_device_error(exc: BaseException) -> bool:
+    """判断异常是不是"设备/协议类可操作错误"（消息里已写清用户下一步）。"""
+    if isinstance(exc, ScanDeviceError):
+        return True
+    msg = str(exc)
+    return any(marker in msg for marker in _ACTIONABLE_ERROR_MARKERS)
+
+
+def _report_scan_error(exc: BaseException) -> None:
+    """
+    把扫描失败呈现给用户（只写 stderr，绝不写 stdout）。
+
+    - 设备/协议类可操作错误 ⇒ 原样打印消息（含可执行指引），不甩 traceback；
+    - 其它意外错误 ⇒ 打印消息 **加** 完整 traceback（便于排障）。
+    - 两种情况都记一份完整 traceback 到日志（可操作错误也不丢排障线索）。
+    """
+    print(f"错误: {exc}", file=sys.stderr)
+    if _is_actionable_device_error(exc):
+        logger.exception("扫描失败（设备/协议类可操作错误）")
+    else:
+        logger.exception("扫描失败（意外错误）")
+        traceback.print_exc(file=sys.stderr)
 
 
 def _write_pdf_via_save_manager(data: bytes, fpath: str,
@@ -59,11 +104,17 @@ def cmd_scan(args):
     source = args.source
     output = args.output or os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
 
-    # 探测 eSCL
-    print(f"正在探测 {ip} 的 eSCL 服务...")
-    escl_url = probe_escl(ip, timeout=5.0)
-    if not escl_url:
-        escl_url = probe_escl(ip, port=443, timeout=5.0)
+    # 探测 eSCL —— **单轮**探测，候选 = 默认(http:80 / https:443) + http:443。
+    #
+    # 改造前分两轮：第 1 轮 probe_escl(ip)、第 2 轮 probe_escl(ip, port=443)。
+    # 第 2 轮的候选里 `https://{ip}:443` 与第 1 轮**整块重叠** ⇒ 同一个 URL
+    # 被重复请求（实测 404 形态 2 次、拒连/超时形态 1 次）⇒ 每台不可达设备
+    # 多 2~4 次 HTTP 尝试 + 最多约 10 秒延迟（而"不可达"恰恰是用户最需要
+    # 快速拿到提示的场景）。
+    # 现在用 extra_ports 把 http:443 **并入同一轮**候选表（自动去重）
+    # ⇒ 零重复请求，覆盖面不缩水（http:443 设备仍能被探到）。
+    print(f"正在探测 {ip} 的 eSCL 服务...", file=sys.stderr)
+    escl_url = probe_escl(ip, timeout=5.0, extra_ports=(443,))
     if not escl_url:
         print(f"错误: 无法在 {ip} 上找到 eSCL 服务", file=sys.stderr)
         return 1
@@ -80,16 +131,32 @@ def cmd_scan(args):
         color_mode = "BlackAndWhite1"
 
     # 执行扫描
-    print(f"正在扫描 (DPI={resolution}, 格式={fmt}, 来源={source})...")
-    data, ext = execute_scan(
-        scanner=scanner,
-        resolution=resolution,
-        color_mode=color_mode,
-        output_format=fmt,
-        source=source,
-        duplex=args.duplex,
-        timeout=90.0,
-    )
+    # 进度提示走 stderr：stdout 留给结果（失败时 stdout 必须为空，
+    # 否则消费方（如 `hp_scan scan ... > out`）会拿到半截输出）。
+    print(f"正在扫描 (DPI={resolution}, 格式={fmt}, 来源={source})...", file=sys.stderr)
+    try:
+        data, ext = execute_scan(
+            scanner=scanner,
+            resolution=resolution,
+            color_mode=color_mode,
+            output_format=fmt,
+            source=source,
+            duplex=args.duplex,
+            timeout=90.0,
+        )
+    except ScanCancelled:
+        print("错误: 扫描已取消", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # F-1：协议层写好的可执行指引必须**原样**呈现给用户，
+        # 不能只给一段 Python traceback（traceback 里全是本地绝对路径，
+        # 用户看不懂也不知道下一步该干什么）。
+        _report_scan_error(e)
+        return 1
+
+    if not data:
+        print("错误: 扫描未返回数据（可能被取消）", file=sys.stderr)
+        return 1
 
     # 保存文件
     os.makedirs(output, exist_ok=True)
@@ -203,9 +270,8 @@ def cmd_status(args):
     ip = args.ip
     fmt = args.format
 
-    escl_url = probe_escl(ip, timeout=5.0)
-    if not escl_url:
-        escl_url = probe_escl(ip, port=443, timeout=5.0)
+    # 探测 eSCL —— 单轮探测（与 cmd_scan 同一份候选表，见该处注释）
+    escl_url = probe_escl(ip, timeout=5.0, extra_ports=(443,))
 
     if not escl_url:
         if fmt == "json":
@@ -273,9 +339,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan = subparsers.add_parser("scan", help="执行扫描")
     p_scan.add_argument("--ip", required=True, help="打印机 IP 地址")
     p_scan.add_argument("--resolution", type=int, default=300, help="分辨率 DPI (默认 300)")
-    p_scan.add_argument("--format", default="jpg", choices=["jpg", "png", "pdf"],
-                        help="输出格式 (默认 jpg)。不支持的格式会直接报错，"
-                             "不会静默降级成别的格式")
+    # --format 的允许值 = 协议层 REQUEST_FORMAT 的键集合（唯一事实源，
+    # 不会与协议层漂移）：jpg / jpeg / png / tiff / tif / pdf。
+    #   - jpeg / tif / tiff 之前 CLI 不暴露（协议层与 GUI 都支持）⇒ 反向缺口；
+    #   - bmp **不在** REQUEST_FORMAT 里（协议层不支持）⇒ 仍被显式拒绝，
+    #     不会静默降级成别的格式。
+    p_scan.add_argument("--format", default="jpg", choices=sorted(REQUEST_FORMAT),
+                        help="输出格式 (默认 jpg)，可选: "
+                             f"{'、'.join(sorted(REQUEST_FORMAT))}。"
+                             "不支持的格式会直接报错，不会静默降级成别的格式")
     p_scan.add_argument("--color", default="color", choices=["color", "gray", "bw"],
                         help="颜色模式 (默认 color)")
     p_scan.add_argument("--source", default="Platen", choices=["Platen", "Feeder"],
