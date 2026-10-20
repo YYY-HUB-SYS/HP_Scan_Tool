@@ -307,7 +307,10 @@ def test_overlapping_saves_keep_both_products(qapp, tmp_path, isolated_cache,
     colors = {}
     for name in files:
         with Image.open(out_dir / name) as im:
-            colors[name] = im.convert("RGB").getpixel((5, 5))
+            # ★ 新契约：图片产物也过 A4 归一 ⇒ 内容**居中**在画布里
+            #   （取画布中心的像素；画布角是 A4 白边，永远是白的）
+            colors[name] = im.convert("RGB").getpixel(
+                (im.width // 2, im.height // 2))
     reds = [c for c in colors.values() if c[0] > 200 and c[2] < 60]
     blues = [c for c in colors.values() if c[2] > 200 and c[0] < 60]
     assert len(reds) == 1 and len(blues) == 1, \

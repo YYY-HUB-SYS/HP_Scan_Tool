@@ -78,6 +78,29 @@ def _histogram_range(path):
     return nonzero[-1] - nonzero[0]
 
 
+# ── A4 画布工具（图片产物现在也过 `_a4_canvas`）────────────────────────
+#
+# ★ 新契约：图片产物与 PDF 产物几何完全一致 ⇒ 产物恒为 A4 画布
+#   （2480×3507@300dpi）。"原图像素""角像素"这类断言必须改成
+#   **画布里的内容区**的断言（意图保留：曝光作用在内容上、没作用在白边上）。
+
+A4_W, A4_H = 2480, 3507
+
+
+def _content_region(img, content_size):
+    """A4 画布里居中的内容矩形（内容小于画布时是 1:1 原尺寸）"""
+    ox = (img.width - content_size[0]) // 2
+    oy = (img.height - content_size[1]) // 2
+    return img.crop((ox, oy, ox + content_size[0], oy + content_size[1]))
+
+
+def _content_histogram_range(img, content_size):
+    """**内容区**的灰度动态范围（排除 A4 白边 ⇒ 反映内容本身的对比度）"""
+    hist = _content_region(img, content_size).convert("L").histogram()
+    nonzero = [i for i, count in enumerate(hist) if count]
+    return nonzero[-1] - nonzero[0]
+
+
 # ────────── 落盘侧 ──────────
 
 class TestSaveSingleExposure:
@@ -96,8 +119,11 @@ class TestSaveSingleExposure:
             a_rgb, b_rgb = a.convert("RGB"), b.convert("RGB")
             diff = ImageChops.difference(a_rgb, b_rgb)
             assert diff.getbbox() is not None, "加了曝光但产物像素没有任何变化"
-            assert b_rgb.getpixel((10, 10))[0] > a_rgb.getpixel((10, 10))[0], \
-                "brightness=50 之后产物没有变亮"
+            # ★ 新契约：产物是 A4 画布 ⇒ 取**内容区**里的像素（不是画布角）
+            a_px = _content_region(a_rgb, (120, 160)).getpixel((10, 10))
+            b_px = _content_region(b_rgb, (120, 160)).getpixel((10, 10))
+            assert b_px[0] > a_px[0], \
+                f"brightness=50 之后产物没有变亮（{a_px} → {b_px}）"
 
     def test_exposure_none_is_byte_identical(self, tmp_path, tmp_config_dir):
         """exposure=None ⇒ 与不加曝光逐字节相同（向后兼容，老测试一条不退化）。"""
@@ -121,13 +147,18 @@ class TestSaveSingleExposure:
         save_manager.save_single(gray_src, "png", str(plain))
         save_manager.save_single(gray_src, "png", str(auto), exposure={"mode": "auto"})
 
-        assert _histogram_range(str(auto)) > _histogram_range(str(plain)), \
-            "auto 去灰底之后动态范围没有变大"
-
+        # ★ 新契约：产物是 A4 画布 ⇒ 对比度必须只看**内容区**
+        #   （否则 A4 白边会把动态范围整个吃掉，断言失去意义）
         with Image.open(plain) as p, Image.open(auto) as a:
+            plain_range = _content_histogram_range(p, (400, 300))
+            auto_range = _content_histogram_range(a, (400, 300))
             # 灰底必须被提亮（这才是 auto 的实际作用）
-            assert a.convert("RGB").getpixel((10, 10))[0] > \
-                p.convert("RGB").getpixel((10, 10))[0], "auto 之后灰底没有被提亮"
+            p_px = _content_region(p.convert("RGB"), (400, 300)).getpixel((10, 10))
+            a_px = _content_region(a.convert("RGB"), (400, 300)).getpixel((10, 10))
+        assert auto_range > plain_range, \
+            f"auto 去灰底之后动态范围没有变大（{plain_range} → {auto_range}）"
+        assert a_px[0] > p_px[0], \
+            f"auto 之后灰底没有被提亮（{p_px} → {a_px}）"
 
     def test_auto_ignores_manual_params(self, tmp_path, tmp_config_dir, gray_src):
         """auto 与手动互斥：mode=auto 时忽略 brightness 等手动参数。"""
@@ -246,8 +277,11 @@ class TestSavePagesExposure:
         assert len(plain_files) == 2 and len(bright_files) == 2
         for pf, bf in zip(sorted(plain_files), sorted(bright_files)):
             with Image.open(tmp_path / pf) as a, Image.open(tmp_path / bf) as b:
-                assert b.convert("RGB").getpixel((5, 5))[0] > \
-                    a.convert("RGB").getpixel((5, 5))[0]
+                # ★ 新契约：产物是 A4 画布 ⇒ 取**内容区**里的像素
+                a_px = _content_region(a.convert("RGB"), (60, 60)).getpixel((5, 5))
+                b_px = _content_region(b.convert("RGB"), (60, 60)).getpixel((5, 5))
+                assert b_px[0] > a_px[0], \
+                    f"曝光没有作用到产物内容上（{a_px} → {b_px}）"
 
 
 # ────────── GUI 侧 ──────────
@@ -754,5 +788,8 @@ class TestDirectSaveExposure:
         out = tmp_path / "direct_none.png"
         assert out.exists(), f"直接保存没产出文件：{os.listdir(tmp_path)}"
         with Image.open(src) as a, Image.open(out) as b:
-            assert a.convert("RGB").tobytes() == b.convert("RGB").tobytes(), \
-                "无曝光时产物必须与原图逐像素一致"
+            # ★ 新契约：产物是 A4 画布 ⇒ 断言改成「**内容区**与原图逐像素一致」
+            #   （PNG 无损 ⇒ 可以逐像素比）
+            region = _content_region(b.convert("RGB"), a.size)
+            assert region.tobytes() == a.convert("RGB").tobytes(), \
+                "无曝光时产物内容必须与原图逐像素一致"

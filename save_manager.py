@@ -14,12 +14,26 @@ PDF 路径（批次 2）：
 - 单页与多页 PDF 共用 _a4_canvas，页面尺寸必然一致
 - 最终 PDF 先写同目录临时文件、成功后再 os.replace（不留半截文件）
 
+图片路径（与 PDF 完全对齐）：
+- ★ **jpg / png / tiff 产物一律过 `_a4_canvas`** ⇒ 同一页的**图片**与
+  **PDF** 产物几何完全一致（A4 画布 2480×3507@300dpi）。
+  旧口径是"图片保留原始幅面"（2550×3508）⇒ 两者几何不一致，已废止。
+- 归一是**等比缩放 + 居中 + 白边**，**绝不裁切**（600 DPI 源图整体缩进来）
+- 幂等：已经是 A4 尺寸的图走 `_a4_canvas` 的**提前返回分支** ⇒ 逐字节不变
+  （jpg 快路径据此保留：源页已是 A4 画布 ⇒ 直接复制原始字节）
+
 自动纠偏（批次 4）：
-- 顺序固定为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**
+- 顺序固定为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**（A4 归一永远最后）
 - 纠偏角来自页元数据（page_meta.deskew_angle，扫描时由 skew_detect 测出）
 - 阈值：|angle| >= deskew_apply_threshold（默认 0.5°）才施加；
   角度为 0 时**一个像素都不动** ⇒ 直页产物与改造前逐字节相同
 - skew_detect 是**静态 import** ⇒ PyInstaller 依赖分析会自动收录它
+
+会话收尾（防「幽灵会话」）：
+- 顺序固定为 **先把会话状态写成 completed（并回读验证）→ 再清缓存**
+  ⇒ 任何时刻磁盘上都不会出现"会话还开着、页却已经被删"的死路径会话
+- 状态写失败 ⇒ **不报告 completed**：会话留在可重试状态、缓存保留，
+  并在返回值上如实上报（status_write_failed / status_write_error）
 """
 
 import io
@@ -37,6 +51,7 @@ from PIL import Image, UnidentifiedImageError
 import cache_manager
 import config_io
 import doc_merge
+import document_session
 import history_manager
 import page_meta
 import skew_detect
@@ -65,6 +80,10 @@ __all__ = [
 PDF_PEAK_FACTOR = 2.1
 # PDF 合成的内存峰值门禁（与批次 4 门禁一致）：1.5GB
 PDF_PEAK_LIMIT_BYTES = int(1.5 * 1024 ** 3)
+
+#: 落盘用的默认 DPI —— **PDF 与图片产物共用** ⇒ 两者的页面几何必然一致
+#: （图片产物现在也过 `_a4_canvas`：2480×3507@300dpi，与 PDF 产物同尺寸）
+DEFAULT_DPI = 300
 
 # ── 自动纠偏策略（批次 4）────────────────────────────────────────────────
 # 这四个键写进 scan_config.json（scan_coordinator 用 load_config/save_config 落盘）。
@@ -302,7 +321,10 @@ class SaveResult(list):
     """
 
     def __init__(self, saved_files=(), failed_pages: int = 0,
-                 skipped_pages=None, warnings=None, saved_page_count: int = 0):
+                 skipped_pages=None, warnings=None, saved_page_count: int = 0,
+                 status_write_failed: bool = False,
+                 status_write_error: str = "",
+                 session_state: str = ""):
         super().__init__(saved_files)
         self.failed_pages = int(failed_pages)
         # 被跳过的页在 page_specs 里的下标（0 基）
@@ -310,6 +332,14 @@ class SaveResult(list):
         self.warnings = list(warnings or [])
         # 实际写出的**页数**（PDF 一个文件多页；图片一个文件一页）
         self.saved_page_count = int(saved_page_count) if saved_page_count else len(self)
+        # ── 会话状态落盘的上报（纯数据，GUI 侧直接读这两个字段）──
+        # True ⇒ 会话状态**没能**写成 completed ⇒ 调用方**不得**报告
+        # "已完成"，会话应留在可重试状态（缓存已保留）。
+        self.status_write_failed = bool(status_write_failed)
+        # 失败原因（可展示给用户 / 记日志）
+        self.status_write_error = str(status_write_error or "")
+        # 会话落盘后的状态（"completed" / "paused" / "scanning" / ...）
+        self.session_state = str(session_state or "")
 
     @property
     def ok(self) -> bool:
@@ -532,6 +562,16 @@ def _expose_and_rotate(img: Image.Image, rotation: int, exposure,
     return img
 
 
+def _a4_size(dpi: int = 300) -> tuple[int, int]:
+    """
+    A4 画布的像素尺寸（按 dpi 算）：210mm×297mm ⇒ 300dpi 时 **2480×3507**。
+
+    ★ **唯一真源**：`_a4_canvas`（画布）与「已经是 A4 尺寸」的判定
+      （`_is_intact_a4_jpeg` 快路径）都用它 ⇒ 两边**不可能**算出不同的尺寸。
+    """
+    return int(210 / 25.4 * dpi), int(297 / 25.4 * dpi)
+
+
 def _a4_canvas(img, dpi: int = 300) -> Image.Image:
     """
     把图片居中放到 A4 画布上。
@@ -545,7 +585,8 @@ def _a4_canvas(img, dpi: int = 300) -> Image.Image:
 
     返回值**可能是入参本身**（入参已是 RGB 且尺寸恰好等于 A4 画布时），
     调用方必须用 `canvas is not img` 判断所有权，不能无条件 close() 入参。
-    单页 PDF 与多页 PDF 共用这一个函数 —— 两者页面尺寸一致由此保证。
+    ★ **图片产物与 PDF 产物共用这一个函数** ⇒ 两者页面尺寸必然一致
+      （单页 PDF / 多页 PDF / jpg / png / tiff 全部同一条归一路径）。
 
     ★ **返回值必须是「可继续使用」的图像**（N1）：
     旧实现把"即将返回的那张图"也放进了 finally 的 close() 里 ——
@@ -555,8 +596,7 @@ def _a4_canvas(img, dpi: int = 300) -> Image.Image:
     现在：**尺寸精确匹配的分支提前 return，不经过 close 逻辑**；
     只有"新建画布"那条路径才 close 中间产物（像素已复制进画布，close 无害）。
     """
-    a4_w = int(210 / 25.4 * dpi)
-    a4_h = int(297 / 25.4 * dpi)
+    a4_w, a4_h = _a4_size(dpi)
     w, h = img.size
     rgb = img if img.mode == "RGB" else img.convert("RGB")
     if w == a4_w and h == a4_h:
@@ -606,20 +646,56 @@ def _ensure_parent_dir(path):
         os.makedirs(parent, exist_ok=True)
 
 
+def _is_intact_a4_jpeg(path: str, dpi: int = 300) -> bool:
+    """
+    缓存页是不是「**完整**的 JPEG 且尺寸**恰好等于 A4 画布**」。
+
+    ★ 只有这种页能走「原字节复制」快路径：
+      `_a4_canvas` 对尺寸精确匹配的图**提前返回**（像素一个都不动）
+      ⇒ 复制原始字节 **==** 归一之后的产物（**逐字节一致**）。
+    ★ 尺寸不符的页**必须**走解码路径：否则产物不是 A4 画布
+      ⇒ 图片与 PDF 的几何就不一致了（这正是本次改动要消灭的差异）。
+    ★ 只读文件头（`Image.open` 不解码像素）⇒ 代价恒定，几百页也只是毫秒级。
+    """
+    if not _is_intact_jpeg(path):
+        return False
+    try:
+        with Image.open(path) as im:
+            return im.size == _a4_size(dpi)
+    except (OSError, UnidentifiedImageError, ValueError):
+        return False
+
+
 def _write_image(img, path, ext, dpi=300):
-    """按扩展名落盘一张图片"""
+    """
+    按扩展名落盘一张图片。
+
+    ★ **图片产物一律过 `_a4_canvas`**（与 PDF 产物完全一致的几何）：
+      等比缩放 + 居中 + 白边，**不裁切**。
+      调用方传进来的 img 已经完成「曝光 → 手动旋转 → 自动纠偏」
+      ⇒ **A4 归一永远在最后一步**（顺序是硬约定）。
+    ★ 所有权：`_a4_canvas` 可能**返回入参本身** ⇒ 只有
+      `canvas is not img` 时才 close 画布（否则会把调用方的图关掉）。
+    """
     # 输出目录可能还不存在（PDF 分支会建，图片分支原先不会 ⇒ 目录缺失时整批失败）
     _ensure_parent_dir(path)
     if ext == "pdf":
         _save_a4_pdf(img, path, dpi=dpi)
-    elif ext in ("jpg", "jpeg"):
-        img.convert("RGB").save(path, "JPEG", quality=95)
-    elif ext == "png":
-        img.save(path, "PNG")
-    elif ext in ("tiff", "tif"):
-        img.save(path, "TIFF")
-    else:
-        img.convert("RGB").save(path, "JPEG", quality=95)
+        return
+    canvas = _a4_canvas(img, dpi)
+    try:
+        if ext in ("jpg", "jpeg"):
+            # 画布恒为 RGB（_a4_canvas 内部已转）⇒ 不需要再 convert
+            canvas.save(path, "JPEG", quality=95)
+        elif ext == "png":
+            canvas.save(path, "PNG")
+        elif ext in ("tiff", "tif"):
+            canvas.save(path, "TIFF")
+        else:
+            canvas.save(path, "JPEG", quality=95)
+    finally:
+        if canvas is not img:
+            canvas.close()
 
 
 def _extract_pdf_image(cache_file: str, rotation: int = 0) -> Image.Image:
@@ -841,7 +917,7 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
                                   deskew_angle=deskew_angle,
                                   deskew_threshold=deskew_threshold)
         try:
-            _write_image(img, final, ext)
+            _write_image(img, final, ext, dpi=DEFAULT_DPI)
         finally:
             img.close()
 
@@ -949,19 +1025,22 @@ def save_pages(job_id: str, ext: str, output_path: str,
                     fpath = build_output_name(base, ext, group_count, gi, seq)
                     if (ext in ("jpg", "jpeg") and not rotation
                             and not exposure_active and not apply_angle
-                            and _is_intact_jpeg(cache_file)):
-                        # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径，逐字节一致）
+                            and _is_intact_a4_jpeg(cache_file, DEFAULT_DPI)):
+                        # ★ 快路径：源页**已经是 A4 画布** ⇒ `_a4_canvas` 提前返回
+                        #   （像素一个都不动）⇒ 复制原始字节 **==** 归一后的产物
+                        #   （逐字节一致）。尺寸不符的页一律走解码路径。
                         _ensure_parent_dir(fpath)      # ★ 快路径绕开 _write_image ⇒ 这里必须自己建目录
                         shutil.copy2(cache_file, fpath)
                     else:
-                        # 快路径的前置条件不满足（曝光/旋转/纠偏，或缓存页不是完整 JPEG）
-                        # ⇒ 走解码路径：能解码就正常落盘，解不开就由下面的
-                        #    except 计入 failed_pages —— **绝不谎报成功**（N2）。
+                        # 快路径的前置条件不满足（曝光/旋转/纠偏，或缓存页不是
+                        # 完整的 A4 尺寸 JPEG）⇒ 走解码路径：能解码就正常落盘，
+                        # 解不开就由下面的 except 计入 failed_pages ——
+                        # **绝不谎报成功**（N2）。
                         img = _open_page_image(cache_file, rotation, exposure,
                                                deskew_angle=angle,
                                                deskew_threshold=deskew_threshold)
                         try:
-                            _write_image(img, fpath, ext)
+                            _write_image(img, fpath, ext, dpi=DEFAULT_DPI)
                         finally:
                             img.close()
                     saved_files.append(fpath)
@@ -1157,6 +1236,58 @@ def _session_cleanup_jobs(job_ids) -> None:
         _remove_page_meta(jid)
 
 
+def _persist_session_completed(session, store=None) -> tuple[bool, str]:
+    """
+    把会话落盘成「completed」，并**回读验证**它真的写到了磁盘上。
+
+    返回 (ok, reason)：
+      ok=True  ⇒ 磁盘上的会话状态**就是** completed
+      ok=False ⇒ 没能确认 ⇒ reason 说明原因
+                 （调用方据此**不报告 completed**，并保留缓存以便重试）
+
+    ★ 为什么必须**回读验证**：`document_session.SessionStore.save()`
+      **不抛异常**（写失败只记 error 日志就返回）⇒ 调用方从返回值里
+      **看不出**"到底写没写进去" ⇒ 只有回读磁盘上的状态才能给出**如实**的上报。
+    ★ 失败时把会话状态**回滚**成原来的状态：原来的状态按状态机一定是
+      **可重试**的（scanning / paused / awaiting_flip）⇒ 会话可以安全地
+      留给用户重试，不会变成"指向死路径"的幽灵会话。
+    ★ 本模块**不 import 任何 GUI 框架** ⇒ CLI 也能用。
+    """
+    session_id = str(getattr(session, "session_id", "") or "")
+    if not session_id:
+        return False, "会话没有 session_id，无法落盘状态"
+    set_state = getattr(session, "set_state", None)
+    if not callable(set_state):
+        return False, "会话对象不支持状态机（缺少 set_state）"
+
+    original = str(getattr(session, "state", "") or "")
+    if original != "completed":
+        try:
+            set_state("completed")
+        except Exception as e:
+            # 非法转换（例如从 abandoned 切 completed）⇒ 不改状态，如实上报
+            return False, f"会话状态切不到 completed（{original} → completed）：{e}"
+
+    try:
+        (store or document_session.SessionStore()).save(session)
+    except Exception as e:
+        session.state = original
+        return False, f"会话状态落盘失败：{e}"
+
+    try:
+        reloaded = document_session.SessionStore().load(session_id)
+    except Exception as e:
+        session.state = original
+        return False, f"会话状态回读失败：{e}"
+    if reloaded is None:
+        session.state = original
+        return False, "会话状态回读不到（会话文件缺失或损坏）"
+    if reloaded.state != "completed":
+        session.state = original
+        return False, f"会话状态没有落盘（磁盘上仍是 {reloaded.state!r}）"
+    return True, ""
+
+
 def save_session(session, out_path=None, extra_dirs=None,
                  job_id=None, device_name="", device_ip="",
                  groups=None, confirm=None) -> SaveResult:
@@ -1177,9 +1308,18 @@ def save_session(session, out_path=None, extra_dirs=None,
     已落地的路径（_expose_and_rotate → skew_detect.deskew_image）；
     `PageRef.force_keep == True` 的页**不纠偏**。
 
-    清理（**只在全部页都合成成功**时执行；失败时什么都不清 ⇒ 可重试）：
-      ① 先解除保护（cache_manager.unprotect_dir，可能尚未落地 ⇒ 存在性检查）
-      ② 再删 job 目录（cache_manager.remove_job）+ 页元数据
+    图片产物：jpg / png / tiff 与 PDF **同样过 `_a4_canvas`** ⇒ 同一页的
+    图片与 PDF 几何完全一致（A4 画布，会话 dpi）。
+
+    收尾（★ 顺序是硬约定，防「幽灵会话」）：
+      ① 全部页都合成成功 ⇒ **先把会话状态写成 completed**（并回读验证）
+      ② **再**清缓存：解除保护（cache_manager.unprotect_dir）+ 删 job 目录
+         （cache_manager.remove_job）+ 页元数据
+    状态写失败 ⇒ **不报告 completed**：会话留在可重试状态、**缓存保留**
+    （页还在 ⇒ 重试能成），并在返回值上如实上报：
+      `status_write_failed`（bool）/ `status_write_error`（str）/
+      `session_state`（str，落盘后的会话状态）
+    有页失败 ⇒ 什么都不清（可重试），`status_write_failed` 保持 False。
 
     :param session: 文档会话（鸭子类型：需要 pages / mode / ext / dpi /
         exposure / reverse_back / output_path）
@@ -1267,8 +1407,9 @@ def save_session(session, out_path=None, extra_dirs=None,
                     fpath = build_output_name(base, ext, group_count, gi, seq)
                     if (ext in ("jpg", "jpeg") and not rotation
                             and not exposure_active and not apply_angle
-                            and _is_intact_jpeg(cache_file)):
-                        # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径）
+                            and _is_intact_a4_jpeg(cache_file, dpi)):
+                        # ★ 快路径：源页**已经是 A4 画布**（会话 dpi）⇒
+                        #   `_a4_canvas` 提前返回 ⇒ 复制原始字节 == 归一后的产物
                         _ensure_parent_dir(fpath)      # ★ 快路径绕开 _write_image ⇒ 这里必须自己建目录
                         shutil.copy2(cache_file, fpath)
                     else:
@@ -1276,7 +1417,7 @@ def save_session(session, out_path=None, extra_dirs=None,
                                                deskew_angle=angle,
                                                deskew_threshold=deskew_threshold)
                         try:
-                            _write_image(img, fpath, ext)
+                            _write_image(img, fpath, ext, dpi=dpi)
                         finally:
                             img.close()
                     saved_files.append(fpath)
@@ -1293,17 +1434,41 @@ def save_session(session, out_path=None, extra_dirs=None,
 
     copy_to_extra_dirs(saved_files, extra_dirs)
 
-    # 清理：只在**全部页都合成成功**时清（部分失败 ⇒ 保留缓存以便重试）
+    # ── 收尾（★ 顺序是硬约定：先写状态、再清缓存）────────────────────
+    #
+    #  ① 落盘成功 ⇒ **先把会话状态写成 completed**（并回读验证）
+    #  ② **再**清缓存（删 job 目录）
+    #
+    #  ★ 为什么不能反：旧顺序是「先删 job 目录 → 再（由 GUI）置 completed」。
+    #    中途崩溃 / 状态写失败 ⇒ 磁盘上的会话还"开着"（可重试），
+    #    而它引用的缓存页**已经被删了** ⇒ **幽灵会话**：
+    #    用户看到的会话点开全是死路径，重试永远失败。
+    #  ★ 状态写失败 ⇒ **不报告 completed**：会话留在可重试状态、
+    #    缓存**保留**（页还在 ⇒ 重试能成），并在返回值里如实上报。
     job_ids = [str(j) for j in getattr(session, "referenced_job_ids", []) or []]
     if job_id and str(job_id) not in job_ids:
         job_ids.append(str(job_id))
+
+    state_ok = True
+    state_reason = ""
     if failed_pages:
         warnings.append(
             f"有 {failed_pages} 页未能保存，缓存目录已保留（可重试）："
             f"{', '.join(job_ids)}")
         logger.warning("会话落盘有 %d 页失败 ⇒ 保留缓存目录以便重试", failed_pages)
     else:
-        _session_cleanup_jobs(job_ids)
+        state_ok, state_reason = _persist_session_completed(session)
+        if not state_ok:
+            logger.error("会话状态未写成 completed ⇒ 保留缓存目录以便重试：%s",
+                         state_reason)
+            warnings.append(
+                f"会话状态未能保存为「已完成」（{state_reason}）；"
+                f"缓存目录已保留，可重试保存。")
+        else:
+            # ★ 状态**已经**在磁盘上是 completed ⇒ 现在删缓存才是安全的
+            #   （即便这里失败，也只是留下一个待回收的缓存目录，
+            #     **不会**出现"会话还开着、页却没了"的幽灵会话）
+            _session_cleanup_jobs(job_ids)
 
     if saved_files:
         history_manager.append({
@@ -1317,5 +1482,8 @@ def save_session(session, out_path=None, extra_dirs=None,
         })
 
     return SaveResult(saved_files, failed_pages=failed_pages,
-                       skipped_pages=skipped_pages, warnings=warnings,
-                       saved_page_count=saved_page_count)
+                      skipped_pages=skipped_pages, warnings=warnings,
+                      saved_page_count=saved_page_count,
+                      status_write_failed=not state_ok,
+                      status_write_error=state_reason,
+                      session_state=str(getattr(session, "state", "") or ""))

@@ -161,6 +161,27 @@ def _assert_color(actual, expected, tol=12):
             f"颜色不符: 实际 {actual}，期望 {expected}"
 
 
+# ── A4 画布工具（图片产物现在也过 `_a4_canvas`）────────────────────────
+#
+# ★ 新契约：图片产物与 PDF 产物几何完全一致 ⇒ 产物恒为 A4 画布
+#   （2480×3507@300dpi）。"逐字节相同"这类断言必须改成
+#   **画布里的内容区**的断言（意图保留：内容没被改动/没被裁切）。
+
+A4_W, A4_H = 2480, 3507
+
+
+def _content_offset(content_size, canvas_size=(A4_W, A4_H)):
+    """A4 画布里内容居中时的左上角坐标（与 `_a4_canvas` 的 paste 偏移一致）"""
+    return ((canvas_size[0] - content_size[0]) // 2,
+            (canvas_size[1] - content_size[1]) // 2)
+
+
+def _content_region(img, content_size):
+    """从 A4 画布里取出居中的内容矩形（内容小于画布时是 1:1 原尺寸）"""
+    ox, oy = _content_offset(content_size, img.size)
+    return img.crop((ox, oy, ox + content_size[0], oy + content_size[1]))
+
+
 def _expected_duplex_order(session):
     """期望页序：交给 doc_merge 自己算（**不手写期望值**）"""
     front = [p for p in session.pages if p.side == "front"]
@@ -473,7 +494,12 @@ class TestDeskewOnSessionSave:
 
     def test_force_keep_page_is_not_deskewed(self, tmp_path, cache_root,
                                              small_page):
-        """★ force_keep=True 的页**不纠偏**（产物与缓存原件逐字节相同）"""
+        """★ force_keep=True 的页**不纠偏**。
+
+        ★ 新契约（图片也过 A4 归一）：产物不再是缓存原件的字节副本
+          ⇒ 断言改成「**画布里的内容区**与源图**逐像素相同**」
+          （用 PNG 产物 ⇒ 无损 ⇒ 可以逐像素比，判别力不降）。
+        """
         job = "job_force_keep"
         data = _skewed_bytes(small_page, 3.0)
         path = cache_manager.write_page(job, 1, data, "jpg")
@@ -483,21 +509,28 @@ class TestDeskewOnSessionSave:
         store.set_page(job, 1, page_meta.PageMeta(
             cache_path=path, width=width, height=height, deskew_angle=-3.0))
 
-        session = new_session(mode="single", ext="jpg", dpi=300)
+        session = new_session(mode="single", ext="png", dpi=300)
         refs = session.add_pages(job, [path], side="single", page_nos=[1])
         refs[0].force_keep = True
 
         out_base = str(tmp_path / "force")
         result = save_manager.save_session(session, out_base)
 
-        out = save_manager.build_output_name(out_base, "jpg", 1, 1, 1)
+        out = save_manager.build_output_name(out_base, "png", 1, 1, 1)
         assert list(result) == [out]
-        assert open(out, "rb").read() == data, \
-            "force_keep 的页必须原样保存（不纠偏）"
+        with Image.open(io.BytesIO(data)) as src, Image.open(out) as res:
+            src.load()
+            res.load()
+            assert res.size == (A4_W, A4_H), \
+                f"图片产物必须是 A4 画布：{res.size}"
+            region = _content_region(res, src.size)
+            assert region.convert("RGB").tobytes() == \
+                src.convert("RGB").tobytes(), \
+                "force_keep 的页内容必须原样保存（不纠偏）"
 
     def test_non_force_keep_page_is_deskewed(self, tmp_path, cache_root,
                                               small_page):
-        """对照组：同样的页不设 force_keep ⇒ 会被纠偏（产物与原件不同）"""
+        """对照组：同样的页不设 force_keep ⇒ 会被纠偏（内容与原件不同）"""
         job = "job_no_force"
         data = _skewed_bytes(small_page, 3.0)
         path = cache_manager.write_page(job, 1, data, "jpg")
@@ -507,14 +540,19 @@ class TestDeskewOnSessionSave:
         store.set_page(job, 1, page_meta.PageMeta(
             cache_path=path, width=width, height=height, deskew_angle=-3.0))
 
-        session = new_session(mode="single", ext="jpg", dpi=300)
+        session = new_session(mode="single", ext="png", dpi=300)
         session.add_pages(job, [path], side="single", page_nos=[1])
         out_base = str(tmp_path / "noforce")
         save_manager.save_session(session, out_base)
 
-        out = save_manager.build_output_name(out_base, "jpg", 1, 1, 1)
-        assert open(out, "rb").read() != data, \
-            "没设 force_keep 的页必须施加纠偏"
+        out = save_manager.build_output_name(out_base, "png", 1, 1, 1)
+        with Image.open(io.BytesIO(data)) as src, Image.open(out) as res:
+            src.load()
+            res.load()
+            region = _content_region(res, src.size)
+            assert region.convert("RGB").tobytes() != \
+                src.convert("RGB").tobytes(), \
+                "没设 force_keep 的页必须施加纠偏"
 
 
 # ── D：清理 ──────────────────────────────────────────────────────────

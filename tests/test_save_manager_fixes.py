@@ -185,9 +185,16 @@ class TestJpgFastPathValidation:
         assert len(result) == 1
 
     def test_fast_path_keeps_bytes_identical(self, tmp_path, isolated):
-        """完好 JPEG 仍走快路径 ⇒ 输出与缓存页**逐字节相同**。"""
+        """完好且**已经是 A4 尺寸**的 JPEG 仍走快路径 ⇒ 输出与缓存页**逐字节相同**。
+
+        ★ 新契约（图片一律过 `_a4_canvas`）：快路径只对「尺寸恰好 = A4 画布」
+          的页成立 —— `_a4_canvas` 对它**提前返回**（像素一个都不动）
+          ⇒ 复制原始字节 **==** 归一后的产物（逐字节一致）。
+          尺寸不符的页走解码路径（会被缩放/补白并重新编码），
+          那条路径由 tests/test_save_manager_a4_images.py 覆盖。
+        """
         src = tmp_path / "src.jpg"
-        Image.new("RGB", (300, 400), (12, 34, 56)).save(src, "JPEG")
+        Image.new("RGB", (A4_W, A4_H), (12, 34, 56)).save(src, "JPEG")
         out = str(tmp_path / "HP_Scan.jpg")
         result = save_manager.save_pages("job_fast", "jpg", out,
                                          [(str(src), 0)], [[0]])
@@ -233,7 +240,9 @@ class TestJpgFastPathValidation:
         assert result.failed_pages == 0
         with Image.open(result[0]) as im:
             assert im.format == "JPEG"
-            assert im.size == (300, 400)
+            # ★ 新契约：图片也过 A4 归一 ⇒ 产物是 A4 画布（与 PDF 产物一致）
+            assert im.size == (A4_W, A4_H), \
+                f"图片产物不是 A4 画布：{im.size}"
 
 
 # ────────────── N5：空页列表必须报错 ──────────────

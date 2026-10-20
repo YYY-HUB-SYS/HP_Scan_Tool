@@ -495,6 +495,33 @@ def _out_path(base, ext="jpg"):
     return save_manager.build_output_name(str(base), ext, 1, 1, 1)
 
 
+# ── A4 画布工具（图片产物现在也过 `_a4_canvas`）────────────────────────
+#
+# ★ 新契约：图片产物与 PDF 产物**几何完全一致** ⇒ 产物恒为 A4 画布
+#   （2480×3507@300dpi）。因此"画布尺寸""逐字节相同"这类断言必须改成
+#   **画布里的内容区**的断言（意图保留：内容没被改动/没被裁切）。
+
+A4_W, A4_H = 2480, 3507
+
+
+def _content_offset(content_size, canvas_size=(A4_W, A4_H)):
+    """A4 画布里内容居中时的左上角坐标（与 `_a4_canvas` 的 paste 偏移一致）"""
+    return ((canvas_size[0] - content_size[0]) // 2,
+            (canvas_size[1] - content_size[1]) // 2)
+
+
+def _content_region(img, content_size):
+    """从 A4 画布里取出居中的内容矩形（内容小于画布时是 1:1 原尺寸）"""
+    ox, oy = _content_offset(content_size, img.size)
+    return img.crop((ox, oy, ox + content_size[0], oy + content_size[1]))
+
+
+def _mad(a, b):
+    """两张图的平均绝对差（JPEG 有损 ⇒ 用它而不是逐字节比）"""
+    diff = ImageChops.difference(a.convert("RGB"), b.convert("RGB"))
+    return ImageStat.Stat(diff).mean[0]
+
+
 def _write_cache_page(cache_root, job_id, page_no, data, ext="jpg", **meta_kwargs):
     """
     写一页缓存件 + 对应的页元数据，返回缓存件路径。
@@ -548,7 +575,13 @@ class TestApplyDeskewOnSave:
 
     def test_straight_page_output_byte_identical(self, tmp_path, cache_root,
                                                   small_page):
-        """★ 直页（角度 0）落盘 ⇒ 与不纠偏**逐字节相同**。"""
+        """★ 直页（角度 0）落盘 ⇒ **纠偏不介入**。
+
+        ★ 新契约（图片也过 A4 归一）：产物不再是缓存原件的字节副本
+          （源图不是 A4 尺寸 ⇒ 会被补白/重新编码）⇒ 断言改成
+          「**画布里的内容区**与源图一致」+「与关掉纠偏的产物逐字节相同」
+          （后者仍是**逐字节**级护栏：证明纠偏这一步对直页完全没有介入）。
+        """
         job = "job_straight_save"
         data = _jpeg_bytes(small_page)
         cache_file = _write_cache_page(cache_root, job, 1, data,
@@ -556,13 +589,27 @@ class TestApplyDeskewOnSave:
 
         out = _out_base(tmp_path, "a")
         save_manager.save_pages(job, "jpg", out, [(cache_file, 0)], [[0]])
-        # 参照物：改造前的行为（直接复制缓存字节）
-        import shutil
-        reference = _out_base(tmp_path, "ref")
-        shutil.copy2(cache_file, reference)
+        # 参照物：**关掉纠偏总开关**再存一遍 ⇒ 两者必须逐字节相同
+        #（旧参照物是"直接复制缓存字节"，新契约下产物已归一，不再适用）
+        ref = _out_base(tmp_path, "ref")
+        with mock.patch.object(save_manager, "load_deskew_settings",
+                               lambda: save_manager.resolve_deskew_settings(
+                                   {"deskew_enabled": False})):
+            save_manager.save_pages(job, "jpg", ref, [(cache_file, 0)], [[0]])
         assert open(_out_path(out, "jpg"), "rb").read() == \
-            open(reference, "rb").read(), \
+            open(_out_path(ref, "jpg"), "rb").read(), \
             "角度为 0 时产物必须与不纠偏逐字节相同"
+
+        # 内容区必须与源图一致（没有被改动）
+        with Image.open(cache_file) as src, \
+                Image.open(_out_path(out, "jpg")) as res:
+            src.load()
+            res.load()
+            assert res.size == (A4_W, A4_H), \
+                f"图片产物必须是 A4 画布：{res.size}"
+            region = _content_region(res, src.size)
+            assert _mad(region, src) < 6.0, \
+                "直页内容被改动了（纠偏不该介入）"
 
     def test_exposure_off_still_byte_identical(self, tmp_path, cache_root,
                                                small_page):
@@ -582,7 +629,11 @@ class TestApplyDeskewOnSave:
 
     def test_below_threshold_not_applied(self, tmp_path, cache_root,
                                           small_page):
-        """低于施加阈值（0.5°）⇒ 不施加（像素一个都不动）。"""
+        """低于施加阈值（0.5°）⇒ 不施加（内容一个像素都不动）。
+
+        ★ 新契约：产物是 A4 画布 ⇒ 断言改成「**画布里的内容区**与源图
+          一致」（意图保留：低于阈值 ⇒ 纠偏没有介入）。
+        """
         job = "job_thresh"
         data = _jpeg_bytes(small_page)
         cache_file = _write_cache_page(cache_root, job, 1, data,
@@ -590,9 +641,13 @@ class TestApplyDeskewOnSave:
 
         out = _out_base(tmp_path, "thresh")
         save_manager.save_pages(job, "jpg", out, [(cache_file, 0)], [[0]])
-        assert open(_out_path(out, "jpg"), "rb").read() == \
-            open(cache_file, "rb").read(), \
-            "0.3° < 施加阈值 0.5° ⇒ 必须逐字节不变（走快路径）"
+        with Image.open(cache_file) as src, \
+                Image.open(_out_path(out, "jpg")) as res:
+            src.load()
+            res.load()
+            region = _content_region(res, src.size)
+            assert _mad(region, src) < 6.0, \
+                "0.3° < 施加阈值 0.5° ⇒ 内容必须一个像素都不动"
 
     def test_threshold_helper_semantics(self):
         """★ 两个阈值的语义：施加阈值 vs 检出下限。"""
@@ -611,7 +666,11 @@ class TestApplyDeskewOnSave:
     def test_deskew_disabled_leaves_output_untouched(self, tmp_path,
                                                       cache_root, small_page,
                                                       monkeypatch):
-        """deskew_enabled=False ⇒ 一页都不纠偏。"""
+        """deskew_enabled=False ⇒ 一页都不纠偏。
+
+        ★ 新契约：产物是 A4 画布 ⇒ 断言改成「**画布里的内容区**与源图
+          一致」（且与"纠偏过的版本"差距明显 ⇒ 断言仍有判别力）。
+        """
         job = "job_disabled"
         data = _skewed_bytes(small_page, 3.0)
         cache_file = _write_cache_page(cache_root, job, 1, data,
@@ -621,15 +680,26 @@ class TestApplyDeskewOnSave:
                                 {"deskew_enabled": False}))
         out = _out_base(tmp_path, "off")
         save_manager.save_pages(job, "jpg", out, [(cache_file, 0)], [[0]])
-        assert open(_out_path(out, "jpg"), "rb").read() == \
-            open(cache_file, "rb").read()
+        with Image.open(cache_file) as src, \
+                Image.open(_out_path(out, "jpg")) as res:
+            src.load()
+            res.load()
+            region = _content_region(res, src.size)
+            mad = _mad(region, src)
+            # 对照：如果纠偏真的施加了，差距必须大得多
+            mad2 = _mad(region, skew_detect.deskew_image(src, -3.0))
+        assert mad < 6.0, f"关掉纠偏后内容被改动了（平均差 {mad}）"
+        assert mad2 > mad * 2, f"纠偏没有生效（{mad} vs {mad2}）"
 
     def test_manual_rotation_and_deskew_both_applied(self, tmp_path,
                                                       cache_root, small_page):
         """★ 手动旋转（90° 倍数）与自动纠偏**两者都要**（先转手动、再纠偏）。
 
-        判据：产物与"先转手动、再纠偏"手工复算的结果**逐像素一致**
-        （JPEG 有损 ⇒ 用平均绝对差判定，容差远小于"少纠偏一次"的差距）。
+        判据：产物**画布里的内容区**与"先转手动、再纠偏"手工复算的结果
+        **逐像素一致**（JPEG 有损 ⇒ 用平均绝对差判定，容差远小于
+        "少纠偏一次"的差距）。
+
+        ★ 新契约：产物恒为 A4 画布 ⇒ 比的是内容区，不是整张。
         """
         job = "job_both"
         data = _skewed_bytes(small_page, 3.0)
@@ -644,15 +714,13 @@ class TestApplyDeskewOnSave:
                 -3.0, resample=Image.BICUBIC, fillcolor=255)
             with Image.open(_out_path(out, "jpg")) as res:
                 res.load()
-                assert res.width > res.height, "手动旋转没有生效"
-                diff = ImageChops.difference(res.convert("RGB"),
-                                             expected.convert("RGB"))
-                mad = ImageStat.Stat(diff).mean[0]
+                assert res.size == (A4_W, A4_H)
+                region = _content_region(res, expected.size)
+                assert region.width > region.height, "手动旋转没有生效"
+                mad = _mad(region, expected)
                 # 只转手动、不纠偏的对照：差距必须大得多
                 only_rotate = src.rotate(90, expand=True)
-                diff2 = ImageChops.difference(res.convert("RGB"),
-                                              only_rotate.convert("RGB"))
-                mad2 = ImageStat.Stat(diff2).mean[0]
+                mad2 = _mad(region, only_rotate)
         assert mad < 6.0, f"产物与[先转手动、再纠偏]的结果不符（平均差 {mad}）"
         assert mad2 > mad * 2, f"纠偏没有生效（{mad} vs {mad2}）"
 
@@ -663,6 +731,9 @@ class TestApplyDeskewOnSave:
           - 手动旋转 90°（expand=True）后画布从 400×300 变成 300×400；
           - 随后的自动纠偏（小角度、不 expand）**不改变画布尺寸**；
           - 最终产物必须与"先转手动、再纠偏"手工复算的结果**逐像素相同**。
+
+        ★ 新契约：产物恒为 **A4 画布** ⇒ 比的是**画布里的内容区**
+          （PNG 无损 ⇒ 内容区仍可逐像素比对）。
         """
         job = "job_order"
         # 构造图：左上角一个黑块（标记）+ 若干横向文本行
@@ -685,12 +756,16 @@ class TestApplyDeskewOnSave:
             -3.0, resample=Image.BICUBIC, fillcolor=255)
         with Image.open(_out_path(out, "png")) as res:
             res.load()
-            assert res.size == (300, 400), \
-                f"画布尺寸不对（手动旋转 + 纠偏后应为 300×400）：{res.size}"
-            assert res.tobytes() == expected.tobytes(), \
-                "产物与'先转手动、再纠偏'的结果不一致（顺序错了）"
+            assert res.size == (A4_W, A4_H), \
+                f"产物必须是 A4 画布：{res.size}"
+            region = _content_region(res, expected.size)
+            assert region.size == (300, 400), \
+                f"内容区尺寸不对（手动旋转 + 纠偏后应为 300×400）：{region.size}"
+            assert region.convert("RGB").tobytes() == \
+                expected.convert("RGB").tobytes(), \
+                "产物内容区与'先转手动、再纠偏'的结果不一致（顺序错了）"
             # 标记（黑块）跟着旋转走了：深色像素仍然在
-            hist = res.convert("L").histogram()
+            hist = region.convert("L").histogram()
             assert sum(hist[:40]) > 0, "标记丢了"
 
     def test_grayscale_rgb_and_dpi_variants_do_not_crash(self, tmp_path,
@@ -828,7 +903,12 @@ class TestApplyDeskewOnSave:
             "PDF 路径依然没有护栏")
 
     def test_deskew_keeps_canvas_size(self, tmp_path, cache_root, small_page):
-        """不 expand ⇒ 画布尺寸不变（只多了一圈补白）。"""
+        """不 expand ⇒ **页面尺寸不变**（只多了一圈补白）。
+
+        ★ 新契约：产物恒为 A4 画布 ⇒ 断言改成「画布里的**内容区**与
+          源图同尺寸」+「内容区与'不 expand 的纠偏结果'一致」
+          ⇒ 若哪天纠偏改成 expand（内容尺寸变大），这条会变红。
+        """
         job = "job_size"
         data = _skewed_bytes(small_page, 3.0)
         cache_file = _write_cache_page(cache_root, job, 1, data,
@@ -837,8 +917,17 @@ class TestApplyDeskewOnSave:
         save_manager.save_pages(job, "jpg", out, [(cache_file, 0)], [[0]])
         with Image.open(cache_file) as src, \
                 Image.open(_out_path(out, "jpg")) as res:
-            assert res.size == src.size, \
-                f"画布尺寸变了：{src.size} → {res.size}"
+            src.load()
+            res.load()
+            assert res.size == (A4_W, A4_H), \
+                f"产物必须是 A4 画布：{res.size}"
+            region = _content_region(res, src.size)
+            assert region.size == src.size, \
+                f"内容区尺寸变了：{src.size} → {region.size}"
+            expected = skew_detect.deskew_image(src, -3.0)
+            assert expected.size == src.size, "参照物尺寸不对"
+            assert _mad(region, expected) < 6.0, \
+                "内容区与'不 expand 的纠偏结果'不一致（画布尺寸被改了）"
 
     def test_600dpi_source_not_cropped(self, tmp_path):
         """★ 既有护栏：600 DPI 源图不被裁切（纠偏在 A4 归一之前，顺序不变）。"""

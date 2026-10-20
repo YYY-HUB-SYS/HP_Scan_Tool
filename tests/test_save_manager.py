@@ -60,11 +60,18 @@ class TestBuildOutputName:
 
 class TestSaveSingle:
     def test_saves_jpg(self, tmp_path, jpg, isolated):
+        """单页图片落盘。
+
+        ★ 新契约（图片也过 A4 归一）：产物尺寸 = **A4 画布** 2480×3507，
+          与同一页的 PDF 产物**完全一致**（旧口径是保留原始幅面）。
+        """
         out = str(tmp_path / "out.jpg")
         saved = save_manager.save_single(jpg, "jpg", out)
         assert os.path.exists(saved)
         with Image.open(saved) as im:
-            assert im.size == (100, 200)
+            im.load()
+            assert im.size == (2480, 3507), \
+                f"图片产物必须是 A4 画布（与 PDF 产物同尺寸）：{im.size}"
 
     def test_extension_corrected_when_mismatch(self, tmp_path, jpg, isolated):
         out = str(tmp_path / "out.png")
@@ -73,10 +80,29 @@ class TestSaveSingle:
         assert os.path.exists(saved)
 
     def test_rotation_applied(self, tmp_path, jpg, isolated):
+        """手动旋转生效。
+
+        ★ 新契约：产物恒为 A4 画布 ⇒ 旋转的方向改看**画布里的内容区**
+          （源图 100×200 竖 ⇒ 旋转 90° 后内容区是 200×100 横）。
+          （用彩色源图 ⇒ 白底上能分辨内容区）
+        """
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (100, 200), (220, 30, 30)).save(src, "JPEG")
         out = str(tmp_path / "out.jpg")
-        saved = save_manager.save_single(jpg, "jpg", out, rotation=90)
+        saved = save_manager.save_single(str(src), "jpg", out, rotation=90)
         with Image.open(saved) as im:
-            assert im.size == (200, 100)
+            im.load()
+            assert im.size == (2480, 3507)
+            mask = im.convert("L").point(lambda p: 0 if p > 245 else 255)
+            bbox = mask.getbbox()
+        assert bbox is not None, "内容整个丢了"
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        assert width > height, \
+            f"手动旋转没有生效（内容区还是竖的）：{bbox}"
+        # JPEG 重压缩在边缘有 1~2px 振铃 ⇒ 容差 3px
+        assert abs(width - 200) <= 3 and abs(height - 100) <= 3, \
+            f"内容区尺寸不对（旋转后应为 200×100）：{bbox}"
 
 
 class TestSavePages:

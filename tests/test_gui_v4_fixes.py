@@ -162,6 +162,38 @@ def _scan_with_border(w=100, h=120, border=30):
     return img
 
 
+# ── A4 画布工具（图片产物现在也过 `_a4_canvas`）────────────────────────
+#
+# ★ 新契约：图片产物与 PDF 产物几何完全一致 ⇒ 产物恒为 A4 画布
+#   （2480×3507@300dpi）。"产物尺寸 = 裁边结果"这类断言必须改成
+#   **画布里的内容区**的断言（意图保留：旋转没被清零、裁边几何没变）。
+
+A4_W, A4_H = 2480, 3507
+
+
+def _ink_bbox(img):
+    """产物里非白像素的外接框（裁边内容在 A4 画布里居中）"""
+    mask = img.convert("L").point(lambda p: 0 if p > 245 else 255)
+    return mask.getbbox()
+
+
+def _assert_a4_product(im, expected):
+    """产物 = A4 画布；裁边内容**居中**在里面（内容区尺寸 = expected）。
+
+    返回内容里非白像素的宽高（用来判"旋转有没有生效"）。
+    """
+    assert im.size == (A4_W, A4_H), \
+        f"图片产物必须是 A4 画布（与 PDF 产物一致）: {im.size}"
+    bbox = _ink_bbox(im)
+    assert bbox is not None, "内容整个丢了"
+    ox = (A4_W - expected[0]) // 2
+    oy = (A4_H - expected[1]) // 2
+    assert ox <= bbox[0] and oy <= bbox[1] and \
+        bbox[2] <= ox + expected[0] and bbox[3] <= oy + expected[1], \
+        f"内容不在居中的内容区里: {bbox}（内容区起点 {ox},{oy} 尺寸 {expected}）"
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
 # ══════════ 16.17 / F1 直接保存不许阻塞主线程 ══════════
 
 def test_direct_save_keeps_event_loop_alive(qapp, tmp_path, monkeypatch,
@@ -335,8 +367,15 @@ def test_single_page_crop_keeps_rotation(qapp, tmp_path, isolated_cache,
 
     assert out.exists(), "没产出文件"
     with Image.open(out) as im:
-        assert im.size == expected, \
-            f"旋转 {angle}° + 裁边的产物尺寸不对: {im.size} != {expected}"
+        # ★ 新契约：产物恒为 A4 画布 ⇒ 判据改成「内容区在画布里居中」
+        #   +「内容的方向 = 旋转后的方向」（旋转没被清零）
+        width, height = _assert_a4_product(im, expected)
+        if angle in (90, 270):
+            assert width > height, \
+                f"旋转 {angle}° 没有生效（内容还是竖的）"
+        else:
+            assert height > width, \
+                f"旋转 {angle}° 没有生效（内容还是横的）"
 
 
 @pytest.mark.parametrize("angle,expected", [
@@ -366,8 +405,15 @@ def test_single_page_crop_page_meta_matches_actual(qapp, tmp_path,
 
     assert out.exists(), "没产出文件"
     with Image.open(out) as im:
-        assert im.size == expected, \
-            f"旋转 {angle}° + 裁边的产物尺寸不对: {im.size} != {expected}"
+        # ★ 新契约：产物恒为 A4 画布 ⇒ 判据改成「内容区在画布里居中」
+        #   +「内容的方向 = 旋转后的方向」
+        width, height = _assert_a4_product(im, expected)
+        if angle in (90, 270):
+            assert width > height, \
+                f"旋转 {angle}° 没有生效（内容还是竖的）"
+        else:
+            assert height > width, \
+                f"旋转 {angle}° 没有生效（内容还是横的）"
     assert meta["manual_rotation"] == angle, \
         f"manual_rotation 没落盘: {meta.get('manual_rotation')}"
     assert (meta["width"], meta["height"]) == expected, \
@@ -412,8 +458,15 @@ def test_multi_page_crop_keeps_rotation(qapp, tmp_path, isolated_cache,
     out = tmp_path / "multi_001.png"
     assert out.exists(), f"没产出文件: {sorted(p.name for p in tmp_path.glob('*.png'))}"
     with Image.open(out) as im:
-        assert im.size == expected, \
-            f"旋转 {angle}° + 裁边的产物尺寸不对: {im.size} != {expected}"
+        # ★ 新契约：产物恒为 A4 画布 ⇒ 判据改成「内容区在画布里居中」
+        #   +「内容的方向 = 旋转后的方向」
+        width, height = _assert_a4_product(im, expected)
+        if angle in (90, 270):
+            assert width > height, \
+                f"旋转 {angle}° 没有生效（内容还是竖的）"
+        else:
+            assert height > width, \
+                f"旋转 {angle}° 没有生效（内容还是横的）"
 
 
 @pytest.mark.parametrize("angle,expected", [
@@ -449,8 +502,15 @@ def test_multi_page_crop_page_meta_matches_actual(qapp, tmp_path,
     out = tmp_path / "multi_001.png"
     assert out.exists(), f"没产出文件: {sorted(p.name for p in tmp_path.glob('*.png'))}"
     with Image.open(out) as im:
-        assert im.size == expected, \
-            f"旋转 {angle}° + 裁边的产物尺寸不对: {im.size} != {expected}"
+        # ★ 新契约：产物恒为 A4 画布 ⇒ 判据改成「内容区在画布里居中」
+        #   +「内容的方向 = 旋转后的方向」
+        width, height = _assert_a4_product(im, expected)
+        if angle in (90, 270):
+            assert width > height, \
+                f"旋转 {angle}° 没有生效（内容还是竖的）"
+        else:
+            assert height > width, \
+                f"旋转 {angle}° 没有生效（内容还是横的）"
     assert meta["manual_rotation"] == angle, \
         f"manual_rotation 没落盘: {meta.get('manual_rotation')}"
     assert (meta["width"], meta["height"]) == expected, \
@@ -477,7 +537,9 @@ def test_crop_without_rotation_keeps_legacy_geometry(qapp, tmp_path,
         dlg.deleteLater()
 
     with Image.open(out) as im:
-        assert im.size == (50, 70), f"不旋转时产物尺寸变了: {im.size}"
+        # ★ 新契约：产物恒为 A4 画布 ⇒ 判据改成「内容区在画布里居中」
+        #   （裁边几何仍由 page_meta 的断言守着）
+        _assert_a4_product(im, (50, 70))
     assert meta["manual_rotation"] == 0
     assert (meta["width"], meta["height"]) == (50, 70)
     left, top, right, bottom = meta["crop_rect"]
