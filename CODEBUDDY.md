@@ -109,7 +109,9 @@ Resource path resolution: `get_resource_path()` adds `resources/` prefix in deve
 
 ### Deprecated/Stripped Code
 
-`exposure.py` and `preset_manager.py` are **no longer imported** by any active module. They were stripped in v3.3 (2026-07-19) and moved to `_docfix_reserve/` for a separate DocFix project. Do not reference them in new code.
+`exposure.py` and `preset_manager.py` are **active again** as of 2026-10-20. They were stripped in v3.3 (2026-07-19) and moved to a separate DocFix project, but that standalone DocFix software was abandoned and the basic exposure/filter features were **merged back into this project** (ADR-0008 + `docs/design/2026-10-20_新功能调研与方案_双面_续扫_纠偏_曝光_v1.0.md`). `hp_scan_gui_pyside.py` imports `preset_manager` / `exposure` for the preview exposure panel, and `save_manager.py` applies `apply_exposure` on the save path (曝光 → 旋转 → A4 归一). Presets persist at `%APPDATA%\HP_Scan_Tool\presets.json`. **Do not treat them as dead code.**
+
+The `_docfix_reserve/` directory no longer exists (removed long ago; it is not in the repo).
 
 ### ScannerInfo Dataclass
 
