@@ -80,8 +80,8 @@ class TestResolveSource:
 
     def test_adf_loaded_returns_feeder_for_auto(self, coordinator, scanner):
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Idle", "adf_loaded": True}):
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": True})):
             assert coordinator.resolve_source(scanner, "Auto") == ("Feeder", True)
 
     def test_platen_request_is_respected(self, coordinator, scanner):
@@ -91,34 +91,69 @@ class TestResolveSource:
         否则用户选了平板却被拿输稿器扫，是行为回归。
         """
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Idle", "adf_loaded": True}) as probe:
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": True})) as probe:
             assert coordinator.resolve_source(scanner, "Platen") == ("Platen", False)
             assert probe.call_count == 0
 
     def test_adf_empty_returns_platen(self, coordinator, scanner):
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Idle", "adf_loaded": False}):
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": False})):
             assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
 
     def test_probe_failure_keeps_requested_source(self, coordinator, scanner):
         """探测失败时必须保留用户请求的来源，不能静默改成平板。
 
-        生产真实形态：get_scanner_status 把异常吞掉、返回
-        state=="Unknown"、adf_loaded=False，从不抛异常。
+        生产真实形态：probe_scanner_status 把异常吞掉、返回
+        (False, {"state": "Unknown", "adf_loaded": False})，从不抛异常。
         """
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Unknown", "adf_loaded": False}):
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(False, {"state": "Unknown", "adf_loaded": False})):
             assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
 
     def test_probe_exception_keeps_requested_source(self, coordinator, scanner):
-        """防御性：即便 get_scanner_status 真的抛异常，来源也不得被改掉"""
+        """防御性：即便 probe_scanner_status 真的抛异常，来源也不得被改掉"""
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
+        with mock.patch("scan_coordinator.probe_scanner_status",
                         side_effect=RuntimeError("boom")):
             assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
+
+    def test_legit_unknown_state_is_probe_success(self, coordinator, scanner):
+        """设备合法上报 <State>Unknown</State> 时，探测算成功，不该被当成探测失败"""
+        scanner.has_adf = True
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Unknown", "adf_loaded": False})):
+            # Auto 模式下：探测成功但没纸 -> 落 Platen
+            assert coordinator.resolve_source(scanner, "Auto") == ("Platen", False)
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Unknown", "adf_loaded": False})):
+            # Feeder 模式下：探测成功但没纸 -> 落 Platen（不是保留 Feeder）
+            assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
+
+    @pytest.mark.parametrize("requested,probe_ok,adf_loaded,has_adf,expected", [
+        ("Platen", True, True, True, ("Platen", False)),   # 显式选平板：保持平板
+        ("Feeder", True, True, True, ("Feeder", True)),    # 选输稿器 + 有纸
+        ("Feeder", True, False, True, ("Platen", False)),  # 选输稿器 + 无纸
+        ("Feeder", False, False, True, ("Feeder", False)), # 选输稿器 + 探测失败：保留来源
+        ("Auto", True, True, True, ("Feeder", True)),      # 自动 + 有纸
+        ("Auto", True, False, True, ("Platen", False)),    # 自动 + 无纸
+        ("Auto", False, False, True, ("Platen", False)),   # 自动 + 探测失败
+        ("Feeder", True, True, False, ("Platen", False)),  # 设备无 ADF 能力
+    ])
+    def test_source_behavior_table(self, coordinator, scanner, requested,
+                                   probe_ok, adf_loaded, has_adf, expected):
+        """来源决策行为对照表：8 行必须同时成立。
+
+        这是本次改造的验收契约——切到 probe_scanner_status 后，"探测失败"
+        与"设备合法上报 Unknown"必须仍然分得开。
+        """
+        scanner.has_adf = has_adf
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(probe_ok,
+                                      {"state": "Idle", "adf_loaded": adf_loaded})):
+            assert coordinator.resolve_source(scanner, requested) == expected
 
 
 class TestRunScanSync:
@@ -150,8 +185,8 @@ class TestRunScanSync:
     def test_multipage_writes_each_page(self, coordinator, scanner, tmp_path, cache_root):
         scanner.has_adf = True
         pages = [(b"a", "jpg"), (b"b", "jpg"), (b"c", "jpg")]
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Idle", "adf_loaded": True}), \
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": True})), \
              mock.patch("scan_coordinator.execute_multipage_scan", return_value=pages):
             # 必须显式请求输稿器：显式选平板时不再探测，也不会切到 Feeder
             result = coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"))
@@ -178,8 +213,8 @@ class TestRunScanSync:
         否则 GUI 会收到"完成但 0 页"和"取消"两种信号。
         """
         scanner.has_adf = True
-        with mock.patch("scan_coordinator.get_scanner_status",
-                        return_value={"state": "Idle", "adf_loaded": True}), \
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": True})), \
              mock.patch("scan_coordinator.execute_multipage_scan", return_value=[]):
             with pytest.raises(ScanCancelled):
                 coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"))

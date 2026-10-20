@@ -20,7 +20,7 @@ import cache_manager
 import history_manager
 from escl_engine import (
     probe_escl, fetch_capabilities,
-    get_scanner_status, execute_scan, execute_multipage_scan,
+    probe_scanner_status, execute_scan, execute_multipage_scan,
     ScannerInfo,
 )
 from wsd_engine import discover_all_scanners
@@ -131,9 +131,6 @@ class ScanCoordinator(QObject):
         super().__init__(parent)
         self.scanners: list[ScannerInfo] = []
         self._scanners_lock = threading.Lock()
-        self._active_scans = 0
-        self._scan_lock = threading.Lock()
-        self._scan_cancel = threading.Event()
         self.cfg: dict = {}
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(4)
@@ -278,26 +275,6 @@ class ScanCoordinator(QObject):
 
     # ── 扫描执行 ──
 
-    def begin_scan(self):
-        """递增活跃扫描计数，返回当前计数"""
-        with self._scan_lock:
-            self._active_scans += 1
-            self._scan_cancel.clear()
-            return self._active_scans
-
-    def end_scan(self):
-        """递减活跃扫描计数，返回剩余计数"""
-        with self._scan_lock:
-            self._active_scans = max(0, self._active_scans - 1)
-            return self._active_scans
-
-    def active_scan_count(self) -> int:
-        with self._scan_lock:
-            return self._active_scans
-
-    def is_cancelled(self) -> bool:
-        return self._scan_cancel.is_set()
-
     def resolve_source(self, scanner, requested: str) -> tuple:
         """
         决定实际扫描来源，返回 (实际来源, 是否探测到输稿器有纸)。
@@ -308,13 +285,15 @@ class ScanCoordinator(QObject):
         - "Auto"：探测决定，有纸用 Feeder 否则 Platen
         设备没有 ADF 能力或没有 eSCL 地址时，任何请求都落到 Platen。
 
-        探测失败时**保留用户请求的来源**。get_scanner_status 会把
-        RequestException / ParseError 全部吞掉、返回 state=="Unknown"，
-        从不抛异常，所以"探测失败"只能靠 state 判定（下面还有一层
-        except 是防御性的）。若此时把 Feeder 静默改成 Platen，用户选了
-        输稿器却扫了平板且界面无任何提示——改造前这种情形是会失败报错的。
-        保留来源后，扫描本身会去暴露问题（输稿器没纸时扫描失败），
-        与改造前行为一致。
+        探测失败时**保留用户请求的来源**。probe_scanner_status 显式返回
+        (探测是否成功, 状态字典)："探测失败"（连接失败 / 非 200 / XML 畸形，
+        ok=False）与"设备合法上报 <State>Unknown</State>"（ok=True）是两回事。
+        因此判定只看 ok，**不能**用 state=="Unknown" 反推探测失败——
+        否则设备真报 Unknown 时会被误判，在 Auto 模式下静默改扫平板
+        （与改造前 GUI 的字符串判定不同）。若探测失败时把 Feeder 静默改成
+        Platen，用户选了输稿器却扫了平板且界面无任何提示——改造前这种情形
+        是会失败报错的。保留来源后，扫描本身会去暴露问题（输稿器没纸时
+        扫描失败），与改造前行为一致。
         """
         has_adf = getattr(scanner, "has_adf", False)
         if requested == "Platen":
@@ -325,14 +304,16 @@ class ScanCoordinator(QObject):
             return "Platen", False
 
         try:
-            st = get_scanner_status(scanner.escl_url, timeout=5.0)
+            ok, st = probe_scanner_status(scanner.escl_url, timeout=5.0)
         except Exception as e:
             # 防御性：当前实现不抛异常，但接口契约上仍可能
             logger.debug("ADF 状态探测异常，保持原来源: %s", e)
-            st = None
+            ok, st = False, None
 
-        if st is None or st.get("state") == "Unknown":
-            # 探测失败：无法判断输稿器状态，保留用户请求的来源
+        if not ok:
+            # 探测失败：无法判断输稿器状态，保留用户请求的来源。
+            # 注意：只看 ok，不看 state=="Unknown"——设备合法上报
+            # <State>Unknown</State> 时 ok=True，不算探测失败。
             if requested == "Feeder":
                 return "Feeder", False
             return "Platen", False
