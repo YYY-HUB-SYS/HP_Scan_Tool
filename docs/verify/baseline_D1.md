@@ -1,7 +1,10 @@
 # D1 真机基准（改造前）— 2026-10-20
 
 > ⚠️ **本文档含内网信息**（设备 IP / 内部路径 / 远端地址）。仓库当前只推送内网 Gitea，故保留这些值以便真机复现与对照。**若将来要推 GitHub 等公开平台，须先把 IP 泛化（如 `17.17.171.x`）并移除内部路径与远端地址。**
-> **泛化时的完整清单（共 11 处）**：本目录 `docs/verify/`（本文件 + `regression_D2.md`）、`docs/audit/`（3 份）、`docs/design/`（3 份）、`docs/superpowers/specs/`（1 份）、`docs/superpowers/plans/`（1 份）—— 这 10 份文档各自第 3 行都带本提示；**另有第 11 处是代码注释**：`escl_engine.py` 中「某些老打印机（实测 17.17.171.203 / .208）把 ScannerCapabilities 301 到 …」一句，泛化时一并处理。
+> **泛化时的完整清单（共 12 处）**：本目录 `docs/verify/`（本文件 + `regression_D2.md`）、`docs/audit/`（3 份）、`docs/design/`（3 份）、`docs/superpowers/specs/`（1 份）、`docs/superpowers/plans/`（1 份）—— 这 10 份文档各自第 3 行都带本提示；**另有 2 处是代码注释**（均在 `escl_engine.py`）：
+> ① 「某些老打印机（实测 17.17.171.203 / .208）把 ScannerCapabilities 301 到 …」
+> ② 「实测 2026-10-21（E2E 真机 17.17.171.111）：上一个 ScanJob 刚被 DELETE，紧接着的建 job 请求就 …」（503 退避说明）
+> 泛化时一并处理。
 > 由 `tools/verify_scan.py` 生成。改造后 D2 必须与本文件逐项一致。
 
 采集命令：
