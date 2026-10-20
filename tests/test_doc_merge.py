@@ -113,10 +113,14 @@ class TestGroupPages:
         assert group_pages(pages) == [[1, 2, 3, 4]]
         assert group_pages(pages, group_size=None) == [[1, 2, 3, 4]]
 
-    def test_empty_pages(self):
-        """空输入 ⇒ []（没有页就没有组）"""
-        assert group_pages([]) == []
-        assert group_pages([], group_size=3) == []
+    def test_empty_pages_raises(self):
+        """★ 空页列表 ⇒ ValueError（复审 D-1：不再产出一个空组）"""
+        with pytest.raises(ValueError):
+            group_pages([])
+        with pytest.raises(ValueError):
+            group_pages([], group_size=3)
+        with pytest.raises(ValueError):
+            group_pages([], group_size=None)
 
     def test_group_size_one(self):
         """每页自成一组"""
@@ -132,6 +136,38 @@ class TestGroupPages:
             group_pages([1, 2], group_size=0)
         with pytest.raises(ValueError):
             group_pages([1, 2], group_size=-1)
+
+    def test_non_integer_group_size_raises_value_error(self):
+        """★ group_size 非整数 ⇒ ValueError（**不是** TypeError，复审 D-1）
+
+        内部 range() 只接受 int ⇒ float 原本会抛 TypeError，调用方按
+        docstring `except ValueError` 会漏接。现在类型不对也归 ValueError。
+        """
+        for bad in (2.5, 2.0, "3", 3.0, True):
+            with pytest.raises(ValueError):
+                group_pages([1, 2, 3], group_size=bad)
+
+    def test_group_size_checked_before_empty_pages(self):
+        """★ 校验顺序：group_size 非法 ⇒ 先报 group_size（复审 D-1）"""
+        with pytest.raises(ValueError) as ei:
+            group_pages([], group_size=0)
+        assert "group_size" in str(ei.value)
+
+    def test_error_message_states_expectation(self):
+        """★ 异常消息要说清期望值"""
+        with pytest.raises(ValueError) as ei:
+            group_pages([1, 2], group_size=0)
+        assert "正整数" in str(ei.value)
+        with pytest.raises(ValueError) as ei2:
+            group_pages([], group_size=1)
+        assert "pages" in str(ei2.value)
+
+    def test_valid_calls_unchanged(self):
+        """★ 合法调用行为不变（None ⇒ 不分组；正整数 ⇒ 按大小分组）"""
+        assert group_pages([1, 2, 3, 4, 5], group_size=2) == [[1, 2], [3, 4], [5]]
+        assert group_pages([1, 2, 3], group_size=None) == [[1, 2, 3]]
+        assert group_pages([1, 2, 3], group_size=1) == [[1], [2], [3]]
+        assert group_pages([1, 2], group_size=10) == [[1, 2]]
 
     def test_inputs_not_modified(self):
         """★ 输入不被修改"""

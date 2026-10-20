@@ -256,6 +256,11 @@ def save_config(cfg: dict) -> bool:
     - False = 拿不到跨进程锁（本次**未写入**，原文件保持不变）或写失败
     失败**不抛异常**（避免 GUI 槽里未捕获异常），但必须**记 error 日志** ——
     写失败绝不能只留一条 debug 日志（用户会以为设置已保存）。
+
+    ★ 调用方约定：**返回值必须被接住**。
+      协调器内部一律走 `ScanCoordinator._save_config_checked`
+      （在本函数之外再补「记 error 日志 + 发 config_save_failed 信号」），
+      GUI 侧走 `ScanApp._save_cfg`（同样如实上报）。
     """
     path = os.path.join(_app_dir(), "scan_config.json")
     try:
@@ -296,6 +301,14 @@ class ScanCoordinator(QObject):
     #   ★ 在**工作线程**发出 ⇒ GUI 侧必须走现有的 `_UiPostMixin._post_ui`
     #     投递到主线程，**不要**在工作线程里直接弹窗。
     skew_warning = Signal(str, int, float, str)
+    # ★ 配置写入失败（复审 A4-1：协调器侧此前把 save_config 的返回值丢了，
+    #   写失败完全静默 —— 用户以为改了分辨率/昵称，实际没落盘）。
+    #   签名：config_save_failed(context: str)
+    #     - context ：人类可读的失败场景（如 "持久化扫描参数"）
+    #   触发条件：协调器自己写的任何一次配置落盘失败
+    #             （拿不到跨进程锁 / 写盘异常）。
+    #   ★ GUI 侧接线：连到状态栏提示"设置未生效"（接线点由 GUI 批次统一派发）。
+    config_save_failed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -306,21 +319,62 @@ class ScanCoordinator(QObject):
         self._pool.setMaxThreadCount(4)
         self._cancel_events: dict = {}
         self._cancel_mutex = QMutex()
+        # 最近一次**配置写入尝试**的结果（没有尝试过 ⇒ True）。
+        # 调用方（如 load_config 返回值必须是 dict 的老契约）可据此感知失败。
+        self.last_config_save_ok: bool = True
 
     # ── 配置 ──
 
     def load_config(self):
+        """
+        读配置并补齐纠偏阈值缺省值。返回配置字典（**契约不变**）。
+
+        ★ 返回值必须是 dict（GUI 与 tests/test_b4_4_skew_pipeline.py 都这么用），
+          所以"补默认值那次落盘"的成功/失败**不通过返回值**表达，而是：
+            ① `self.last_config_save_ok`（本次结果）
+            ② `config_save_failed(context)` 信号
+          两者都由 `_save_config_checked` 统一产出。
+        """
         cfg = load_config()
         changed = apply_deskew_defaults(cfg)
         self.cfg = cfg
         if changed:
             # 纠偏阈值写进 scan_config.json（缺省值落盘，用户可在 GUI 里改）
-            self.save_config()
+            self._save_config_checked("加载配置时写入纠偏阈值缺省值")
         return self.cfg
 
     def save_config(self):
-        """保存配置。返回是否真的写入（False = 本次未存上）。"""
+        """
+        保存配置。返回是否真的写入（False = 本次未存上）。
+
+        ★ **不抛异常**（拿不到跨进程锁 / 写盘失败都只返回 False）。
+          协调器内部的调用点一律走 `_save_config_checked`：
+          它额外做「记 error 日志 + 置 last_config_save_ok + 发失败信号」。
+        """
         return save_config(self.cfg)
+
+    def _save_config_checked(self, context: str) -> bool:
+        """
+        写配置并**如实报告**结果 —— 协调器侧所有配置写入的统一出口。
+
+        :param context: 失败时用于定位的场景名（如 "持久化扫描参数"）
+        :return: True = 已落盘；False = 拿不到跨进程锁 / 写失败（**本次未写入**）
+
+        失败时三件事同时做（缺一不可）：
+          ① 记 **error** 日志 —— 写失败绝不能只留一条 debug（用户会以为已保存）；
+          ② 置 `self.last_config_save_ok = False`（供不能改返回值的调用方感知）；
+          ③ 发 `config_save_failed(context)` 信号（供 GUI 接线成用户可见提示）。
+        ★ 不抛异常：GUI 槽里未捕获异常会把整个保存流程打断。
+        """
+        ok = bool(self.save_config())
+        self.last_config_save_ok = ok
+        if not ok:
+            logger.error("配置未落盘（%s）：拿不到跨进程锁或写失败，本次未写入", context)
+            try:
+                self.config_save_failed.emit(context)
+            except Exception as e:       # pragma: no cover - 对象已销毁等极端情况
+                logger.debug("发 config_save_failed 信号失败: %s", e)
+        return ok
 
     def deskew_settings(self) -> dict:
         """
@@ -333,17 +387,24 @@ class ScanCoordinator(QObject):
         cfg = self.cfg if isinstance(self.cfg, dict) and self.cfg else load_config()
         return resolve_deskew_settings(cfg)
 
-    def set_custom_name(self, ip: str, name: str):
-        """设置设备自定义名称"""
+    def set_custom_name(self, ip: str, name: str) -> bool:
+        """
+        设置设备自定义名称。返回**是否真的落盘**（False = 本次未存上）。
+
+        ★ 复审 A4-1：此前这里把 `save_config` 的返回值吞掉了，写失败完全静默。
+          现在如实返回 —— GUI 侧历史上绕开了本方法（自己写一份配置，
+          见 hp_scan_gui_pyside.py 的改名路径），可以直接改为复用本方法。
+        """
         nicknames = self.cfg.get("nicknames", {})
         nicknames[ip] = name
         self.cfg["nicknames"] = nicknames
-        self.save_config()
+        ok = self._save_config_checked("设置设备自定义名称 (%s)" % ip)
         # 更新内存中的扫描仪
         for s in self.scanners:
             if s.ip == ip:
                 s.custom_name = name
                 break
+        return ok
 
     # ── 扫描仪管理 ──
 
@@ -446,7 +507,7 @@ class ScanCoordinator(QObject):
                         nicknames[s.ip] = s.custom_name
             self.cfg["saved_ips"] = ips
             self.cfg["nicknames"] = nicknames
-            self.save_config()
+            self._save_config_checked("保存已发现的扫描仪列表")
 
             on_complete(len(new_scanners), new_scanners)
         threading.Thread(target=_discover, daemon=True).start()
@@ -701,6 +762,48 @@ class ScanCoordinator(QObject):
         if ev is not None:
             ev.set()
 
+    # ── 外部取消事件登记（公开 API）──────────────────────────────
+
+    def register_external_cancel(self, job_id: str, cancel_event) -> None:
+        """
+        把**外部创建的**取消事件登记到 job_id 上，使 `cancel_scan(job_id)` 能停掉它。
+
+        与 `start_scan` 内部登记的事件**同机制**（同一把 `_cancel_mutex`、
+        同一张 `_cancel_events` 表）⇒ 取消信号走的是同一条链路。
+
+        :param job_id: 任务 id（外部自己生成即可，协调器不需要认识这个任务）
+        :param cancel_event: **由调用方创建**的取消事件（如 `threading.Event`）；
+            协调器**只负责置位**（`set()`），不负责创建、也不负责取消之外的任何事。
+
+        ★ 为什么需要它：GUI 的 WIA 路径自己起线程、自己建 event，此前是
+          **直接写进协调器的私有字典**（`coordinator._cancel_events[job_id] = ev`）
+          —— 功能是通的，但属于跨模块私有耦合，协调器一改字段名就静默断掉。
+          改走本公开 API 后，私有字段的重构不会再波及外部调用方。
+        ★ 登记成功后**必须**调用 `unregister_external_cancel(job_id)` 注销，
+          否则条目会残留在表里（`shutdown()` 时会被误置位）。
+        ★ 覆盖语义：同一 job_id 重复登记 ⇒ 后者覆盖前者（并记 warning）。
+        """
+        if not job_id:
+            raise ValueError("job_id 不能为空")
+        if cancel_event is None:
+            raise ValueError("cancel_event 不能为 None")
+        if not hasattr(cancel_event, "set"):
+            raise TypeError(
+                "cancel_event 必须支持 set()（如 threading.Event）: %s"
+                % type(cancel_event).__name__)
+        with QMutexLocker(self._cancel_mutex):
+            if job_id in self._cancel_events:
+                logger.warning("job_id %s 已有取消事件，外部登记将覆盖", job_id)
+            self._cancel_events[job_id] = cancel_event
+
+    def unregister_external_cancel(self, job_id: str) -> None:
+        """
+        注销外部登记的取消事件（与 `register_external_cancel` 成对使用）。
+
+        幂等：没登记过也不报错。
+        """
+        self._clear_cancel_event(job_id)
+
     def shutdown(self) -> None:
         """取消全部在途任务并停止线程池。GUI 关闭时调用。"""
         with QMutexLocker(self._cancel_mutex):
@@ -748,8 +851,12 @@ class ScanCoordinator(QObject):
     # ── 持久化辅助 ──
 
     def persist_scan_settings(self, resolution, color_mode, output_format,
-                               output_dir, source_label):
-        """将当前扫描参数写入配置"""
+                               output_dir, source_label) -> bool:
+        """
+        将当前扫描参数写入配置。返回**是否真的落盘**（False = 本次未存上）。
+
+        ★ 复审 A4-1：此前返回值被吞掉，写失败完全静默。
+        """
         self.cfg.update({
             "resolution": resolution,
             "color_mode_ui": color_mode,
@@ -757,7 +864,7 @@ class ScanCoordinator(QObject):
             "output_dir": output_dir,
             "source": source_label,
         })
-        self.save_config()
+        return self._save_config_checked("持久化扫描参数")
 
 
 def _check_cancel(cancel_event, job_id: str) -> None:

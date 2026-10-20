@@ -93,15 +93,33 @@ def group_pages(pages, group_size=None):
     :return: 分组列表（list[list]）
 
     · 7 页 + group_size=3 ⇒ 3 组，页数分布 [3, 3, 1]
-    · 空输入 ⇒ []（没有页就没有组）
-    · group_size 必须为正整数，否则抛 ValueError
+    · 空页列表 ⇒ 抛 ValueError（**没有页就没有组**，不产出空组）
+    · group_size 必须为**正整数**，否则抛 ValueError
     · ★ 输入不被修改
+
+    ★ 异常类型统一为 **ValueError**（复审 D-1）：
+      参数**值**非法（0 / 负数 / 空页列表）⇒ ValueError；
+      group_size **类型**不对（float / str / bool）⇒ 同样 ValueError ——
+      它也是"这个参数值不合法"，不是"类型不支持"。
+      这样调用方按 docstring `except ValueError` 一把接住即可，
+      不会因为内部 `range()` 抛 TypeError 而漏接。
     """
     pages = list(pages)
+
+    # ① 先校验 group_size（**在空列表判断之前**）：
+    #    非正整数 / 非整数一律 ValueError，不让它落到 range() 的 TypeError
+    if group_size is not None:
+        if isinstance(group_size, bool) or not isinstance(group_size, int):
+            raise ValueError(
+                "group_size 必须为正整数（不支持 %s）: %r"
+                % (type(group_size).__name__, group_size))
+        if group_size <= 0:
+            raise ValueError("group_size 必须为正整数（> 0）: %r" % (group_size,))
+
+    # ② 空页列表 ⇒ 报错（不产出一个空组）
     if not pages:
-        return []
+        raise ValueError("pages 不能为空：没有页就没有组")
+
     if group_size is None:
         return [pages]
-    if group_size <= 0:
-        raise ValueError("group_size 必须为正整数: %r" % (group_size,))
     return [pages[i:i + group_size] for i in range(0, len(pages), group_size)]
