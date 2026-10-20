@@ -258,3 +258,63 @@ class TestCancelAndShutdown:
         coordinator._cancel_events["b"] = e2
         coordinator.shutdown()
         assert e1.is_set() and e2.is_set()
+
+    def test_start_scan_cancel_chain(self, coordinator, scanner, tmp_path,
+                                     cache_root, qt_app):
+        """端到端取消链路：start_scan → cancel_scan → 引擎中止 → scan_cancelled。
+
+        补的是 I-3 的取消半边：现有 test_cancel_scan_sets_event 直写
+        _cancel_events，绕过了"协调器自己注册 event"这一环，测不到
+        cancel_scan 置位的是不是引擎拿到的那个 event。
+        """
+        cancelled = []
+        finished = []
+        failed = []
+        observed = {}
+
+        def fake_scan(**kwargs):
+            # 模拟引擎在轮询点观察 cancel_event：置位才中止
+            ev = kwargs.get("cancel_event")
+            observed["event"] = ev
+            deadline = time.time() + 5
+            while time.time() < deadline and not (ev is not None and ev.is_set()):
+                time.sleep(0.01)
+            observed["engine_saw_cancel"] = bool(ev is not None and ev.is_set())
+            return (None, "jpg")
+
+        coordinator.scan_cancelled.connect(lambda jid: cancelled.append(jid))
+        coordinator.scan_finished.connect(lambda jid, res: finished.append(jid))
+        coordinator.scan_failed.connect(lambda jid, err: failed.append((jid, err)))
+
+        with mock.patch("scan_coordinator.execute_scan", side_effect=fake_scan):
+            job_id = coordinator.start_scan(scanner, _params(tmp_path))
+            # 协调器自己注册了 job_id → cancel_event 的映射
+            assert job_id in coordinator._cancel_events, "协调器未注册 cancel_event"
+            registered = coordinator._cancel_events[job_id]
+
+            # 等工作线程进入引擎（此时它正阻塞在 cancel_event 上）
+            deadline = time.time() + 5
+            while time.time() < deadline and "event" not in observed:
+                qt_app.processEvents()
+                time.sleep(0.01)
+            assert "event" in observed, "工作线程未进入引擎"
+
+            # 用注册表里的 job_id 取消
+            coordinator.cancel_scan(job_id)
+
+            # 等信号（跨线程信号靠主线程事件循环投递）
+            deadline = time.time() + 5
+            while time.time() < deadline and not cancelled:
+                qt_app.processEvents()
+                time.sleep(0.01)
+        coordinator.shutdown()
+
+        # 1) 引擎拿到的就是协调器注册的那个 event，cancel_scan 置位的也是它
+        assert observed["event"] is registered
+        assert registered.is_set()
+        # 2) 引擎侧确实观察到了取消
+        assert observed["engine_saw_cancel"] is True
+        # 3) 收到 scan_cancelled，且没有 scan_finished / scan_failed
+        assert cancelled == [job_id]
+        assert finished == []
+        assert failed == []
