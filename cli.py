@@ -12,12 +12,12 @@ import shutil
 import sys
 import tempfile
 import traceback
-import uuid
 from datetime import datetime
 
 # 确保能导入同目录模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import naming
 from escl_engine import (
     discover_scanners, probe_escl, fetch_capabilities,
     get_scanner_status, execute_scan, ScannerInfo,
@@ -171,45 +171,34 @@ def _write_pdf_via_save_manager(data: bytes, fpath: str,
     return fpath
 
 
-def _unique_token() -> str:
-    """
-    6 位随机唯一成分：**1 位字母（a–p）+ 5 位十六进制**（**不依赖时钟分辨率**）。
-
-    ★ 为什么首字符固定是字母：产物名已有**分组编号**规则
-      （`{base}_{组号:03d}.ext` / `{base}_{N:03d}.ext`）⇒ 纯数字的尾巴
-      会被误读成组号/页号 ⇒ 尾巴一律以字母开头 ⇒ 一眼可辨"这是随机成分"。
-    ★ 用 `uuid4()` 而不是计数器：CLI 每次都是**新进程** ⇒ 进程内计数器
-      在两次调用之间会重置 ⇒ 反而更容易撞名。
-    """
-    raw = uuid.uuid4().hex[:6]
-    return chr(ord("a") + int(raw[0], 16) % 26) + raw[1:]
-
-
 def _timestamped_name(prefix: str, ext: str) -> str:
     """
     生成「时间戳 + 随机唯一成分」的输出文件名。
 
-    格式：`{prefix}_{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}.{ext}`
+    格式：`{prefix}_{YYYYmmdd}_{HHMMSS}_{唯一成分}.{ext}`
+    （唯一成分 = **1 位字母（a–p）+ 7 位十六进制**，见 `naming` 模块）
 
-    ★ 为什么**光有微秒不够**（复审 I1 → 2026-10-21 实测订正）：
+    ★ 时间戳是**秒级**的（2026-10-21 统一形态）：
       本机 Windows 的**系统时钟粒度是 15.625 ms**
       （`time.get_clock_info('time').resolution` 实测 0.015625）
-      ⇒ 相邻两次 `datetime.now().strftime('%f')` 的结果 **99.5% 完全相同**
-      ⇒ 只把「秒」提到「微秒」**并不能**避免撞名：
-      同一 tick 内完成的两批 CLI 扫描算出**同一个文件名**
+      ⇒ 同一 tick 内两次取名的 `%f` **99.5% 完全相同**
+      ⇒ 之前那 6 位微秒**没有额外信息量** ⇒ 留着是**虚假精度** ⇒ 已下线。
+      同一秒内完成的两批 CLI 扫描若算出**同一个文件名**
       ⇒ 后写的把先写的整个覆盖掉 ⇒ 先写的那批产物**静默消失**
-      （用户看不到、也没有任何报错）。
-    ★ 唯一性来自 `uuid4().hex[:6]`（24 bit 随机，见 `_unique_token`）
-      ⇒ **不依赖时钟分辨率**：同一 tick / 同一微秒 / 同一秒内都必然不同。
+      （用户看不到、也没有任何报错）—— 这靠**随机成分**解决，不靠时钟。
+    ★ 唯一性来自 `uuid4()`（`naming.unique_token`）
+      ⇒ **不依赖时钟分辨率**：同一 tick / 同一秒内都必然不同。
+    ★ 唯一成分**首字符是字母** ⇒ 永远不会被误读成分组编号（`_001`）。
     ★ 不用「撞名加 -1/-2 序号」：产物名已有**分组编号**规则
       （`{base}_{组号}_{组内号}.ext` / `{base}_{N:03d}.ext`）
       ⇒ 再加序号会与组号混淆。
     ★ 时间戳仍在**前面** ⇒ 人一眼能看出大致何时产生（可读性不丢）。
     ★ CLI 侧**没有** GUI 那层 `_OutputNameGuard` 兜底：CLI 自己造名、
       自己落盘（`save_manager` 落盘是覆盖写）⇒ 这个唯一性是**必需**的。
+    ★ 形态与协调器 / GUI **共用** `naming` 模块的**同一份**实现
+      （三处不能互相 import ⇒ 收敛到零依赖模块）。
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{prefix}_{ts}_{_unique_token()}.{ext}"
+    return naming.build_output_name(prefix, ext, now=datetime.now())
 
 
 def cmd_scan(args):
@@ -276,10 +265,11 @@ def cmd_scan(args):
 
     # 保存文件
     os.makedirs(output, exist_ok=True)
-    # ★ 产物名唯一（复审 I1 → 2026-10-21 订正）：CLI 自己造名、不走协调器
-    #   ⇒ 名字里除时间戳外还带一段**随机唯一成分**（`uuid4().hex[:6]`）。
+    # ★ 产物名唯一（复审 I1 → 2026-10-21 统一形态）：CLI 自己造名、不走协调器
+    #   ⇒ 名字里除秒级时间戳外还带一段**随机唯一成分**
+    #   （`naming.unique_token()`：1 位字母 + 7 位十六进制，来自 uuid4）。
     #   只靠时间戳是不够的：本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次
-    #   取名的微秒值 99.5% 相同 ⇒ 后写的会覆盖先写的（产物静默消失）。
+    #   取名的时间戳完全相同 ⇒ 后写的会覆盖先写的（产物静默消失）。
     #   CLI 侧没有 GUI 的 `_OutputNameGuard` 兜底 ⇒ 这里必须自己保证唯一。
     fname = _timestamped_name("HP_CLI", ext)
     fpath = os.path.join(output, fname)

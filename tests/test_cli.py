@@ -357,7 +357,7 @@ class TestCmdScanSave:
 
 class TestOutputFilenamePrecision:
     """
-    ★ 回归（复审 I1）：CLI 的产物名必须到**微秒**。
+    ★ 回归（复审 I1）：CLI 的产物名必须**同一秒内不撞名**。
 
     ★ 关键事实：CLI 走的是 `escl_engine.execute_scan`，**根本不经过协调器**
       ⇒ 协调器那次「秒 → 毫秒」的改动**覆盖不到 CLI 这条链**。
@@ -367,34 +367,43 @@ class TestOutputFilenamePrecision:
 
     ★ 2026-10-21 订正：**只到微秒仍然不够** ——
       本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次取名的 `%f` 99.5% 相同
-      ⇒ 契约扩成 `YYYYMMDD_HHMMSS_ffffff_<6 位随机>`（随机成分不依赖时钟）。
-      本类下面那条**精确形状**断言（"时间戳正好 22 字符、三段"）随之改成
-      **四段**（时间戳三段 + 唯一成分一段）—— 意图不变：微秒段必须还在、
-      且必须还是 6 位数字。
+      ⇒ 契约扩成 `YYYYMMDD_HHMMSS_<随机唯一成分>`（随机成分不依赖时钟）。
+
+    ★ 2026-10-21 再订正（统一形态，主控拍板）：**去掉微秒段** ——
+      同 tick 内那 6 位微秒 99.5% 相同 ⇒ **没有额外信息量** ⇒ 留着是
+      **虚假精度**（让人误以为精确到微秒）。
+      ⇒ 契约最终定为 `YYYYMMDD_HHMMSS_<1 位字母 + 7 位十六进制>`，
+        基名**三段**（日期 / 时分秒 / 唯一成分）。
+      本类下面那条**精确形状**断言随之改成**三段**—— 意图不变：
+        同一秒内的两批必须不同，且唯一成分**首字符是字母**
+        （永远不会长得像分组编号 `_001`）。
     """
 
-    def test_filename_carries_microseconds(self):
+    def test_filename_shape_is_unified(self):
         name = cli._timestamped_name("HP_CLI", "jpg")
         assert name.startswith("HP_CLI_") and name.endswith(".jpg")
-        ts = name[len("HP_CLI_"):-len(".jpg")]
-        # 期望格式：YYYYMMDD_HHMMSS_ffffff_<6 位随机唯一成分>
-        parts = ts.split("_")
-        assert len(parts) == 4, (
-            "应为「日期_时分秒_微秒_唯一成分」四段，实际 %r" % (ts,))
-        date, clock, micro, token = parts
+        stem = name[len("HP_CLI_"):-len(".jpg")]
+        # 期望格式：YYYYMMDD_HHMMSS_<1 位字母 + 7 位十六进制>
+        parts = stem.split("_")
+        assert len(parts) == 3, (
+            "应为「日期_时分秒_唯一成分」三段（不许再有微秒段），实际 %r"
+            % (stem,))
+        date, clock, token = parts
         assert date.isdigit() and len(date) == 8, date
         assert clock.isdigit() and len(clock) == 6, clock
-        assert micro.isdigit() and len(micro) == 6, micro
-        assert len(token) == 6 and all(c in "0123456789abcdef" for c in token[1:]), (
-            "唯一成分必须是「1 位字母 + 5 位十六进制」，实际 %r" % (token,))
+        assert len(token) == 8 and all(c in "0123456789abcdef" for c in token[1:]), (
+            "唯一成分必须是「1 位字母 + 7 位十六进制」，实际 %r" % (token,))
         assert token[0] in "abcdefghijklmnop", (
             "唯一成分首字符必须是字母 ⇒ 不会被误读成组号/页号，实际 %r" % (token,))
 
     def test_two_batches_in_the_same_second_get_different_names(self, monkeypatch):
         """★ 关键行为断言：**同一秒内**的两批 ⇒ 名字必须不同。
 
-        把时间**冻结在同一秒**（只让微秒推进）⇒ 改回秒精度时两个名字会
-        完全相同 ⇒ 这条断言会红（不是"什么都没发生也能过"的空转断言）。
+        把时间**冻结在同一秒**（只让微秒推进）⇒ 两批必须落在同一秒里
+        （否则这条断言没测到东西）⇒ 名字仍必须不同。
+
+        ★ 2026-10-21 统一形态：唯一性来自**随机唯一成分**（uuid4），
+          **不依赖**时钟精度（微秒段已下线）⇒ 即使时间完全冻死也不撞名。
         """
         from datetime import datetime as _dt
 

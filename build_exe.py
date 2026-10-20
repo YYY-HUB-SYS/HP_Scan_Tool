@@ -115,6 +115,8 @@ with tempfile.TemporaryDirectory(prefix="hp_scan_tool_version_") as version_dir:
         "--hidden-import", "cache_manager",
         "--hidden-import", "history_manager",
         "--hidden-import", "profile_manager",
+        # 命名形态的统一实现（零第三方依赖，只用 uuid + datetime）
+        "--hidden-import", "naming",
         # 第三方依赖
         "--hidden-import", "requests",
         "--hidden-import", "urllib3",

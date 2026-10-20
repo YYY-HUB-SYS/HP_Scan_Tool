@@ -24,7 +24,9 @@ CLI 的 **JSON 编码契约** + **`--limit` 条数语义** + **`%f` 单位注释
 ③ `--limit` 为负数必须**明确报错**：`records[--1:]` 是合法 Python
    ⇒ 语义诡异（返回「除最旧一条外的全部」）⇒ 不允许静默。
 
-④ 【复审 M-3】`%f` 是**微秒**（6 位小数秒），**不是毫秒**。
+④ 【复审 M-3 → 2026-10-21 统一形态】产物名里的时间戳**只到秒**，
+   且**不许**把精度说高（既不许写「毫秒」，也不许留一个同 tick 内
+   必然重复的微秒段 —— 那是**虚假精度**）。
 
 ★ 用户数据零污染
    - 进程内用例：走 `tests/conftest.py` 的 APPDATA 沙箱（`_isolate_user_data`）；
@@ -400,7 +402,20 @@ class TestHistoryLimitPositiveStillWorks:
 # ══════════════════════════════════════════════════════════════════════
 
 class TestTimestampPrecisionIsMicroseconds:
-    """★ `%f` = 微秒（6 位小数秒），不是毫秒（差 1000 倍）。"""
+    """★ 时间戳的精度描述必须与**实际形态**一致。
+
+    ★ 2026-10-21 统一形态：产物名里的时间戳**只到秒**
+      （``{YYYYmmdd}_{HHMMSS}``）—— 微秒段**已下线**。
+
+      为什么下线：本机 Windows **系统时钟粒度实测 15.625 ms**
+      ⇒ 同一 tick 内两次 ``strftime("%f")`` 的结果 **99.5% 完全相同**
+      ⇒ 那 6 位微秒**没有额外信息量** ⇒ 保留它是**虚假精度**
+      （会让人误以为产物名精确到微秒）。
+
+      ⇒ 本类的意图从「`%f` 是微秒不是毫秒」**升级**为
+        「**不许**把精度说高 / 做高」：既不许写「毫秒」，
+        也不许在名字里留一个同 tick 内必然重复的微秒段。
+    """
 
     def test_cli_py_never_claims_milliseconds(self):
         """cli.py 里不许再出现「毫秒」的说法（该文件唯一的时间精度讨论就是 `%f`）。"""
@@ -410,26 +425,27 @@ class TestTimestampPrecisionIsMicroseconds:
         assert offenders == [], (
             "cli.py 里 %%f 是**微秒**，不许写成「毫秒」：%r" % (offenders,))
 
-    def test_timestamped_name_docstring_says_microseconds(self):
-        """`_timestamped_name` 的 docstring 必须写「微秒」。"""
+    def test_timestamped_name_docstring_states_second_level_precision(self):
+        """`_timestamped_name` 的 docstring 必须写明「秒级」且不写「毫秒」。"""
         doc = cli._timestamped_name.__doc__ or ""
-        assert "毫秒" not in doc, "docstring 把 %%f 说成了毫秒：%r" % doc
-        assert "微秒" in doc, "docstring 必须写明「微秒」：%r" % doc
+        assert "毫秒" not in doc, "docstring 把时间精度说成了毫秒：%r" % doc
+        assert "秒级" in doc, "docstring 必须写明「秒级」：%r" % doc
 
-    def test_generated_name_carries_six_digit_microseconds(self):
-        """事实锚点：文件名里的时间戳**微秒段**是 **6 位**小数秒（微秒）。
+    def test_generated_name_has_no_microsecond_segment(self):
+        """事实锚点：产物名里**没有**微秒段（基名只有三段）。
 
-        ★ 2026-10-21 订正：产物名契约扩成
-          `{前缀}_{YYYYmmdd}_{HHMMSS}_{ffffff}_{6 位随机唯一成分}.{ext}`
-          ⇒ 微秒段从"最后一段"挪到**倒数第二段**（最后一段是随机唯一成分）。
-          本断言的**意图不变**：微秒段必须还在、且必须还是 6 位数字。
+        ★ 2026-10-21：契约定为
+          `{前缀}_{YYYYmmdd}_{HHMMSS}_{1 位字母 + 7 位十六进制}.{ext}`
+          ⇒ 基名从**四段**变成**三段**（微秒段下线）。
+        ★ 意图不变（而且更强）：时间戳的精度描述必须**与名字里实际的段数一致**
+          —— 名字里写多细，就必须真有那么多信息量。
         """
         name = cli._timestamped_name("HP_CLI", "pdf")
         stem = name[len("HP_CLI_"):-len(".pdf")]
         parts = stem.split("_")
-        assert len(parts) == 4, (
-            "应为「日期_时分秒_微秒_唯一成分」四段，实际 %r" % (name,))
-        micros = parts[2]
-        assert micros.isdigit(), "时间戳里的微秒段不是数字：%r" % name
-        assert len(micros) == 6, (
-            "%f 是 6 位微秒，实际 %r（%d 位）" % (name, micros, len(micros)))
+        assert len(parts) == 3, (
+            "应为「日期_时分秒_唯一成分」三段（不许再有微秒段），实际 %r" % (name,))
+        assert parts[1].isdigit() and len(parts[1]) == 6, (
+            "第二段必须是 6 位时分秒：%r" % name)
+        assert re.fullmatch(r"[a-p][0-9a-f]{7}", parts[2]), (
+            "第三段必须是「1 位字母 + 7 位十六进制」的随机唯一成分：%r" % name)

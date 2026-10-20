@@ -11,7 +11,6 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -31,6 +30,7 @@ import cache_manager
 import doc_merge
 import document_session
 import history_manager
+import naming
 import page_meta
 import preset_manager
 import profile_manager
@@ -700,57 +700,42 @@ def _refresh_scan_button(app):
         logger.debug("刷新扫描按钮状态失败（控件已销毁）")
 
 
-def _unique_token() -> str:
-    """
-    6 位随机唯一成分：**1 位字母（a–p）+ 5 位十六进制**（**不依赖时钟分辨率**）。
-
-    ★ 为什么首字符固定是字母：产物名已有**分组编号**规则
-      （`{base}_{组号:03d}.ext` / `{base}_{N:03d}.ext`）⇒ 纯数字的尾巴
-      会被误读成组号/页号 ⇒ 尾巴一律以字母开头 ⇒ 一眼可辨"这是随机成分"。
-    ★ 用 `uuid4()` 而不是进程内计数器：GUI 是长驻进程，计数器在重启后会
-      从头再来 ⇒ 反倒更容易与重启前的名字撞上。
-    """
-    raw = uuid.uuid4().hex[:6]
-    return chr(ord("a") + int(raw[0], 16) % 26) + raw[1:]
-
-
 def _timestamped_output_name(prefix: str, ext: str) -> str:
     """
-    用户可见的输出文件名：`{prefix}_{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}.{ext}`。
+    用户可见的输出文件名：`{prefix}_{YYYYmmdd}_{HHMMSS}_{唯一成分}.{ext}`。
 
-    ★ 为什么**光有微秒不够**（2026-10-21 实测订正）：
+    ★ 唯一成分 = **1 位字母（a–p）+ 7 位十六进制**（见 `naming` 模块）
+      ⇒ 唯一性来自 `uuid4()` ⇒ **不依赖时钟分辨率**。
+    ★ 为什么**不再带微秒段**（2026-10-21 统一形态）：
       本机 Windows 的**系统时钟粒度是 15.625 ms**
       （`time.get_clock_info('time').resolution` 实测 0.015625）
-      ⇒ 相邻两次 `datetime.now().strftime('%f')` 的结果 **99.5% 完全相同**
-      ⇒ 只把「秒」提到「微秒」**并不能**避免撞名：
-      同一 tick 内完成的两批会算出**同一个文件名**
-      ⇒ 后一批把前一批整个覆盖掉 ⇒ 用户侧「刚才那批不见了」，**无任何报错**。
-    ★ 唯一性来自 `uuid4().hex[:6]`（24 bit 随机，见 `_unique_token`）
-      ⇒ **不依赖时钟分辨率**。
+      ⇒ 同一 tick 内两次取名的 `%f` **99.5% 完全相同**
+      ⇒ 那 6 位微秒**没有额外信息量** ⇒ 留着是**虚假精度** ⇒ 已下线。
+      真正消除撞名的是**随机唯一成分**，不是时间戳精度。
     ★ 不改命名契约：扩展名、单页/多页、`save_manager.build_output_name` 的
       **分组编号规则**一律不动 —— 只在**时间戳之后**追加唯一成分。
     ★ 不用「撞名加 -1/-2 序号」：序号会与分组编号（`_001`）混淆。
     ★ 时间戳仍在**前面** ⇒ 人一眼能看出大致何时产生（可读性不丢）。
+    ★ 形态与协调器 / CLI **共用** `naming` 模块的**同一份**实现。
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{prefix}_{ts}_{_unique_token()}.{ext}"
+    return naming.build_output_name(prefix, ext, now=datetime.now())
 
 
 def _timestamped_job_id() -> str:
     """
-    GUI 侧的任务 id：`{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}`。
+    GUI 侧的任务 id：`{YYYYmmdd}_{HHMMSS}_{唯一成分}`。
 
     ★ 为什么 job_id 也要带唯一成分：
       job_id **直接当缓存目录名**用（`cache_root/<job_id>/`）
       ⇒ 同一 tick 内的两次扫描若拿到同一个 job_id
       ⇒ **共用同一个缓存目录** ⇒ 后写的页把先写的页**逐页覆盖**掉
       ⇒ 产物静默少页（页码相同 ⇒ 同名文件被覆盖）。
-    ★ 与 `_timestamped_output_name` 同源（同一个随机成分机制），
-      同样**不依赖时钟分辨率**。
-    ★ 协调器侧（`scan_coordinator.py`）的 job_id 由另一条线负责，不在本文件范围。
+    ★ 与 `_timestamped_output_name` **同源同一个函数**（`naming` 模块）
+      ⇒ 同样**不依赖时钟分辨率**。
+    ★ 协调器侧（`scan_coordinator.py`）的 job_id 走**同一个** `naming` 实现
+      ⇒ 两个入口的 job_id 形态**逐字一致**。
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    return f"{ts}_{_unique_token()}"
+    return naming.build_job_id(now=datetime.now())
 
 
 class _OutputNameGuard:

@@ -15,13 +15,17 @@ r"""
 
 契约（本次修复后）
 ------------------
-产物名 = `{前缀}_{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}.{扩展名}`
+产物名 = `{前缀}_{YYYYmmdd_HHMMSS}_{8 位随机唯一成分}.{扩展名}`
 
-* 唯一成分来自 `uuid4().hex[:6]` ⇒ **不依赖时钟分辨率**。
+* 唯一成分 = **1 位字母（a–p）+ 7 位十六进制**，来自 `uuid4()`
+  ⇒ **不依赖时钟分辨率**。
 * 时间戳仍在**前面** ⇒ 人一眼能看出大致何时产生（可读性不丢）。
 * 扩展名 / 单页多页 / `save_manager.build_output_name` 的**分组编号规则**一字未改。
 * **不用**「撞名加 -1/-2 序号」：产物名已有分组编号规则
   （`{base}_{组号}_{组内号}.ext` / `{base}_{N:03d}.ext`）⇒ 序号会与组号混淆。
+* ★ 2026-10-21 统一形态：**去掉微秒段**（本机时钟粒度 15.625 ms ⇒
+  同 tick 内 99.5% 相同 ⇒ 留着是**虚假精度**），并与协调器 / CLI 共用
+  `naming` 模块的**同一份**实现（形态不再分叉）。
 
 覆盖面
 ------
@@ -73,10 +77,11 @@ GUI_PATH = os.path.join(PROJECT_ROOT, "hp_scan_gui_pyside.py")
 # 一个「同一 tick」内的固定时刻（两次调用拿到的 `%f` 完全相同）
 _FROZEN = _real_datetime(2026, 10, 21, 4, 52, 13, 123456)
 
-# 产物名契约：{前缀}_{YYYYmmdd}_{HHMMSS}_{ffffff}_{6位随机}.{ext}
-# ★ 唯一成分 = 1 位字母（a–p）+ 5 位十六进制 ⇒ 尾巴**永远不会**长得像组号。
+# 产物名契约：{前缀}_{YYYYmmdd}_{HHMMSS}_{8位随机}.{ext}
+# ★ 唯一成分 = 1 位字母（a–p）+ 7 位十六进制 ⇒ 尾巴**永远不会**长得像组号。
+# ★ 2026-10-21：**去掉微秒段**（虚假精度）⇒ 基名只有三段。
 _NAME_RE = re.compile(r"^(?P<prefix>[A-Za-z_]+)_(?P<date>\d{8})_(?P<clock>\d{6})"
-                       r"_(?P<micro>\d{6})_(?P<token>[a-p][0-9a-f]{5})\.(?P<ext>[A-Za-z0-9]+)$")
+                       r"_(?P<token>[a-p][0-9a-f]{7})\.(?P<ext>[A-Za-z0-9]+)$")
 
 
 class _FrozenClock:
@@ -94,8 +99,22 @@ def _freeze_clock(monkeypatch, module):
     monkeypatch.setattr(module, "datetime", _FrozenClock(_FROZEN))
 
 
+def _has_no_microsecond_segment(name):
+    """★ 产物名的基名里**不许**再有微秒段（6 位小数秒）。
+
+    理由：本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次 `%f` 99.5% 相同
+    ⇒ 那 6 位**没有额外信息量** ⇒ 留着是**虚假精度**。
+
+    判据：基名的**尾部三段**必须是「日期(8 位数字) / 时分秒(6 位数字) /
+    唯一成分(1 字母 + 7 位十六进制)」⇒ 中间**没有**多出来的 6 位微秒段。
+    （前缀里可能也有下划线，如 ``HP_CLI`` ⇒ 从**尾部**对齐，不按前缀切。）
+    """
+    stem = name.rsplit(".", 1)[0]
+    return bool(re.search(r"\d{8}_\d{6}_[a-p][0-9a-f]{7}$", stem))
+
+
 def _timestamp_name_call_sites(path):
-    """返回文件里所有 `strftime("%Y%m%d_%H%M%S_%f")` 调用点所在的函数名。"""
+    """返回文件里所有 `strftime(...)` 调用点所在的函数名。"""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     parents = {}
     for node in ast.walk(tree):
@@ -107,10 +126,6 @@ def _timestamp_name_call_sites(path):
             continue
         func = node.func
         if not (isinstance(func, ast.Attribute) and func.attr == "strftime"):
-            continue
-        if not node.args or not isinstance(node.args[0], ast.Constant):
-            continue
-        if node.args[0].value != "%Y%m%d_%H%M%S_%f":
             continue
         cur = node
         name = "<module>"
@@ -148,8 +163,9 @@ class TestCliOutputName:
         assert m.group("prefix") == "HP_CLI"
         assert m.group("date") == "20261021"
         assert m.group("clock") == "045213"
-        assert m.group("micro") == "123456", "时间戳的微秒段必须保留"
         assert m.group("ext") == "jpg", "扩展名必须一字未改"
+        assert _has_no_microsecond_segment(name), (
+            "产物名里不许再有微秒段（虚假精度）：%r" % name)
 
     def test_many_names_in_the_same_tick_are_all_distinct(self, monkeypatch):
         """同一 tick 内连续取 200 个名 ⇒ 全部不同（唯一成分不是摆设）。"""
@@ -170,6 +186,8 @@ class TestCliOutputName:
             "唯一成分跟着时钟走 ⇒ 同一 tick 内必然撞名: %r / %r" % (a, b))
         assert token_a != "123456", (
             "唯一成分就是微秒本身 ⇒ 同一 tick 内必然撞名: %r" % a)
+        assert _has_no_microsecond_segment(a), (
+            "产物名里还留着微秒段（虚假精度）: %r" % a)
 
     def test_two_batches_in_same_tick_both_reach_disk(self, tmp_path, monkeypatch):
         """★ 用户侧症状的直接复现：同一 tick 的两批 ⇒ 磁盘上必须有两个产物。
@@ -215,8 +233,9 @@ class TestGuiOutputName:
         assert m.group("prefix") == prefix
         assert m.group("date") == "20261021"
         assert m.group("clock") == "045213"
-        assert m.group("micro") == "123456", "时间戳的微秒段必须保留"
         assert m.group("ext") == "pdf"
+        assert _has_no_microsecond_segment(name), (
+            "产物名里不许再有微秒段（虚假精度）：%r" % name)
 
     def test_many_names_in_the_same_tick_are_all_distinct(self, monkeypatch):
         _freeze_clock(monkeypatch, gui)
@@ -224,14 +243,14 @@ class TestGuiOutputName:
         assert len(set(names)) == 200, "同一 tick 内出现重复名字"
 
     def test_gui_no_longer_builds_bare_timestamp_names(self):
-        """★ 护栏：GUI 文件里**不许**再出现裸的 `%Y%m%d_%H%M%S_%f` 造名。
+        """★ 护栏：GUI 文件里**不许**再自己拼时间戳造名。
 
-        只允许两个入口造名（都在 helper 里）：`_timestamped_output_name`
-        （用户可见的输出文件名）与 `_timestamped_job_id`（缓存目录名）。
+        ★ 2026-10-21 统一形态后，造名**全部委托**给 ``naming`` 模块
+          （零依赖、单一实现）⇒ GUI 文件里**一个 `strftime` 调用都不该有**。
         """
         sites = _timestamp_name_call_sites(_gui_path())
-        assert set(sites) <= {"_timestamped_output_name", "_timestamped_job_id"}, (
-            "GUI 里出现了裸时间戳造名（会撞名）：%r" % (sites,))
+        assert sites == [], (
+            "GUI 里出现了裸时间戳造名（会撞名 / 形态会漂移）：%r" % (sites,))
 
     def test_listen_and_wia_sites_use_the_helper(self):
         """监听 ×2 / WIA ×1 / 会话默认 ×1 必须都走同一个造名入口。"""
@@ -253,11 +272,10 @@ class TestGuiJobId:
     def test_job_id_keeps_timestamp_and_is_a_safe_cache_dir_name(self, monkeypatch):
         _freeze_clock(monkeypatch, gui)
         job_id = gui._timestamped_job_id()
-        m = re.match(r"^(\d{8})_(\d{6})_(\d{6})_([a-p][0-9a-f]{5})$", job_id)
+        m = re.match(r"^(\d{8})_(\d{6})_([a-p][0-9a-f]{7})$", job_id)
         assert m, f"job_id 不符合契约: {job_id!r}"
         assert m.group(1) == "20261021" and m.group(2) == "045213"
-        assert m.group(3) == "123456", "时间戳的微秒段必须保留"
-        assert not m.group(4).isdigit(), (
+        assert not m.group(3).isdigit(), (
             "唯一成分是纯数字 ⇒ 会被误读成组号/页号: %r" % job_id)
         # 缓存目录名不能含路径分隔符 / ".."（cache_manager 有越界防护）
         assert ".." not in job_id

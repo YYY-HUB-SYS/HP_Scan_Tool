@@ -39,11 +39,19 @@ Windows 系统时钟分辨率 = **15.625ms**（实测
   的分组编号）⇒ 只允许在**时间戳之后**追加唯一成分
 - 首个损坏备份名仍是 ``<name>.corrupt-<YYYYMMDD-HHMMSS-ffffff>``
   （既有断言 ``^xxx\.corrupt-\d{8}-\d{6}-\d{6}$`` 依赖它）
+
+★ 2026-10-21 统一形态（主控拍板）
+--------------------------------------------------------------------------
+唯一成分 = **1 位字母（a–p）+ 7 位十六进制**（8 字符），
+时间戳**只到秒**（去掉微秒段 —— 本机时钟粒度 15.625 ms ⇒ 那 6 位
+在同 tick 内 99.5% 相同 ⇒ 是**虚假精度**），
+三个入口（协调器 / CLI / GUI）共用 ``naming`` 模块的**同一份**实现。
 """
 
 import os
 import re
 import time
+import uuid
 from datetime import datetime as _real_datetime
 
 import pytest
@@ -181,8 +189,9 @@ class TestJobIdUniqueness:
         tail_b = b[len(_FROZEN_TS):]
         assert tail_a != tail_b, (
             "唯一成分必须与时钟值不同：%r vs %r" % (a, b))
-        assert re.fullmatch(r"_[0-9a-f]{8}", tail_a), (
-            "唯一成分应为 8 位十六进制（uuid4 前 8 位，仓库既有惯例）：%r" % a)
+        assert re.fullmatch(r"_[a-p][0-9a-f]{7}", tail_a), (
+            "唯一成分应为「1 位字母（a–p）+ 7 位十六进制」"
+            "（统一形态，首字符必须是字母 ⇒ 不会与组号混淆）：%r" % a)
 
     def test_job_id_is_safe_as_directory_name(self, monkeypatch):
         """job_id 会被直接当**目录名**用 ⇒ 绝不能含路径分隔符 / 非法字符。"""
@@ -201,11 +210,15 @@ class TestJobIdUniqueness:
         把 ``uuid.uuid4`` 换成固定值 ⇒ 输出必须**逐字符**等于预期值。
         ⇒ 旧实现（唯一成分 = 时钟的微秒）在这里**必然红**，
         且本断言**零概率性**（不像"比较微秒值"那种 1/16^6 的偶发命中）。
+
+        ★ 2026-10-21：统一形态后唯一成分 = **1 位字母（a–p）+ 7 位十六进制**
+          ⇒ 固定 uuid4 ``deadbeefcafe0000`` ⇒ 取前 8 位 ``deadbeef``
+          ⇒ 首字符 ``d``(=13) 映射到字母 ``n`` ⇒ 唯一成分 ``neadbeef``。
         """
         _freeze_clock(monkeypatch, scan_coordinator)
-        monkeypatch.setattr(scan_coordinator.uuid, "uuid4",
+        monkeypatch.setattr(uuid, "uuid4",
                             lambda: _FakeUuid("deadbeefcafe0000"))
-        assert scan_coordinator.new_job_id() == "20261021_065432_deadbeef", (
+        assert scan_coordinator.new_job_id() == "20261021_065432_neadbeef", (
             "job_id 的唯一成分必须来自 uuid4（时间戳只负责可读性）")
 
     def test_run_scan_sync_same_tick_two_scans_keep_both_pages(
@@ -274,9 +287,10 @@ class TestOutputNameUniqueness:
             "输出名必须以 HP_Scan_<时间戳> 开头（时间戳在前）：%r" % name)
         assert name.endswith(".jpg"), "扩展名不能变：%r" % name
         base = name[:-len(".jpg")]
-        m = re.fullmatch(r"HP_Scan_\d{8}_\d{6}_[0-9a-f]{6}", base)
+        m = re.fullmatch(r"HP_Scan_\d{8}_\d{6}_[a-p][0-9a-f]{7}", base)
         assert m, (
-            "唯一成分应为 6 位十六进制（与组号/页号规则不冲突）：%r" % base)
+            "唯一成分应为「1 位字母（a–p）+ 7 位十六进制」"
+            "（统一形态；首字符是字母 ⇒ 与组号/页号不混淆）：%r" % base)
 
     def test_output_name_unique_component_comes_from_uuid4_not_the_clock(
             self, monkeypatch):
@@ -286,31 +300,33 @@ class TestOutputNameUniqueness:
         ⇒ 旧实现（唯一成分 = 时钟的微秒）在这里**必然红**，且零概率性。
         """
         _freeze_clock(monkeypatch, scan_coordinator)
-        monkeypatch.setattr(scan_coordinator.uuid, "uuid4",
+        monkeypatch.setattr(uuid, "uuid4",
                             lambda: _FakeUuid("deadbeefcafe0000"))
         assert scan_coordinator.new_output_name("jpg") == \
-            "HP_Scan_20261021_065432_deadbe.jpg", (
+            "HP_Scan_20261021_065432_neadbeef.jpg", (
             "输出名的唯一成分必须来自 uuid4（时间戳只负责可读性）")
 
     def test_output_name_does_not_use_sequence_suffix(self, monkeypatch):
         """★ 不得用「撞名加 -1/-2 序号」——输出名已有**分组编号**规则。
 
-        分组编号是 **3 位零填充**（``_001`` / ``_002``），唯一成分是 **6 位**，
-        ⇒ 两者在形态上不可能混淆。
+        分组编号是 **3 位零填充**（``_001`` / ``_002``），唯一成分是
+        **1 位字母 + 7 位十六进制**，⇒ 两者在形态上不可能混淆。
         """
         _freeze_clock(monkeypatch, scan_coordinator)
         base = scan_coordinator.new_output_name("jpg")[:-len(".jpg")]
         suffix = base.rsplit("_", 1)[-1]
-        assert len(suffix) == 6, (
-            "唯一成分长度固定为 6（组号是 3 位零填充 ⇒ 形态不混淆）：%r" % base)
+        assert len(suffix) == 8, (
+            "唯一成分长度固定为 8（1 字母 + 7 十六进制）：%r" % base)
         # 唯一成分**不能**是 3 位零填充的组号形态
         assert not re.fullmatch(r"\d{3}", suffix), (
             "唯一成分不得长得像组号（3 位零填充）：%r" % base)
+        assert suffix[0].isalpha(), (
+            "唯一成分首字符必须是字母（永远不像组号）：%r" % base)
 
     def test_build_output_name_group_numbering_unchanged(self, tmp_path):
         """★ 命名契约：协调器给出的输出名仍是**基名**，
         ``save_manager.build_output_name`` 的分组编号规则**一字未改**。"""
-        base = os.path.join(str(tmp_path), "HP_Scan_20261021_065432_ab12cd")
+        base = os.path.join(str(tmp_path), "HP_Scan_20261021_065432_ab12cd34")
         assert save_manager.build_output_name(base, "jpg", 1, 1, 1) == \
             base + "_001.jpg"
         assert save_manager.build_output_name(base, "jpg", 2, 1, 2) == \

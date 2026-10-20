@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import threading
-import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -26,6 +25,7 @@ from PySide6.QtCore import QObject, QMutex, QMutexLocker, QRunnable, QThreadPool
 import cache_manager
 import config_io
 import history_manager
+import naming
 import page_meta
 import skew_detect
 from escl_engine import (
@@ -62,21 +62,11 @@ DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
 #   ⇒ 任何"把时间戳当唯一键"的地方都会撞名（上一轮把 `%Y%m%d_%H%M%S`
 #   改成 `%Y%m%d_%H%M%S_%f` **并不足以避免撞名**）。
 #   ⇒ 时间戳只负责**可读性**，唯一性一律由 uuid4 决定（**与时钟无关**）。
-
-#: job_id 里唯一成分的长度（uuid4 前 N 位十六进制）
-_JOB_ID_UNIQUE_LEN = 8
-#: 输出文件名里唯一成分的长度
-_OUTPUT_UNIQUE_LEN = 6
-
-
-def _unique_token(length: int) -> str:
-    """
-    生成唯一成分（uuid4 前 N 位十六进制）。
-
-    ★ uuid4 取自操作系统随机源（Windows: CryptGenRandom / getrandom），
-      **与时钟分辨率完全无关** ⇒ 同一时钟 tick 内连取 N 次也不会相同。
-    """
-    return uuid.uuid4().hex[:length]
+#
+# ★ 2026-10-21 统一形态（主控拍板）：唯一成分 = **1 位字母（a–p）+ 7 位十六进制**，
+#   时间戳**只到秒**（去掉微秒段 —— 那是虚假精度，详见 `naming.py` 的模块说明）。
+#   ⇒ 本仓库三个入口（协调器 / CLI / GUI）**共用** `naming` 的同一份实现，
+#     形态**逐字一致** ⇒ 用户在 GUI 里不会再看到两种形状。
 
 
 def new_job_id() -> str:
@@ -89,30 +79,29 @@ def new_job_id() -> str:
       ⇒ 后一次 `write_page`（`open(path, "wb")`）把前一次的页**覆盖**
       ⇒ **丢的是扫描产物**（用户侧："刚才那批页不见了"），**且零报错**。
 
-    格式：`<YYYYMMDD_HHMMSS>_<uuid4 前 8 位>`
+    格式：`{YYYYmmdd}_{HHMMSS}_{1 位字母（a–p）+ 7 位十六进制}`
       · 与 `document_session.new_session_id()` 的 `sess_{ts}_{uuid4().hex[:8]}`
         同一套仓库惯例（时间戳在前 = 可读性，唯一成分在后 = 唯一性）
       · 时间戳部分只负责可读性；唯一性由 uuid4 决定 ⇒ **与时钟分辨率无关**
-      · 只含 ``[0-9a-f_]`` ⇒ 可安全用作目录名 / page_meta 的 key
+      · 只含 ``[0-9a-z_]`` ⇒ 可安全用作目录名 / page_meta 的 key
     """
-    return "%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
-                     _unique_token(_JOB_ID_UNIQUE_LEN))
+    return naming.build_job_id(now=datetime.now())
 
 
 def new_output_name(ext: str) -> str:
     """
-    生成默认输出文件名：``HP_Scan_<YYYYMMDD_HHMMSS>_<uuid4 前 6 位>.<ext>``。
+    生成默认输出文件名：``HP_Scan_{YYYYmmdd}_{HHMMSS}_{唯一成分}.{ext}``。
 
     ★ 同一 tick 的两次扫描算出同一个文件名 ⇒ 后者**静默覆盖**前者的产物。
     ★ **不用**「撞名加 -1/-2 序号」：输出名已有**分组编号**规则
       （`save_manager.build_output_name` 的 `{base}_{组号}_{组内号}`，
       组号是 3 位零填充）⇒ 序号会与组号混淆。
-      改用 **6 位十六进制**后缀（形态与 3 位组号**不可能混淆**），
-      且它落在**基名**里 ⇒ `build_output_name` 的分组编号规则**一字未改**。
+      改用 **1 位字母 + 7 位十六进制**后缀（首字符是字母 ⇒ 与 3 位组号
+      **不可能混淆**），且它落在**基名**里 ⇒ `build_output_name` 的
+      分组编号规则**一字未改**。
     ★ 唯一性由 uuid4 决定 ⇒ **与时钟分辨率完全无关**。
     """
-    return "HP_Scan_%s_%s.%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
-                                 _unique_token(_OUTPUT_UNIQUE_LEN), ext)
+    return naming.build_output_name("HP_Scan", ext, now=datetime.now())
 
 
 # ── 用户可见提示文案（F-3）──
