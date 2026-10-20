@@ -104,13 +104,60 @@ def _presets_path() -> str:
 # 已备份过的损坏文件（路径 + mtime + size），避免反复读取刷出一堆备份
 _CORRUPT_BACKED_UP = set()
 
+#: 损坏备份名撞名时的最大重试次数（同名 ⇒ 自动加序号 -2 / -3 …）
+_BACKUP_NAME_MAX_RETRY = 999
+
+
+def _remove_quietly(path: str) -> None:
+    """删文件，失败不抛（备份失败时清理残留的占位空文件）"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _reserve_backup_path(base_path: str):
+    """
+    预留一个**唯一**的损坏备份路径（独占创建），返回该路径；文件已建好、内容待写入。
+
+    ★ 为什么不能只靠时间戳：Windows 系统时钟分辨率只有 **15.625ms**（实测
+      `time.get_clock_info('time').resolution == 0.015625`）⇒ 相邻两次
+      `datetime.now().strftime('%f')` 有 49/50 概率**完全相同** ⇒ 两次损坏
+      备份算出**同一个文件名** ⇒ 第二次**覆盖**第一次 ⇒ **证据丢失**。
+
+    ★ 这里的分工：**时间戳只负责可读性**（人一眼看出大概何时损坏），
+      **唯一性由「独占创建（O_CREAT|O_EXCL）+ 同名自动加序号」保证**
+      ⇒ 与时钟分辨率**完全无关**。
+      首个备份名仍是 `<name>.corrupt-<YYYYMMDD-HHMMSS-ffffff>`（既有断言不变），
+      真撞名时追加 `-2` / `-3` …（同前缀、同时间戳，人工仍看得出是同一批备份）。
+
+    返回 None = 所有候选名都被占用 / 创建失败（此时不写任何内容）。
+    """
+    for idx in range(_BACKUP_NAME_MAX_RETRY + 1):
+        candidate = base_path if idx == 0 else "%s-%d" % (base_path, idx + 1)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            continue          # 名字已被占用 ⇒ 换下一个序号
+        except OSError as e:
+            logger.error("损坏备份文件创建失败: %s（%s）", candidate, e)
+            return None
+        os.close(fd)
+        return candidate
+    logger.error("损坏备份文件名候选全部被占用: %s", base_path)
+    return None
+
 
 def _backup_corrupt(fpath: str):
     """
     把损坏的预设文件原文备份成 <name>.corrupt-<时间戳>，返回备份路径。
 
-    与 history_manager._backup_corrupt 同一套命名与去重规则：同一份损坏内容
-    只备份一次；备份失败不影响主流程（原文仍在原处，不会被静默清空）。
+    - 时间戳只负责**可读性**；备份名**唯一性**由「独占创建 + 同名加序号」保证
+      —— Windows 时钟分辨率只有 15.6ms，两次损坏很容易算出同一个时间戳
+      （旧实现会让后一次**覆盖**前一次 ⇒ 证据丢失）
+    - 与 history_manager._backup_corrupt 同一套命名与去重规则：同一份损坏内容
+      只备份一次；备份失败不影响主流程（原文仍在原处，不会被静默清空）。
     """
     try:
         st = os.stat(fpath)
@@ -121,11 +168,14 @@ def _backup_corrupt(fpath: str):
         return None
     _CORRUPT_BACKED_UP.add(key)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    backup = f"{fpath}.corrupt-{ts}"
+    backup = _reserve_backup_path("%s.corrupt-%s" % (fpath, ts))
+    if backup is None:
+        return None
     try:
         shutil.copyfile(fpath, backup)
     except OSError as e:
-        logger.error("预设文件损坏备份失败: %s（%s）", fpath, e)
+        logger.error("预设损坏备份失败: %s（%s）", fpath, e)
+        _remove_quietly(backup)
         return None
     logger.error("预设文件已损坏，原文已备份到: %s", backup)
     return backup

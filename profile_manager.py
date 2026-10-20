@@ -10,8 +10,10 @@
 `profiles.json` 损坏（半截写入 / 磁盘满 / 外部改写）时，三条铁律：
 
 1. **读侧照旧降级**：返回 {}，不抛异常（保持既有语义，GUI 不崩）；
-2. **先备份原文**：同目录 <name>.corrupt-<时间戳>（时间戳带**微秒** ⇒
-   连续两次损坏产生不同文件名，互不覆盖），备份路径经安全检查
+2. **先备份原文**：同目录 <name>.corrupt-<时间戳>（时间戳只负责**可读性**；
+   备份名**唯一性**由「独占创建 + 同名加序号」保证 ⇒ 与系统时钟分辨率无关
+   —— Windows 时钟只有 15.6ms，两次损坏很容易算出同一个时间戳，旧实现
+   会让后一次**覆盖**前一次 ⇒ 证据丢失），备份路径经安全检查
    （必须留在应用数据目录内）；
 3. **禁止用空状态覆盖**：写路径发现"损坏 / 读不出来"时**拒绝写入**并返回
    False ⇒ 用户其它设备的档案不会被静默清空，原文可从备份恢复。
@@ -60,6 +62,9 @@ _PROFILES_CACHE_TTL = 2.0
 # 已备份过的损坏文件（路径 + mtime + size），避免反复读取刷出一堆备份
 _CORRUPT_BACKED_UP = set()
 
+#: 损坏备份名撞名时的最大重试次数（同名 ⇒ 自动加序号 -2 / -3 …）
+_BACKUP_NAME_MAX_RETRY = 999
+
 # ── 读盘状态 ────────────────────────────────────────────────
 # 读侧一律降级为 {}（不抛），但**写路径必须区分**这四种状态：
 #   missing    文件不存在（首次运行）—— 空档案，写入安全
@@ -100,11 +105,54 @@ def _is_inside_app_dir(path: str) -> bool:
         return False   # 不同盘符
 
 
+def _remove_quietly(path: str) -> None:
+    """删文件，失败不抛（备份失败时清理残留的占位空文件）"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _reserve_backup_path(base_path: str):
+    """
+    预留一个**唯一**的损坏备份路径（独占创建），返回该路径；文件已建好、内容待写入。
+
+    ★ 为什么不能只靠时间戳：Windows 系统时钟分辨率只有 **15.625ms**（实测
+      `time.get_clock_info('time').resolution == 0.015625`）⇒ 相邻两次
+      `datetime.now().strftime('%f')` 有 49/50 概率**完全相同** ⇒ 两次损坏
+      备份算出**同一个文件名** ⇒ 第二次**覆盖**第一次 ⇒ **证据丢失**。
+
+    ★ 这里的分工：**时间戳只负责可读性**（人一眼看出大概何时损坏），
+      **唯一性由「独占创建（O_CREAT|O_EXCL）+ 同名自动加序号」保证**
+      ⇒ 与时钟分辨率**完全无关**（两台机器时钟同步也安全）。
+      首个备份名仍是 `<name>.corrupt-<YYYYMMDD-HHMMSS-ffffff>`（既有断言不变），
+      真撞名时追加 `-2` / `-3` …（同前缀、同时间戳，人工仍看得出是同一批备份）。
+
+    返回 None = 所有候选名都被占用 / 创建失败（此时不写任何内容）。
+    """
+    for idx in range(_BACKUP_NAME_MAX_RETRY + 1):
+        candidate = base_path if idx == 0 else "%s-%d" % (base_path, idx + 1)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            continue          # 名字已被占用 ⇒ 换下一个序号
+        except OSError as e:
+            logger.error("损坏备份文件创建失败: %s（%s）", candidate, e)
+            return None
+        os.close(fd)
+        return candidate
+    logger.error("损坏备份文件名候选全部被占用: %s", base_path)
+    return None
+
+
 def _backup_corrupt(fpath: str):
     """
     把损坏的设备档案原文备份成 <name>.corrupt-<时间戳>（**同目录**），返回备份路径。
 
-    - 时间戳带**微秒** ⇒ 连续两次损坏产生不同文件名，互不覆盖
+    - 时间戳只负责**可读性**；备份名**唯一性**由「独占创建 + 同名加序号」保证
+      —— Windows 时钟分辨率只有 15.6ms，两次损坏很容易算出同一个时间戳
+      （旧实现会让后一次**覆盖**前一次 ⇒ 证据丢失）
     - 同一份损坏内容只备份一次（按 路径+mtime+size 去重）
     - 备份路径经 _is_inside_app_dir 安全检查（不能写到应用数据目录之外）
     - 备份失败不影响主流程（原文仍在原处，不会被静默清空）
@@ -117,15 +165,19 @@ def _backup_corrupt(fpath: str):
     if key in _CORRUPT_BACKED_UP:
         return None
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    backup = "%s.corrupt-%s" % (fpath, ts)
-    if not _is_inside_app_dir(backup):
-        logger.error("设备档案损坏备份被拒绝（路径越出应用数据目录）: %s", backup)
+    base = "%s.corrupt-%s" % (fpath, ts)
+    if not _is_inside_app_dir(base):
+        logger.error("设备档案损坏备份被拒绝（路径越出应用数据目录）: %s", base)
         return None
     _CORRUPT_BACKED_UP.add(key)
+    backup = _reserve_backup_path(base)
+    if backup is None:
+        return None
     try:
         shutil.copyfile(fpath, backup)
     except OSError as e:
         logger.error("设备档案损坏备份失败: %s（%s）", fpath, e)
+        _remove_quietly(backup)
         return None
     logger.error("设备档案文件已损坏，原文已备份到: %s", backup)
     return backup
