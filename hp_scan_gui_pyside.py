@@ -680,6 +680,9 @@ class ScanApp(QMainWindow):
     # 跨线程信号：发现完成
     discover_finished = Signal()
 
+    # 工作线程 → 主线程的通用 UI 投递（QTimer.singleShot 在工作线程里不会触发）
+    _ui_post = Signal(object)
+
     def __init__(self):
         super().__init__()
 
@@ -719,6 +722,7 @@ class ScanApp(QMainWindow):
 
         # 连接跨线程信号
         self.discover_finished.connect(self._on_discover_finished)
+        self._ui_post.connect(self._run_ui_post)
 
         # 显示加载界面（居中到屏幕）
         self._loading = LoadingDialog(self)
@@ -738,6 +742,14 @@ class ScanApp(QMainWindow):
 
         # 延迟 100ms 确保加载界面渲染后再开始设备探测
         QTimer.singleShot(100, self._do_startup_scan)
+
+    def _run_ui_post(self, fn):
+        """在主线程执行投递过来的可调用对象"""
+        fn()
+
+    def _post_ui(self, fn):
+        """从任意线程安全地把 fn 投递到主线程执行"""
+        self._ui_post.emit(fn)
 
     def _setup_ui(self):
         self.setWindowTitle("HP Scan Tool v4.0")
@@ -1580,7 +1592,7 @@ class ScanApp(QMainWindow):
         self.status_bar.addPermanentWidget(self.cancel_listen_btn)
 
         def _progress(msg, page=0):
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage(f"监听模式：{msg}"))
+            self._post_ui(lambda: self.status_bar.showMessage(f"监听模式：{msg}"))
 
         def _listen_thread():
             try:
@@ -1604,10 +1616,10 @@ class ScanApp(QMainWindow):
                             cache_manager.write_page(job_id, i, data, ext)
                             del data
                         output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-                        QTimer.singleShot(0, lambda: self._show_multi_preview(
+                        self._post_ui(lambda: self._show_multi_preview(
                             job_id, ext, output_path, len(pages), scanner))
                     else:
-                        QTimer.singleShot(0, lambda: self.status_bar.showMessage("监听模式：超时或已取消"))
+                        self._post_ui(lambda: self.status_bar.showMessage("监听模式：超时或已取消"))
                 else:
                     result = listen_for_scan(
                         scanner=scanner,
@@ -1627,14 +1639,14 @@ class ScanApp(QMainWindow):
                         cache_path = cache_manager.write_page(job_id, 1, data, ext)
                         del data
                         output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-                        QTimer.singleShot(0, lambda: self._show_preview(
+                        self._post_ui(lambda: self._show_preview(
                             cache_path, ext, output_path, job_id, scanner))
                     else:
-                        QTimer.singleShot(0, lambda: self.status_bar.showMessage("监听模式：超时或已取消"))
+                        self._post_ui(lambda: self.status_bar.showMessage("监听模式：超时或已取消"))
             except Exception as e:
-                QTimer.singleShot(0, lambda: self._scan_error(f"监听模式错误: {e}"))
+                self._post_ui(lambda: self._scan_error(f"监听模式错误: {e}"))
             finally:
-                QTimer.singleShot(0, self._reset_scan_ui)
+                self._post_ui(self._reset_scan_ui)
 
         threading.Thread(target=_listen_thread, daemon=True).start()
 
@@ -1709,13 +1721,13 @@ class ScanApp(QMainWindow):
                 from escl_engine import probe_escl
                 url = probe_escl(ip, int(port_input.text() or 80))
                 if url:
-                    QTimer.singleShot(0, lambda: status_label.setText(
+                    self._post_ui(lambda: status_label.setText(
                         f"✓ 发现 eSCL 服务: {url}"))
-                    QTimer.singleShot(0, lambda: add_btn.setEnabled(True))
+                    self._post_ui(lambda: add_btn.setEnabled(True))
                 else:
-                    QTimer.singleShot(0, lambda: status_label.setText(
+                    self._post_ui(lambda: status_label.setText(
                         "✗ 未发现 eSCL 服务"))
-                QTimer.singleShot(0, lambda: probe_btn.setEnabled(True))
+                self._post_ui(lambda: probe_btn.setEnabled(True))
 
             threading.Thread(target=_probe_thread, daemon=True).start()
 
@@ -1758,7 +1770,7 @@ class ScanApp(QMainWindow):
         def _status_thread():
             from escl_engine import get_scanner_status
             status = get_scanner_status(scanner.escl_url)
-            QTimer.singleShot(0, lambda: self._on_status_received(status))
+            self._post_ui(lambda: self._on_status_received(status))
 
         threading.Thread(target=_status_thread, daemon=True).start()
 
@@ -1854,12 +1866,12 @@ class ScanApp(QMainWindow):
                             out_dir,
                             f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
                         )
-                        QTimer.singleShot(0, lambda: self._show_preview(
+                        self._post_ui(lambda: self._show_preview(
                             cache_path, ext, output_path, job_id))
                     else:
-                        QTimer.singleShot(0, lambda: self.status_bar.showMessage("WIA 扫描失败"))
+                        self._post_ui(lambda: self.status_bar.showMessage("WIA 扫描失败"))
                 except Exception as e:
-                    QTimer.singleShot(0, lambda: self._scan_error(f"WIA 错误: {e}"))
+                    self._post_ui(lambda: self._scan_error(f"WIA 错误: {e}"))
 
             threading.Thread(target=_wia_thread, daemon=True).start()
 
