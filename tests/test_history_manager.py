@@ -4,6 +4,7 @@ history_manager 单元测试 — HP Scan Tool v4.0
 """
 
 import json
+import logging
 import os
 import threading
 
@@ -158,3 +159,88 @@ class TestRobustness:
         history_manager.append({"device_ip": "1.2.3.4"})
         records = history_manager.list_records()
         assert len(records) == 1
+
+
+# ── 损坏文件保护（I-4）──────────────────────────────────────
+
+
+def _corrupt_backups(config_dir):
+    """目录里的损坏备份文件列表"""
+    return [f for f in os.listdir(config_dir) if ".corrupt-" in f]
+
+
+class TestCorruptProtection:
+    """history.json 损坏后，原文必须被备份下来，不能被静默清空"""
+
+    def test_corrupt_file_is_backed_up_with_original_content(self, tmp_config_dir):
+        path = history_manager._history_file()
+        original = '{"broken": [1, 2,'
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(original)
+
+        history_manager.list_records()  # 触发损坏检测
+
+        backups = _corrupt_backups(tmp_config_dir)
+        assert backups, "损坏的历史文件必须留下备份"
+        with open(os.path.join(tmp_config_dir, backups[0]), "r", encoding="utf-8") as f:
+            assert f.read() == original, "备份内容必须等于损坏前的原文"
+
+    def test_append_after_corrupt_keeps_backup_and_does_not_raise(self, tmp_config_dir):
+        path = history_manager._history_file()
+        original = "not json at all"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(original)
+
+        history_manager.append({"device_ip": "1.2.3.4"})  # 不抛异常
+
+        backups = _corrupt_backups(tmp_config_dir)
+        assert backups, "损坏的历史文件必须留下备份"
+        with open(os.path.join(tmp_config_dir, backups[0]), "r", encoding="utf-8") as f:
+            assert f.read() == original, "损坏前的原文不能丢"
+        # 本次 append 从空开始写
+        records = history_manager.list_records()
+        assert len(records) == 1
+        assert records[0]["device_ip"] == "1.2.3.4"
+
+    def test_corrupt_file_logs_error(self, tmp_config_dir, caplog):
+        path = history_manager._history_file()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("corrupt")
+        with caplog.at_level(logging.ERROR):
+            history_manager.list_records()
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "历史文件损坏必须记 error 日志"
+        assert any(r.name == "history_manager" for r in errors)
+
+    def test_missing_file_is_not_treated_as_corrupt(self, tmp_config_dir, caplog):
+        """文件不存在 = 正常首次运行：不产生备份、不记 error"""
+        assert not os.path.exists(history_manager._history_file())
+        with caplog.at_level(logging.ERROR):
+            assert history_manager.list_records() == []
+        assert _corrupt_backups(tmp_config_dir) == []
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    def test_normal_path_unaffected(self, tmp_config_dir):
+        history_manager.append({"device_ip": "1.2.3.4"})
+        records = history_manager.list_records()
+        assert len(records) == 1
+        assert records[0]["device_ip"] == "1.2.3.4"
+        assert _corrupt_backups(tmp_config_dir) == []
+
+    def test_save_failure_keeps_old_file_and_logs(self, tmp_config_dir, monkeypatch, caplog):
+        path = history_manager._history_file()
+        history_manager.append({"device_ip": "1.2.3.4"})
+        with open(path, "r", encoding="utf-8") as f:
+            before = f.read()
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(history_manager.os, "replace", boom)
+        with caplog.at_level(logging.ERROR):
+            history_manager.append({"device_ip": "5.6.7.8"})  # 不抛异常
+
+        with open(path, "r", encoding="utf-8") as f:
+            assert f.read() == before, "写失败时旧文件必须原样保留"
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not [f for f in os.listdir(tmp_config_dir) if f.endswith(".tmp")]
