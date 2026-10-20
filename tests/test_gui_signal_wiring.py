@@ -108,6 +108,46 @@ class TestConfigSaveFailedWiring:
         assert win.status_bar.currentMessage(), "空上下文时必须仍有提示"
 
 
+class TestConfigSaveFailureVisibility:
+    """
+    ★ 光"接了信号"不够 —— 必须确认**用户改设置的每条主路径**都能看见失败。
+
+    协调器的 `config_save_failed` 只在协调器自己的 4 个调用点发出
+    （load_config 补缺省值 / set_custom_name / 发现后持久化 / persist_scan_settings），
+    而 GUI 的主配置写入走的是 `ScanApp._save_cfg`（自己实现）⇒
+    信号接上了，主路径却是**死线**。
+    """
+
+    def test_gui_settings_write_failure_is_visible_to_user(self, win, monkeypatch):
+        """★ 用户改分辨率/昵称时配置写失败 ⇒ 必须**弹窗**（状态栏用户看不见）。"""
+        fake = _FakeMessageBox()
+        monkeypatch.setattr(gui, "QMessageBox", fake)
+        monkeypatch.setattr(gui, "save_config", lambda cfg: False)
+
+        assert win._save_cfg(what="扫描参数") is False
+        assert fake.warning_calls, (
+            "GUI 主路径的配置写失败没有弹窗 ⇒ 用户以为改好了，实际没落盘")
+
+    def test_rename_failure_shows_exactly_one_dialog(self, win, monkeypatch):
+        """★ 改名失败 ⇒ **恰好一次**弹窗。
+
+        `_save_cfg` 与改名路径都会报失败 ⇒ 若两处各弹一次，用户要点两次"确定"。
+        """
+        import types
+        fake = _FakeMessageBox()
+        monkeypatch.setattr(gui, "QMessageBox", fake)
+        monkeypatch.setattr(gui, "save_config", lambda cfg: False)
+
+        scanner = types.SimpleNamespace(ip="192.168.1.9", custom_name="",
+                                        model="HP Test", has_adf=False)
+        win._apply_custom_name(scanner, "新名字")
+        assert len(fake.warning_calls) == 1, (
+            "改名失败弹了 %d 次窗（应恰好 1 次）: %r"
+            % (len(fake.warning_calls), fake.warning_calls))
+        assert not any("已重命名" in m for m in [win.status_bar.currentMessage()]), \
+            "改名失败不许说已重命名"
+
+
 # ── 缺口 2：GUI 不得直写协调器私有取消表 ────────────────────────────────
 
 class TestExternalCancelApiUsage:

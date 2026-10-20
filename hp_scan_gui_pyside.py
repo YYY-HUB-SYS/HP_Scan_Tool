@@ -2051,13 +2051,17 @@ class ScanApp(QMainWindow, _UiPostMixin):
         parent_layout.addWidget(panel)
 
     # ────────── 事件处理 ──────────
-    def _save_cfg(self, cfg=None, what="设置") -> bool:
+    def _save_cfg(self, cfg=None, what="设置", notify=True) -> bool:
         """
         写配置并**如实报告**结果（V1-N-2）。
 
         `scan_coordinator.save_config` 现在在拿不到跨进程锁 / 写失败时返回
         **False**（本次没存上）⇒ GUI 绝不能无条件说"已保存"。
         失败时在状态栏如实说明"未生效"，并记 error 日志。
+
+        :param notify: 是否走协调器的 `config_save_failed` 信号（统一出口，
+            状态栏 + **弹窗**只在一处实现）。置 False 用于「调用方自己会提示」
+            的场景（如改名）—— 避免同一个失败弹两次窗。
 
         返回是否真的落盘。
         """
@@ -2069,10 +2073,23 @@ class ScanApp(QMainWindow, _UiPostMixin):
             ok = False
         if not ok:
             logger.error("配置未落盘（拿不到跨进程锁或写失败）: %s", what)
-            try:
-                self.status_bar.showMessage(f"{what}保存失败（设置未生效）")
-            except Exception:
-                pass
+            emitted = False
+            if notify:
+                # ★ 协调器的信号是**统一出口**：主路径（用户改分辨率/昵称/路径）
+                #   也必须让用户看见失败 —— 状态栏用户根本不会盯着看。
+                #   信号不可用时（最小替身 / 旧版协调器）退回状态栏兜底。
+                try:
+                    signal = getattr(self.coordinator, "config_save_failed", None)
+                    if signal is not None:
+                        signal.emit(what)
+                        emitted = True
+                except Exception as e:
+                    logger.debug("发 config_save_failed 信号失败: %s", e)
+            if not emitted:
+                try:
+                    self.status_bar.showMessage(f"{what}保存失败（设置未生效）")
+                except Exception:
+                    pass
         return ok
 
     def _on_resolution_changed(self, text):
@@ -2380,11 +2397,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
         nicknames = self.coordinator.cfg.get("nicknames", {})
         nicknames[scanner.ip] = new_name
         self.coordinator.cfg["nicknames"] = nicknames
-        ok = self._save_cfg(self.coordinator.cfg, "重命名")
+        ok = self._save_cfg(self.coordinator.cfg, "重命名", notify=False)
         self._rebuild_cards()
         if ok:
             self.status_bar.showMessage(f"已重命名为: {new_name}")
             return True
+        # ★ notify=False ⇒ 失败提示由**这里**给（不重复弹窗）
         self.status_bar.showMessage(f"重命名未保存（设置未生效）: {new_name}")
         QMessageBox.warning(
             self, "保存失败",
@@ -2583,10 +2601,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
         logger.error("配置未落盘（%s）", ctx)
         try:
             self.status_bar.showMessage(
-                f"⚠ {ctx}未保存（本次修改未生效），请关闭占用配置文件的程序后重试")
+                f"⚠ {ctx}保存失败（本次修改未生效），"
+                f"请关闭占用配置文件的程序后重试")
             QMessageBox.warning(
                 self, "设置未保存",
-                f"{ctx}未保存，本次修改**未生效**。\n\n"
+                f"{ctx}保存失败，本次修改**未生效**。\n\n"
                 "常见原因：配置文件被其它程序占用（同步盘 / 编辑器 / 杀毒软件）。\n"
                 "请关闭占用它的程序后重新修改一次。")
         except RuntimeError:
