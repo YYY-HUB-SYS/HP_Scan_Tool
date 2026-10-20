@@ -16,9 +16,9 @@ HP Scan Tool v3.2 作为单页扫描工具运行良好，但面临以下核心�
 v3.3 通过以下改造解决上述问题：
 
 - 引入磁盘缓存架构，扫描数据直接落盘，内存只保留预览缩略图
-- 基于磁盘缓存实现真正并发扫描（多台打印机同时工作）
+- 基于磁盘缓存实现真正并发扫描（多台打印机同时工作）　**⚠️ 后端已实现、GUI 入口未开放**（见下文「并发扫描」小节）
 - 新增多页 ADF 扫描，支持批量预览和自定义页面分组保存
-- 增强曝光控制：直方图显示 + Gamma/阴影高光/RGB 通道增益 + 命名预设系统
+- 增强曝光控制：直方图显示（**⚠️ 未实现、已延后**）+ Gamma/阴影高光/RGB 通道增益（✅）+ 命名预设系统（✅）
 - 新增 WSD 发现协议，与 mDNS 并行运行
 - 新增 CLI 命令行模式（argparse 子命令）
 - 新增平台抽象层，支持 macOS（ImageCapture/SANE 后端）
@@ -40,6 +40,7 @@ v3.3 通过以下改造解决上述问题：
 
 ### 磁盘缓存与并发
 10. As a user, I want to scan from multiple printers simultaneously, so that I don't waste time waiting in queue
+    > ⚠️ **2026-10-21 订正**：v4.0 的 **GUI 上还做不到**（后端已支持并发，界面入口未开放）—— 见下文「并发扫描」小节。
 11. As a user, I want scan data written to disk cache instead of memory, so that concurrent scans don't exhaust RAM
 12. As a user, I want the cache to auto-clean when approaching 95% of the limit, so that I never run out of space mid-scan
 13. As a user, I want to configure the cache size limit (default 1024MB), so that I can adjust it to my disk capacity
@@ -94,9 +95,11 @@ v3.3 通过以下改造解决上述问题：
 - 启动时清理超过 24 小时的残留缓存
 
 **并发扫描**
-- 支持多台打印机同时扫描（真正并发）
-- 每个扫描任务在独立线程中运行，独立缓存子目录
-- 每个任务完成后独立弹出预览
+> ⚠️ **2026-10-21 订正（v4.0 现状）**：**后端支持、GUI 未开放** —— `ScanCoordinator` 用 `QThreadPool`（`setMaxThreadCount(4)`）可真正并发地跑多个任务、每任务独立缓存子目录；但 GUI 在扫描期间禁用「扫描」按钮（`scan_btn.setEnabled(False)`）且只跟踪单个 `_current_job_id` ⇒ **界面上一次只能扫一台**。这与 `PRD.md` §13「单线程扫描，不支持并发」口径一致。
+
+- 支持多台打印机同时扫描（真正并发）—— **后端 ✅ / GUI ⚠️ 未开放**
+- 每个扫描任务在独立线程中运行，独立缓存子目录 —— **✅ 后端成立**
+- 每个任务完成后独立弹出预览 —— **⚠️ GUI 未实现**（GUI 只跟踪一个 job，无多预览对话框）
 
 **多页 ADF 扫描**
 - 新建 execute_multipage_scan 函数，不修改现有 execute_scan
@@ -109,13 +112,15 @@ v3.3 通过以下改造解决上述问题：
 
 **apply_exposure 扩展**
 - 新增参数：gamma (float, 0.1-3.0), shadows (int, -100~100), highlights (int, -100~100), channel_gains (tuple[float, float, float])
-- 处理顺序：channel_gains → shadows/highlights → gamma → brightness/contrast → auto stretch
+- 处理顺序：channel_gains → shadows/highlights → gamma → brightness/contrast（**auto stretch 已移除**）
 - 保持 PIL Image 级操作，无 bytes 往返
 
 **直方图显示**
-- PreviewDialog 中用 Tkinter Canvas 绘制
-- RGB 模式显示三通道叠加（红/绿/蓝半透明），灰度模式显示单通道
-- 随曝光参数变化实时刷新
+> ⚠️ **2026-10-21 订正**：**未实现、有意延后** —— 生产代码搜 `histogram` / `直方图` 零命中；GUI 是 PySide6（无 Tkinter Canvas）。详见 `docs/adr/0008-exposure-enhancement.md` 的延后标注。
+
+- PreviewDialog 中用 Tkinter Canvas 绘制 —— **⚠️ 未实现（延后）**
+- RGB 模式显示三通道叠加（红/绿/蓝半透明），灰度模式显示单通道 —— **⚠️ 未实现（延后）**
+- 随曝光参数变化实时刷新 —— **⚠️ 未实现（延后）**
 
 **预设系统**
 - 内置预设：文字增强、照片还原、去灰底、旧文件修复
@@ -146,7 +151,7 @@ v3.3 通过以下改造解决上述问题：
 ### 配置层
 
 **文件拆分**
-- scan_config.json — 基础设置（主题/分辨率/颜色/格式/来源/已保存打印机）
+- scan_config.json — 基础设置（分辨率/颜色/格式/来源/已保存打印机）　**⚠️ 无「主题」项** —— v4.0 是单主题，全仓搜 `theme` 零命中
 - presets.json — 曝光预设（内置 + 用户自定义）
 - history.json — 扫描历史（append-only 日志）
 - cache_config.json — 缓存策略（上限/触发线/清理量）

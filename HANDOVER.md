@@ -23,7 +23,7 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 - 缓存 → 预览 → 保存原始文件
 - 记录扫描历史
 
-**2026-10-20 起曝光/预设已并回本项目**（放弃独立 DocFix 软件，基础曝光/滤镜在本项目内闭环）：`exposure.py` / `preset_manager.py` 已入库，`ExposurePanel` 已接入两个预览对话框，曝光已接进落盘链路（`save_manager.py`），预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。直方图未实现、未纳入范围；扶正（自动纠偏）引擎已完成但尚未接入扫描流水线。
+**2026-10-20 起曝光/预设已并回本项目**（放弃独立 DocFix 软件，基础曝光/滤镜在本项目内闭环）：`exposure.py` / `preset_manager.py` 已入库，`ExposurePanel` 已接入两个预览对话框，曝光已接进落盘链路（`save_manager.py`），预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。直方图未实现、未纳入范围；扶正（自动纠偏）引擎**已完成并已接入扫描流水线**（`c6037a4`）：每页写入缓存后调 `skew_detect.estimate_skew` 测倾斜角并写入 `page_meta.deskew_angle`，落盘时按阈值施加纠偏。`skew_detect` 被 `scan_coordinator.py` / `save_manager.py` **静态 import** ⇒ PyInstaller 依赖分析实测 `skew_detect` FOUND ⇒ **随 EXE 交付**。⚠️ 但 **GUI 里没有纠偏开关**（`deskew_enabled` 等 4 个键只有默认值，界面不可改）。
 
 ---
 
@@ -46,7 +46,7 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 ├── config_io.py            # 配置读写 helper — 原子写 + 跨进程锁
 ├── exposure.py             # 曝光引擎 — off/auto/manual（2026-10-20 并回本项目，在用）
 ├── preset_manager.py       # 曝光预设管理 — 内置 4 个 + 用户自定义（2026-10-20 并回本项目，在用）
-├── skew_detect.py          # 倾斜角检测引擎 — 纯 PIL 投影法（尚未接入扫描流水线 ⇒ 不随 EXE 交付）
+├── skew_detect.py          # 倾斜角检测引擎 — 纯 PIL 投影法（✅ 已接入扫描流水线 ⇒ 随 EXE 交付）
 ├── build_exe.py            # PyInstaller 打包脚本
 ├── resources/              # 运行时资源（图标/字体/样式，随 EXE 打包）
 │   ├── fonts/
@@ -88,7 +88,8 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 │   │   └── wsd-discovery.md      # WSD 发现协议调研
 │   ├── superpowers/              # 本轮设计规格与实施计划（plans / specs）
 │   └── verify/
-│       └── baseline_D1.md        # 真机基准（改造前）
+│       ├── baseline_D1.md        # 真机基准（改造前）+ D2 回归章节的索引
+│       └── regression_D2.md      # 真机回归对照（改造后）
 ├── tools/
 │   └── verify_scan.py      # 真机基准脚本（D1/D2）
 ├── PRD.md                  # 产品需求文档 v3.1
@@ -195,21 +196,21 @@ preset_manager.py (在用)
 | WIA 降级 | ✅ | eSCL 不可用时自动降级到 WIA |
 | 监听模式 | ✅ | 等待打印机面板触发扫描 |
 
-### 4.2 P1 体验优化（全部完成）
+### 4.2 P1 体验优化（除标注为 v3.1 遗留的条目外，均已完成）
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 深色/浅色主题 | ✅ | 一键切换，配置持久化 |
+| 深色/浅色主题 | ⚠️ v3.1 遗留 | **v4.0 无主题机制** —— 全仓 `*.py` 搜 `theme` 零命中，GUI 是单主题（`hp_scan_gui_pyside.py:89 COLORS` + `resources/styles/app.qss`），既无切换控件也无 `theme` 配置键。PRD §2.6.2 已把整节标为 v3.1 遗留 |
 | 打印机自定义名称 | ✅ | 按 IP 关联，配置持久化 |
 | 打印机优先级排序 | ✅ | ▲▼ 按钮调整顺序，重启后记住 |
 | 扫描仪选中持久化 | ✅ | 按 IP 恢复上次选中的扫描仪 |
-| 任务栏图标清晰 | ✅ | iconphoto + PNG + SetProcessDpiAwareness(2) |
-| 任务栏图标不闪烁 | ✅ | SetCurrentProcessExplicitAppUserModelID |
+| 任务栏图标清晰 | ✅ | PySide6 实际走 `QIcon`：`get_resource_path("icons/icon_64.png")`（`hp_scan_gui_pyside.py:1101`）。⚠️ `iconphoto` 是 CustomTkinter 的 API，v4.0 已不存在 |
+| 任务栏图标不闪烁 | ⚠️ v3.1 遗留 | v4.0 **没有** `SetCurrentProcessExplicitAppUserModelID` 调用（全仓零命中），未做显式任务栏分组设置 |
 | 窗口防逐帧渲染 | ✅ | withdraw → build → update_idletasks → deiconify |
 | 嵌入式字体 | ✅ | AddFontResourceExW 私有加载，ClearType 优化 |
-| 多页分组管理 | ✅ | 插入分割/移除分割/重命名分组 |
+| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:360`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
 | 页面删除 | ✅ | 多页预览中删除不需要的页面 |
-| 并发扫描 | ✅ | 多台打印机同时扫描，独立缓存 |
+| 并发扫描 | ⚠️ 后端支持 / GUI 未开放 | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:305-306`）；但 GUI 扫描期间 `scan_btn.setEnabled(False)`（`hp_scan_gui_pyside.py:1851`）、只跟踪单个 `_current_job_id` ⇒ **GUI 上一次只能扫一台**，与 `PRD.md` §13「单线程扫描，不支持并发」一致 |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
 
 ### 4.3 架构分离（2026-07-19 完成，**2026-10-20 已回退**）
@@ -232,12 +233,13 @@ preset_manager.py (在用)
 
 ### 5.1 图标方案（经过大量迭代）
 
-**最终方案**: `iconphoto` + PNG 文件（比 `iconbitmap` + ICO 清晰得多）
+**v4.0 实际方案**：PySide6 `QIcon` + PNG 资源 —— `hp_scan_gui_pyside.py:1101` `get_resource_path(os.path.join("icons", "icon_64.png"))`
 
-- `iconphoto(True, 64px PNG)` — True 表示应用到所有 Toplevel 窗口
-- `iconphoto(False, 32px PNG)` — 小尺寸用 32px
-- 必须调用 `SetProcessDpiAwareness(2)` 防止 Windows 位图拉伸
-- 必须调用 `SetCurrentProcessExplicitAppUserModelID("HP.ScanTool.v4.0")` 统一任务栏身份
+> ⚠️ **2026-10-21 订正**：本节原先描述的是 **CustomTkinter（v3.1）** 方案 —— `iconphoto(True/False, Npx PNG)`、`SetProcessDpiAwareness(2)`、`SetCurrentProcessExplicitAppUserModelID("HP.ScanTool.v4.0")`。这三个 API 在 v4.0（PySide6）代码里**全部不存在**：全仓 `*.py` 搜 `iconphoto|SetProcessDpiAwareness|SetCurrentProcessExplicitAppUserModelID` 只命中 `hp_scan_gui_pyside.py:4154` 的一句**注释**（"提前设置环境变量可抑制 Qt 内部的 SetProcessDpiAwarenessContext 警告"），不是实现。
+> 下半段的**经验教训仍然有效**，但**机制部分一律以代码为准**。
+
+- v4.0：`QIcon(...icons/icon_64.png)`，32px / 64px 由 Qt 从同一张 64px PNG 缩放，**没有** v3.1 的 `iconphoto` 双尺寸调用
+- v4.0：**未**显式调用 `SetProcessDpiAwareness(2)`，也**未**调用 `SetCurrentProcessExplicitAppUserModelID` ⇒ 任务栏分组行为依赖 Qt 自身
 - AI 生成的图片不适合做图标（细节太多缩小后糊），必须用 ImageDraw 绘制纯几何图形
 - PIL 的 ICO save 不支持真正的多尺寸（append_images 对 ICO 无效），需手写 struct 格式
 
@@ -252,14 +254,14 @@ preset_manager.py (在用)
 
 - `NextDocument` 轮询比 Job URI 更稳定（M232 等机型 Job URI 返回 404）
 - 双协议发现：mDNS 为主，WSD 兜底，按 IP 去重
-- HTTPS 301 重定向暂不跟随（M232 等机型）
+- HTTPS 301 重定向**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:330-343` 的 `_http_get_loose_tls`）
 
 ### 5.4 PyInstaller 打包
 
 - 动态 import 的模块必须加入 hiddenimports
 - EXE 被占用时用 `--distpath` 指定不同目录绕过文件锁
 - 字体/图标由 `build_exe.py` 的 `--add-data resources;resources` 一并打包
-- 单文件 EXE 约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测）
+- 单文件 EXE **65,866,395 字节（约 62.8 MB）** —— `dist/HP_Scan_Tool.exe` 的**实测值**（LastWriteTime `2026-10-21 01:30`，即 `19efd5c`「排除 Pillow 顺带拖入的 numpy + 补 EXE 图标与版本资源」之后重新打出的包）。⚠️ 此前文档里的两个数字**均已过期**：①「63,452,740 字节旧包（2026-07-28）」—— 仓库 `dist/` 现存的就是 01:30 重新打出的包，不是 7 月旧包；②「约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节）」—— 改造前基线，与当前包无关
 
 ---
 
@@ -275,7 +277,7 @@ preset_manager.py (在用)
 
 ### 6.2 关键决策历程
 
-1. **图标问题**（经历 ~8 轮迭代）：AI 图片 → 手绘 ICO → iconbitmap → WM_SETICON → 最终 iconphoto + PNG 解决
+1. **图标问题**（经历 ~8 轮迭代）：AI 图片 → 手绘 ICO → iconbitmap → WM_SETICON → 最终 iconphoto + PNG 解决　**（⚠️ 这是 v3.1 CustomTkinter 的最终方案；v4.0 改用 PySide6 `QIcon` + PNG 资源，见 §5.1）**
 2. **曝光功能归属**：最初考虑在 HP Scan Tool 内加曝光面板 → 用户提议做成独立软件 → 讨论后决定曝光+扶正等功能全部剥离到独立的 DocFix 工具 → **2026-10-20 决定放弃独立 DocFix 软件，曝光/预设并回本项目**（扶正仍未并入）
 3. **打印机排序**：用户要求可调整打印机优先级，重启后记住 → 通过 list 重排 + config 持久化实现
 4. **架构分离**：用户提出"HP Scan Tool 仅用于扫描" → 剥离所有图像后处理代码到 `_docfix_reserve/`（**2026-10-20 该决策对曝光/预设已回退，见 §4.3**）
@@ -292,7 +294,7 @@ preset_manager.py (在用)
 **核心功能**:
 - 曝光矫正（去灰底/亮度/对比度/Gamma/阴影高光/通道增益）—— ✅ 已交付（`ExposurePanel` + 落盘链路）
 - 预设系统（4 个内置预设 + 用户自定义）—— ✅ 已交付（`%APPDATA%\HP_Scan_Tool\presets.json`）
-- 文档扶正/去歪斜 —— ⚠️ **倾斜角检测引擎已完成**（`skew_detect.py`，纯 PIL 零依赖），**但尚未接入扫描流水线 ⇒ 当前不随 EXE 交付**
+- 文档扶正/去歪斜 —— ✅ **已交付**（`skew_detect.py`，纯 PIL 零依赖）：**检测与落盘施加纠偏均已接入扫描流水线**（`c6037a4`）—— 每页写入缓存后调 `estimate_skew` 测角度、写进 `page_meta.deskew_angle`（绝不旋转缓存原件），落盘时 `save_manager.save_pages` 按阈值施加纠偏。`skew_detect` 是**静态 import**（`scan_coordinator.py:29` / `save_manager.py:42`）⇒ PyInstaller 依赖分析实测 FOUND ⇒ **随 EXE 交付**。⚠️ **GUI 里没有纠偏开关** —— `deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive` 这 4 个键只有默认值（`save_manager.DESKEW_CONFIG_DEFAULTS`），界面不可调
 - 后续可能加：裁边、去污、OCR
 
 **技术要点**:
@@ -316,9 +318,9 @@ preset_manager.py (在用)
 
 | 限制 | 说明 |
 |------|------|
-| M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，当前未跟随 |
+| M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:330-343`） |
 | 无扫描预览（原图查看） | 简化后的 PreviewDialog 只加载缩略图，不做全分辨率预览 |
-| 单文件 EXE 体积 | 约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测），包含所有依赖 |
+| 单文件 EXE 体积 | **65,866,395 字节（约 62.8 MB）**，实测值（`dist/HP_Scan_Tool.exe`，LastWriteTime `2026-10-21 01:30`，`19efd5c` 排除 numpy 之后重新打出的包），包含所有依赖。⚠️ 旧的「63,452,740 字节旧包（2026-07-28）」与「改造前基线 64,968,184 字节」均已过期 |
 | 无自动更新 | 当前版本无自动检查更新机制 |
 
 ---
@@ -362,7 +364,6 @@ python cli.py history --limit 10
 
 ```json
 {
-  "theme": "dark",
   "resolution": 300,
   "color_mode_ui": "彩色",
   "output_format": "jpg",
@@ -373,6 +374,10 @@ python cli.py history --limit 10
   "selected_scanner_ip": "192.168.1.100"
 }
 ```
+
+> ⚠️ **2026-10-21 订正**：原示例里带 `"theme": "dark"` —— **v4.0 没有主题机制**，全仓 `*.py` 搜 `theme` 零命中，既无切换控件也无此配置键（该键是 v3.1 遗留，PRD §6.2 已把整行划掉）。已从示例里删除。
+>
+> 示例里也省略了纠偏相关的 4 个键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`）—— 它们**会被程序自动补进 `scan_config.json`**（`scan_coordinator.apply_deskew_defaults`），完整键表见 `PRD.md` §6.2。
 
 注意：`exposure_mode`、`brightness`、`contrast` 字段**不在** `scan_config.json` 里。曝光参数（模式/亮度/对比度/gamma/阴影高光/通道增益）由 `ExposurePanel` 在运行时持有，用户预设持久化在 `%APPDATA%\HP_Scan_Tool\presets.json`；旧配置文件中的这些字段会被忽略。
 

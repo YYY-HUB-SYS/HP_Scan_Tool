@@ -25,6 +25,8 @@ Windows 本地扫描驱动接口，作为 eSCL 不可用时的降级方案。仅
 **探活 (Probe)**
 向指定 IP 发送 HTTP 请求检测 eSCL 服务是否可用，返回基础 URL（`/eSCL/` 或 `/`）。
 
+> ⚠️ **2026-10-21 订正（v4.0 口径）**：v3.1 时代 GUI 有「载入已保存打印机 → 后台逐台探活 → 每探通一台就刷一次卡片」那套逻辑（`_restore_presets` / `_probe_saved`），**v4.0 的 PySide6 GUI 已无这两个方法** —— 发现统一走 `ScanApp._auto_discover()` → `coordinator.discover_scanners_background(...)` → `_on_discover_finished()` → `_rebuild_cards()`；`saved_ips` 现在只用于「手动添加」时补写。`PRD.md` §2.2.4 已把这段标为 v3.1 遗留。
+
 **能力查询 (Capabilities)**
 从 `/eSCL/ScannerCapabilities` XML 解析扫描仪支持的全部参数：分辨率列表、颜色模式、输出格式、ADF/双面支持等。
 
@@ -44,6 +46,8 @@ RGB24（彩色）、Grayscale8（灰度）、BlackAndWhite1（黑白）。
 **配置 (Config)**
 scan_config.json 文件，保存用户偏好：分辨率、颜色模式、格式、来源、已保存的打印机 IP 列表和自定义名称。
 
+> ⚠️ **2026-10-21 订正（v4.0 口径）**：完整键表见 `PRD.md` §6.2。除上面列的以外，v4.0 实际还会写 `duplex` / `direct_save` / `extra_dirs` / `disabled_ips` / `selected_scanner_ip` / `window_width|height|x|y`，以及 4 个纠偏相关键 `deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`（启动时由 `scan_coordinator.apply_deskew_defaults()` 自动补进文件）。**没有 `theme` 键** —— v4.0 是单主题，全仓搜 `theme` 零命中。
+
 **自定义名称 (Custom Name)**
 用户为打印机设置的别名，按 IP 关联，覆盖默认的设备名称。
 
@@ -59,7 +63,7 @@ scan_config.json 文件，保存用户偏好：分辨率、颜色模式、格式
 上限可配置（默认 1024MB），达到 95% 触发线时自动 FIFO 清除 150MB。启动时清理超过 24 小时的残留缓存。
 
 **并发扫描 (Concurrent Scanning)**
-支持多台打印机同时扫描，每个任务独立缓存子目录。
+⚠️ **后端支持、GUI 未开放** —— 后端 `ScanCoordinator` 用 `QThreadPool`（`setMaxThreadCount(4)`）可同时跑多个任务、每个任务独立缓存子目录；但 GUI 在扫描期间禁用「扫描」按钮（`scan_btn.setEnabled(False)`）且只跟踪单个 `_current_job_id` ⇒ **界面上一次只能扫一台**。这条与 `PRD.md` §13「单线程扫描，不支持并发」口径一致。
 
 ## 发现协议
 

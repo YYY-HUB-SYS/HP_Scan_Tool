@@ -31,9 +31,11 @@ PROJECT_DIR=<PROJECT_DIR>
 # 构建输出目录
 DIST_DIR=dist
 
-# PyInstaller 参数
-PYINSTALLER_SPEC=HP_Scan_Tool.spec
+# 构建入口（唯一的打包路径）
+BUILD_SCRIPT=build_exe.py
 ```
+
+> ⚠️ **2026-10-21 订正**：原写 `PYINSTALLER_SPEC=HP_Scan_Tool.spec` —— **该文件已被删除**（实施计划的「删除」表：onedir 配置，与 CI 实际运行的 `build_exe.py`（onefile）冲突）。仓库**不再保留独立的 `.spec` 文件**，`build_exe.py` 是唯一的打包入口（`HANDOVER.md` §8.2 同样口径）。
 
 ## 4. 运行时配置
 

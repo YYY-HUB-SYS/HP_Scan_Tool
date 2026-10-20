@@ -138,7 +138,7 @@ AIGC:
 | 实现函数 | `escl_engine.py::probe_escl(ip, port, timeout)` |
 | 探测路径 | ① `/eSCL/ScannerStatus` → ② `/ScannerStatus`（根路径兜底） |
 | 返回 | eSCL 基础 URL（如 `http://x.x.x.x/eSCL/`）或 None |
-| 超时 | 3-4 秒 |
+| 超时 | 2 秒（`escl_engine.probe_escl` 默认 `timeout=2.0`；发现流程 `scan_coordinator.py:440` 传 3 秒） |
 
 #### 2.2.3 手动添加
 
@@ -167,7 +167,7 @@ AIGC:
 | 优先级 | P0 |
 | 实现函数 | `escl_engine.py::fetch_capabilities(scanner, timeout)` |
 | 端点 | `GET {escl_url}/ScannerCapabilities` |
-| 超时 | 5 秒 |
+| 超时 | 3 秒（`escl_engine.fetch_capabilities` 默认 `timeout=3.0`） |
 | 命名空间 | 支持 `imaging/escl/2011/05/03` 和 `scanner/escl/2011/09` 两种 |
 
 **解析字段对照表**：
@@ -179,8 +179,8 @@ AIGC:
 | 顶层 `Platen` 子元素存在 | `has_platen = True` | True |
 | 顶层 `Adf` 子元素存在 | `has_adf = True` | False |
 | `Adf/Duplex` = "true" | `has_duplex = True` | False |
-| `MaxWidth` | `max_width` | 2550 |
-| `MaxHeight` | `max_height` | 4200 |
+| `MaxWidth` | `max_width` | 2480（dataclass 默认，`escl_engine.py:67`）；解析时该标签缺省取 2550 |
+| `MaxHeight` | `max_height` | 3508（dataclass 默认，`escl_engine.py:68`）；解析时该标签缺省取 4200 |
 | `DiscreteResolutions` 或 `SupportedResolutions` 下 `Width` | `resolutions` | [75,150,200,300,600] |
 | `ColorModes` 或 `SupportedColorModes` 子元素 | `color_modes` | ["RGB24","Grayscale8"] |
 | `DocumentFormats` 或 `SupportedDocumentFormats` 子元素 | `formats` | ["image/jpeg","application/pdf"] |
@@ -193,7 +193,7 @@ AIGC:
 | 实现函数 | `escl_engine.py::get_scanner_status(escl_url, timeout)` |
 | 端点 | `GET {escl_url}/ScannerStatus` |
 | 返回字典 | `{"state": "Idle"/"Processing"/"Unknown", "adf_loaded": True/False}` |
-| 用途 | ① 预览状态按钮弹窗 ② 扫描前 ADF 自动检测 |
+| 用途 | ① 打印机状态对话框 ② 扫描前 ADF 自动检测 |
 
 ### 2.4 扫描执行模块
 
@@ -203,7 +203,7 @@ AIGC:
 |------|---|
 | 优先级 | P0 |
 | 实现函数 | `escl_engine.py::execute_scan()`（返回 `(图片字节, 扩展名)`；**不落盘**） |
-| 超时 | 120 秒（可配置，GUI 中传 90 秒） |
+| 超时 | 30 秒（`escl_engine.execute_scan` 默认 `timeout=30.0`）；协调器 `scan_coordinator.py:713` 传 90 秒。⚠️ 多页路径 `execute_multipage_scan` 默认 90 秒，协调器传 300 秒 |
 | 轮询间隔 | 0.5 秒 |
 
 > **2026-10-21 订正**：本节原写「`execute_scan()` → `scan_to_file()`」。`scan_to_file()` 已于 `50aeb59` 删除（死代码、零调用），`execute_scan()` 之后**不再有引擎层的落盘函数**——落盘已下沉到 `save_manager`（见 §2.4.3）。
@@ -243,7 +243,7 @@ M232 系列 ApolloLedmServer 固件创建 ScanJob 后立刻删除 job 记录，�
 | 分辨率 (resolution) | 75, 150, 200, 300, 600, 1200 DPI | 直接传递 |
 | 颜色模式 (color_mode) | 彩色→RGB24, 灰度→Grayscale8, 黑白→BlackAndWhite1 | `COLOR_MODE_MAP` |
 | 格式 (output_format) | jpg→image/jpeg, png→image/png, pdf→application/pdf, tiff→image/tiff | `FORMAT_MIME` |
-| 来源 (source) | Platen（平板）, Feeder（输稿器） | 直接传递 |
+| 来源 (source) | Platen（平板）, Feeder（输稿器）, 自动 | GUI 下拉是**中文**三项：「平板」/「ADF」/「自动」（`hp_scan_gui_pyside.py:1776-1779`）；「自动」由 `scan_coordinator.resolve_source` 按 ADF 有纸状态判定 |
 | 双面 (duplex) | true/false | 仅 ADF 支持时可用 |
 
 #### 2.4.3 PDF 合成
@@ -379,10 +379,14 @@ CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 
 | 按钮 | 正常态 | 扫描中 |
 |------|--------|--------|
-| 搜索局域网 | normal, "搜索局域网" | disabled, "搜索中..." |
+| 刷新 | normal, "刷新" | — |
 | 扫描 | normal, "扫描" | disabled, "扫描中..." |
-| 查询能力 | 始终可用 | — |
-| 预览状态 | 始终可用 | — |
+| 打印机状态 | 始终可用 | — |
+
+> **2026-10-21 订正**：本表原写「搜索局域网 / 查询能力 / 预览状态」三个按钮 —— 代码里**没有**这三个按钮：
+> - 「搜索局域网」不存在，实际是「**刷新**」（`hp_scan_gui_pyside.py:1245`），点击触发后台重新发现；
+> - 「查询能力」不存在（见 §7.3 订正）—— 能力是**启动时后台并行探测**（`hp_scan_gui_pyside.py:1156-1167` → 200ms 轮询 → `_rebuild_cards`），结果直接体现在**卡片标签**上，没有独立对话框；
+> - 「预览状态」实际叫「**打印机状态**」（`hp_scan_gui_pyside.py:1391`）。
 
 ---
 
@@ -501,12 +505,14 @@ eSCL (eScanner Communication Language) 是 Mopria Alliance 定义的网络扫描
 
 ### 4.3 命名空间差异
 
-不同机型使用不同 XML 命名空间，引擎通过 `tag(el)` 函数剥离命名空间前缀实现兼容：
+不同机型使用不同 XML 命名空间，引擎通过 `_strip_ns(el)` 函数剥离命名空间前缀实现兼容：
 
 ```python
-def tag(el):
+def _strip_ns(el) -> str:
     return el.tag.split("}")[-1] if "}" in el.tag else el.tag
 ```
+
+> **2026-10-21 订正**：原写 `tag(el)`，全仓 `*.py` 搜 `def tag` **零命中**；实际函数名是 `escl_engine._strip_ns(el)`（`escl_engine.py:34`）。
 
 | 机型 | Server | 命名空间 |
 |------|--------|---------|
@@ -518,29 +524,42 @@ def tag(el):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
-<scan:ScanJob
-    xmlns:scan="http://schemas.hp.com/scanner/escl/2011/09"
+<scan:ScanSettings
+    xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"
     xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.0</pwg:Version>
   <pwg:DocumentFormat>image/jpeg</pwg:DocumentFormat>
-  <scan:InputSource>Platen</scan:InputSource>
+  <pwg:InputSource>Platen</pwg:InputSource>
   <scan:Intent>Document</scan:Intent>
-  <scan:ScanRegions>
-    <scan:ScanRegion>
+  <pwg:ScanRegions>
+    <pwg:ScanRegion>
       <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
       <pwg:Width>2550</pwg:Width>
       <pwg:Height>4200</pwg:Height>
-      <scan:ScanRegionXOffset>0</scan:ScanRegionXOffset>
-      <scan:ScanRegionYOffset>0</scan:ScanRegionYOffset>
-    </scan:ScanRegion>
-  </scan:ScanRegions>
+      <pwg:XOffset>0</pwg:XOffset>
+      <pwg:YOffset>0</pwg:YOffset>
+    </pwg:ScanRegion>
+  </pwg:ScanRegions>
   <scan:XResolution>300</scan:XResolution>
   <scan:YResolution>300</scan:YResolution>
   <scan:ColorMode>RGB24</scan:ColorMode>
   <scan:Duplex>false</scan:Duplex>
-</scan:ScanJob>
+  <!-- 仅 Feeder 来源时附加 -->
+  <scan:MaxScanPages>1</scan:MaxScanPages>
+</scan:ScanSettings>
 ```
 
+> **2026-10-21 订正**：原模板与实际请求体不符（`escl_engine._build_scan_job_xml`，`escl_engine.py:505-538`）。逐项差异：
+> - 根元素是 `<scan:ScanSettings>`，**不是** `<scan:ScanJob>`；
+> - 命名空间走常量 `NS_SCAN` = `http://schemas.hp.com/imaging/escl/2011/05/03`（**不是** `.../scanner/escl/2011/09`）与 `NS_PWG`；
+> - 多了 `<pwg:Version>2.0</pwg:Version>`；
+> - 来源是 `<pwg:InputSource>`（**不是** `scan:InputSource`）；
+> - 区域是 `<pwg:ScanRegions>/<pwg:ScanRegion>`（**不是** `scan:` 前缀）；
+> - 偏移是 `<pwg:XOffset>` / `<pwg:YOffset>`（**不是** `scan:ScanRegionXOffset/YOffset`）；
+> - Feeder 来源时追加 `<scan:MaxScanPages>`（原模板完全没有）。
+
 **ContentRegionUnits 说明**：`escl:ThreeHundredthsOfInches`（1/300 英寸）是 eSCL 标准单位，因此 2550 = 8.5 英寸（Letter 宽度），4200 = 14 英寸（Legal 长度）。
+> ⚠️ 注意区分：`_build_scan_job_xml` 的 `width`/`height` **函数默认**仍是 2550 / 4200（Letter/Legal）；而 `ScannerInfo.max_width/max_height` 的**dataclass 默认**是 2480 / 3508（A4 @300dpi）。两者用途不同，不要混用。
 
 ### 4.5 轮询策略决策树
 
@@ -580,11 +599,12 @@ class ScannerInfo:
     has_adf: bool = False            # 是否有输稿器
     has_duplex: bool = False         # 是否支持双面
     has_platen: bool = True          # 是否有平板
-    max_width: int = 2550            # 最大扫描宽度（1/300英寸）
-    max_height: int = 4200           # 最大扫描高度（1/300英寸）
+    max_width: int = 2480            # 最大扫描宽度（1/300英寸；A4 210mm @300dpi）
+    max_height: int = 3508           # 最大扫描高度（1/300英寸；A4 297mm @300dpi）
     resolutions: list = [75,150,200,300,600]    # 支持的分辨率列表
     color_modes: list = ["RGB24","Grayscale8"]  # 支持的颜色模式
     formats: list = ["image/jpeg","application/pdf"]  # 支持的输出格式
+    capabilities_known: bool = False  # 能力文档是否真的拿到（★ 设备到底有没有 ADF 的唯一权威信号）
 
     # GUI 扩展字段（运行时添加，不参与序列化）
     custom_name: str = ""            # 用户自定义名称，存在于 nicknames 配置中
@@ -593,6 +613,8 @@ class ScannerInfo:
     def display_name(self) -> str:
         return self.model or self.name
 ```
+
+> **2026-10-21 订正**：原清单里 `max_width: int = 2550` / `max_height: int = 4200`，与 `escl_engine.py:67-68` 的 dataclass 默认**不符** —— 代码默认是 **2480 / 3508（A4 @300dpi）**，文档写的 2550/4200 是 Letter/Legal。另补上原先漏掉的字段 **`capabilities_known: bool = False`**（`escl_engine.py:80`）：它是「设备到底有没有 ADF」的**唯一权威信号** —— `fetch_capabilities` 真正拿到能力文档才置位（`escl_engine.py:355`），回退探测路径不会置位（`escl_engine.py:347`）。
 
 ### 5.2 ScanJob（⚠️ 当前代码里没有这个类）
 
@@ -694,10 +716,17 @@ REQUEST_FORMAT = {
 | `saved_ips` | array | `[]` | 已发现的打印机 IP 和型号 |
 | `nicknames` | object | `{}` | 用户自定义名称，key=IP, value=名称 |
 | `window_width` / `window_height` / `window_x` / `window_y` | int | `1050` / `720` / — / — | 主窗口位置与尺寸（恢复用） |
+| `deskew_enabled` | bool | `true` | 纠偏总开关；关掉 ⇒ 只检测角度、不纠偏也不提醒（`save_manager.DESKEW_CONFIG_DEFAULTS`） |
+| `deskew_apply_threshold` | float | `0.5` | 施加纠偏的最小角度（度）；低于此值不旋转 |
+| `skew_warn_threshold` | float | `3.0` | 倾斜强提醒阈值（度）；绝对值严格大于才算「歪」 |
+| `skew_warn_consecutive` | int | `3` | 连续几页都超阈值才发一次 `skew_warning` |
 | ~~`theme`~~ | — | — | **v3.1 遗留**：全仓 `*.py` 搜 `theme` 零命中，v4.0 代码里既无主题开关也无此配置键 |
 
 > **2026-10-21 订正**：原文的 schema 缺 `source` / `duplex` / `direct_save` / `extra_dirs` / `disabled_ips` / `selected_scanner_ip` / `window_*` 共 9 个**代码里真实存在**的键，且多了一个**代码里不存在**的 `theme` 键。以上键集合按 HEAD 时点（`hp_scan_gui_pyside.py` 的 `cfg[...]` 写点与 `cfg.get(...)` 读点）逐条核对。
-> ⚠️ 另：在途的纠偏接入批次（尚未提交）还会新增 4 个纠偏相关键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`），落地后本表需再订正。
+>
+> **2026-10-21 二次订正**：原文末行「⚠️ 在途的纠偏接入批次（尚未提交）还会新增 4 个纠偏相关键……落地后本表需再订正」——**该批次已提交并落地**（`c6037a4`「feat(skew): 自动纠偏接线」，已在 HEAD 之内）。4 个键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`）**已正式列入上表**，默认值取自 `save_manager.DESKEW_CONFIG_DEFAULTS`（唯一真源，`save_manager.py:82-87`）；`scan_coordinator.apply_deskew_defaults()`（`scan_coordinator.py:223`）在启动时把它们补进 `scan_config.json`。
+>
+> ⚠️ **仍存在的缺口**：这 4 个键目前**只有默认值，GUI 里没有开关可改** —— 用户只能改 `scan_config.json` 里的数值，界面不可调。
 
 ---
 
@@ -729,6 +758,7 @@ REQUEST_FORMAT = {
 ```
 
 > ⚠️ 顶栏的 `[light│dark]` 在 v4.0 **不存在**（无主题切换）。
+> ⚠️ 左侧的 `[搜索局域网]` 在 v4.0 是「**刷新**」；右下角的 `[查询能力][预览状态]` 在 v4.0 是「**打印机状态**」—— **没有「查询能力」按钮**（能力是启动时后台探测、结果标在卡片标签上）。按钮全集见 §2.6.4。
 
 ### 7.2 卡片状态
 
@@ -743,14 +773,18 @@ REQUEST_FORMAT = {
 
 | 对话框 | 类型 | 触发 | 内容 |
 |--------|------|------|------|
-| 能力查询结果 | showinfo | 点击"查询能力" | 型号/序列号/最大DPI/ADF/双面/平板/颜色模式/格式 |
-| 打印机状态 | showinfo | 点击"预览状态" | State(Idle/Processing/Unknown) + ADF有纸(是/否) |
-| 扫描完成 | askyesno | 扫描成功 | "已保存: {路径}" + "打开所在文件夹？" |
+| 能力探测结果（**无独立对话框**） | — | 启动时后台探测 / 点击「刷新」 | 结果直接显示在**扫描仪卡片的标签**上（型号/序列号/分辨率/颜色模式/格式/ADF/双面/平板），不弹窗 |
+| 打印机状态 | showinfo | 点击"打印机状态" | State(Idle/Processing/Unknown) + ADF有纸(是/否) |
 | 扫描失败 | showerror | 扫描异常 | 异常类型+消息+traceback + 排查提示 |
 | 手动添加 | ~~CTkToplevel~~ → `QDialog` | 点击"手动添加" | IP输入框 + 探测按钮 + 结果反馈 |
 | 重命名 | ~~CTkToplevel~~ → `QDialog` | 右键卡片 | 名称输入框 + 确认按钮 |
 
 > **2026-10-21 订正**：原表两行点名 `CTkToplevel` —— 该类**在当前代码里不存在**（v4.0 用 `QDialog`，见 `hp_scan_gui_pyside.py:1698` / `:2200`）。`showinfo` / `askyesno` / `showerror` 同理，v4.0 是 `QMessageBox.information` / `question` / `critical`。
+>
+> **2026-10-21 二次订正**：
+> - 原「能力查询结果 / showinfo / 点击"查询能力"」一行 —— 代码里**没有「查询能力」按钮**（按钮全集见 §2.6.4），能力是**启动时后台并行探测**（`hp_scan_gui_pyside.py:1156-1167` → 200ms 轮询 → `_rebuild_cards`）后直接标在卡片上，**不弹对话框**。已按现状改写。
+> - 原「扫描完成 / askyesno / "已保存: {路径}" + "打开所在文件夹？"」一行 —— **代码里不弹这个确认框**：`hp_scan_gui_pyside.py:3346` / `:4045` 直接 `os.startfile(os.path.dirname(saved_files[0]))` 打开所在文件夹。全仓搜 `打开文件夹` / `askyesno` **零命中**；代码里仅有的 4 处 `QMessageBox.question` 是「清空配置」「至少保留一页」「保存覆盖确认」「清空历史」。该行已删除。
+> - 「预览状态」按钮实际叫「**打印机状态**」，触发文案已同步订正。
 
 ### 7.4 通知方式
 
@@ -791,13 +825,33 @@ REQUEST_FORMAT = {
 
 ### 8.3 用户排查提示
 
-扫描失败弹窗底部附排查指引：
+> **2026-10-21 订正**：本节原写「扫描失败弹窗底部附排查指引」（eSCL 不通三步检查），但**代码里没有这段提示** —— 全仓 `*.py` 搜 `eSCL 不通` / `打印机已启用` / `浏览器访问` / `防火墙` **零命中**。下面按**代码现状**改写：代码给用户的排查文案是两套，写在异常消息里（`escl_engine`），由 GUI 的 `QMessageBox.critical` 直接展示。
+
+扫描失败时实际弹出的排查文案（节选自 `escl_engine` 的异常消息）：
+
 ```
-如果 eSCL 不通，请确认:
-1. 打印机已启用 eSCL/AirScan
-2. 浏览器访问 http://打印机IP/eSCL/ScannerStatus 确认可达
-3. 防火墙未拦截
+扫描超时：未能在限定时间内获取扫描数据。
+请确认打印机已开机并完成初始化、面板上没有其它任务在执行；
+若设备刚从休眠唤醒，请稍后重试。
 ```
+（`escl_engine.SCAN_TIMEOUT_MESSAGE`，`escl_engine.py:587-591`；首页超时另有 `FIRST_PAGE_TIMEOUT_MESSAGE`，`:592-596`）
+
+```
+打印机当前不可用（HTTP 503）。
+若选择的是输稿器(ADF)扫描，请确认输稿器里已放入纸张后重试；
+否则请等待设备空闲后重试。
+```
+（`escl_engine.py:697-701`）
+
+**代码里实际存在的另外几条错误文案**（`escl_engine.py`）：
+
+| 场景 | 文案 |
+|------|------|
+| 未配置 eSCL URL | 「未配置 eSCL URL…」 |
+| 拿不到 ScanJob URI | 「无法获取 ScanJob URI…」 |
+| 扫描数据已过期（HTTP 410） | 「扫描数据已过期（HTTP 410），请放纸后重试」 |
+
+> **未实现的承诺**：原三行 eSCL 排查指引（① 打印机已启用 eSCL/AirScan ② 浏览器访问 `http://打印机IP/eSCL/ScannerStatus` 确认可达 ③ 防火墙未拦截）**在代码里不存在**。若要补上，这是三条里对用户最有价值的一条（补进 `escl_engine` 约 10 行），但**本轮只订正文档、不改代码** —— 已列入「需补代码」清单交主控排期。
 
 ---
 
@@ -868,8 +922,10 @@ python hp_scan_gui_pyside.py
     ↓
 单击选中 → 调整参数 → 点"扫描"
     ↓
-扫描完成 → 弹窗 "打开文件夹？"
+扫描完成 → 直接打开所在文件夹（os.startfile，无弹窗确认）
 ```
+
+> **2026-10-21 订正**：流程图末行原写「扫描完成 → 弹窗 "打开文件夹？"」—— 代码里**没有这个弹窗**：`hp_scan_gui_pyside.py:3346` / `:4045` 保存后直接 `os.startfile` 打开所在文件夹。与 §7.3 对话框表、`HANDOVER.md` §4.1「保存后打开文件夹 | ✅ | os.startfile 直接打开，无弹窗确认」一致。
 
 ---
 
