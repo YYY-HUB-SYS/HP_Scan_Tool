@@ -1,4 +1,4 @@
-"""
+r"""
 会话合并键重复 ⇒ 落盘静默丢页 的回归测试 — HP Scan Tool v4.0
 
 ★ 缺陷背景（终审 Important I-1，实测）
@@ -15,6 +15,9 @@
 `page_` 前缀，而 `save_manager` 的正则 `page_(\d+)\.` 连 `crop_page_003.jpg`
 都认 ⇒ 同一文件两处解析出**不同页号**（0 vs 3）⇒ 多个解析不出的页会**全是 0**
 ⇒ 又是重复键。本文件也钉住这条口径一致性。
+
+（★ 本 docstring 是 **raw string**：里面的 `\d` 是要展示给读者看的正则片段，
+不是 Python 转义序列 —— 非 raw 会触发 `SyntaxWarning: invalid escape sequence`。）
 """
 
 import os
