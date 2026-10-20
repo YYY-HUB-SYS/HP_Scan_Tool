@@ -36,6 +36,7 @@ from PIL import Image, UnidentifiedImageError
 
 import cache_manager
 import config_io
+import doc_merge
 import history_manager
 import page_meta
 import skew_detect
@@ -51,7 +52,8 @@ except ImportError:  # pragma: no cover - 缺依赖时给明确报错，而不�
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "build_output_name", "copy_to_extra_dirs", "save_pages", "save_single",
+    "build_output_name", "copy_to_extra_dirs", "save_pages", "save_session",
+    "save_single",
     "estimate_pdf_peak_bytes", "run_save_job",
     "SaveRequest", "SaveResult", "SaveAborted",
     "PDF_PEAK_FACTOR", "PDF_PEAK_LIMIT_BYTES",
@@ -951,6 +953,337 @@ def save_pages(job_id: str, ext: str, output_path: str,
     # 历史里的页数必须是**实际写出的页数**，不能是请求的页数
     _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
               saved_page_count or len(saved_files), ext, exposure=exposure)
+    return SaveResult(saved_files, failed_pages=failed_pages,
+                       skipped_pages=skipped_pages, warnings=warnings,
+                       saved_page_count=saved_page_count)
+
+
+# ── 会话级落盘（批次 4 · B4-5）─────────────────────────────────────────
+#
+# 一个**文档会话**（DocumentSession）把多次扫描聚合成一个文档，落盘时：
+#   · 双面 ⇒ 正面/背面交错合并成**一个** PDF
+#   · 批次 ⇒ N 个批次的页顺序拼接成**一个** PDF
+#   · 图片 ⇒ 每页一个文件，命名带**全局页号**（跨批次连续）
+#
+# ★ **合并规则一律委托 doc_merge**：边界规则（末页只有一面、背面整叠翻面）
+#   在 doc_merge 里已有测试覆盖 ⇒ 这里**不重写**，只负责"取页 + 喂给它"。
+# ★ **纠偏施加复用 c6037a4 已落地的路径**：本节只负责"把角度取出来"，
+#   旋转本身仍由 _expose_and_rotate → skew_detect.deskew_image 完成。
+# ★ 会话与缓存目录的关系：会话引用的 job 目录是**受保护**的
+#   （document_session → cache_manager.protect_dir）⇒ 落盘成功后必须
+#   **先解除保护、再删目录**，否则目录永远清不掉。
+
+
+def _strip_output_ext(path: str) -> str:
+    """
+    去掉输出路径的扩展名。
+
+    ★ 只动**文件名**部分：目录名里带点（"/tmp/a.b/out"）不会被误切
+      —— os.path.splitext 只看 basename。
+    """
+    text = str(path)
+    root, name = os.path.split(text)
+    stem, ext = os.path.splitext(name)
+    if not ext:
+        return text
+    return os.path.join(root, stem) if root else stem
+
+
+def _session_merged_pages(session) -> list:
+    """
+    会话页的**最终页序**（合并规则全部委托 doc_merge）。
+
+    · mode == "duplex" ⇒ 按 side 拆正/反 ⇒
+      `doc_merge.interleave_duplex(front, back, reverse_back=session.reverse_back)`
+      ★ side == "single" 的页按**正面**处理（双面会话里它就是被扫到的那一面）
+    · mode in ("batch", "single") ⇒ 按 job_id 分组（保持**首次出现顺序**，
+      组内保持原序）⇒ `doc_merge.merge_batches(batches)`
+    """
+    pages = list(getattr(session, "pages", None) or [])
+    mode = str(getattr(session, "mode", "single") or "single")
+    if mode == "duplex":
+        front = [p for p in pages if str(getattr(p, "side", "single")) != "back"]
+        back = [p for p in pages if str(getattr(p, "side", "single")) == "back"]
+        return list(doc_merge.interleave_duplex(
+            front, back,
+            reverse_back=bool(getattr(session, "reverse_back", True))))
+    batches: list = []
+    index: dict = {}
+    for page in pages:
+        job_id = str(getattr(page, "job_id", "") or "")
+        if job_id not in index:
+            index[job_id] = len(batches)
+            batches.append([])
+        batches[index[job_id]].append(page)
+    return list(doc_merge.merge_batches(batches))
+
+
+def _session_job_meta(job_id: str) -> dict:
+    """
+    读某 job 的页元数据。
+
+    ★ **键是字符串页号**（str(page_no)），不是 int —— 见 page_meta.set_page。
+    """
+    if not job_id:
+        return {}
+    try:
+        store = page_meta.PageMetaStore(cache_manager._cache_root())
+        job = store.get_job(job_id) or {}
+    except Exception as e:
+        logger.debug("读会话页元数据失败 [%s]: %s", job_id, e)
+        return {}
+    return job if isinstance(job, dict) else {}
+
+
+def _session_page_specs(merged_pages, deskew_enabled: bool = True):
+    """
+    逐页解析落盘参数 ⇒ (page_specs, deskew_angles)。
+
+    page_specs 与既有 save_pages **同构**：[(缓存文件路径, 手动旋转角), ...]
+
+    ★ 纠偏角来源（按优先级）：
+      ① page_meta[(job_id, str(page_no))]["deskew_angle"]  ← 权威
+        （扫描时由 skew_detect 测出、写进页元数据）
+      ② `resolve_deskew_angles` —— c6037a4 已落盘的解析路径
+        （缓存路径精确匹配 → 文件名里的页号 → 下标+1）
+      ③ PageRef 自带的 deskew_angle（会话自己的副本）
+    ★ 手动旋转角同理：page_meta 优先，PageRef.manual_rotation 兜底。
+    ★ `PageRef.force_keep == True` ⇒ 角度强制归零
+      （用户选了「强制保存」⇒ 这一页**不纠偏**）。
+    """
+    by_job: dict = {}
+    for idx, page in enumerate(merged_pages):
+        by_job.setdefault(str(getattr(page, "job_id", "") or ""), []).append(idx)
+
+    specs: list = [None] * len(merged_pages)
+    angles: list = [0.0] * len(merged_pages)
+
+    for job_id, indices in by_job.items():
+        job_meta = _session_job_meta(job_id)
+        # ② c6037a4 的既有解析路径（按 job 分组调用，避免逐页重读元数据）
+        resolved: list = []
+        if job_id:
+            try:
+                resolved = list(resolve_deskew_angles(
+                    job_id, [(merged_pages[i].cache_path, 0) for i in indices]))
+            except Exception as e:
+                logger.debug("解析会话页纠偏角失败 [%s]: %s", job_id, e)
+                resolved = []
+        for pos, idx in enumerate(indices):
+            page = merged_pages[idx]
+            cache_path = str(getattr(page, "cache_path", "") or "")
+            page_no = int(getattr(page, "page_no", 0) or 0)
+            meta = job_meta.get(str(page_no))
+            meta = meta if isinstance(meta, dict) else {}
+
+            rotation = _as_int(meta.get("manual_rotation", 0), 0, 0)
+            if not rotation:
+                rotation = _as_int(getattr(page, "manual_rotation", 0), 0, 0)
+
+            angle = 0.0
+            if "deskew_angle" in meta:
+                angle = _as_float(meta.get("deskew_angle"), 0.0, minimum=-180.0)
+            else:
+                if pos < len(resolved):
+                    angle = float(resolved[pos] or 0.0)
+                if not angle:
+                    angle = _as_float(getattr(page, "deskew_angle", 0.0), 0.0,
+                                      minimum=-180.0)
+            if getattr(page, "force_keep", False):
+                angle = 0.0
+            if not deskew_enabled:
+                angle = 0.0
+
+            specs[idx] = (cache_path, rotation)
+            angles[idx] = angle
+
+    return specs, angles
+
+
+def _session_cleanup_jobs(job_ids) -> None:
+    """
+    落盘成功后的缓存清理：**先解除保护、再删目录**（否则目录永远清不掉）。
+
+    ★ `cache_manager.unprotect_dir` 由 B4-2 落地，与本模块并行 ⇒ 用 getattr
+      做**存在性检查**：没有就记 debug 日志跳过（**不因此让保存失败**）。
+      与 document_session._unprotect_jobs 同一套路。
+    """
+    unprotect = getattr(cache_manager, "unprotect_dir", None)
+    if unprotect is None:
+        logger.debug("cache_manager.unprotect_dir 尚未落地，跳过解除保护: %s",
+                     list(job_ids))
+    else:
+        for jid in job_ids:
+            try:
+                unprotect(jid)
+            except Exception as e:
+                logger.error("缓存目录解除保护失败: %s（%s）", jid, e)
+    for jid in job_ids:
+        try:
+            cache_manager.remove_job(jid)
+        except Exception as e:
+            logger.error("缓存目录删除失败: %s（%s）", jid, e)
+        _remove_page_meta(jid)
+
+
+def save_session(session, out_path=None, extra_dirs=None,
+                 job_id=None, device_name="", device_ip="",
+                 groups=None, confirm=None) -> SaveResult:
+    """
+    把一个**文档会话**的全部页合并落盘（批次 4 · B4-5）。
+
+    页序（合并规则一律委托 doc_merge，本函数**不重写**）：
+      · mode == "duplex" ⇒ 按 side 拆正/反 ⇒
+        `doc_merge.interleave_duplex(front, back, reverse_back=session.reverse_back)`
+      · mode in ("batch", "single") ⇒ 按 job_id 分组（保持**首次出现顺序**，
+        组内保持原序）⇒ `doc_merge.merge_batches(batches)`
+
+    产物：
+      · ext == "pdf" ⇒ 合成**一个** PDF（复用既有两阶段流式合成 _write_pdf）
+      · jpg/png/tiff ⇒ 每页一个文件，命名带**全局页号**（跨批次连续）
+
+    纠偏：角度取自页元数据 page_meta[(job_id, str(page_no))]，施加走 c6037a4
+    已落地的路径（_expose_and_rotate → skew_detect.deskew_image）；
+    `PageRef.force_keep == True` 的页**不纠偏**。
+
+    清理（**只在全部页都合成成功**时执行；失败时什么都不清 ⇒ 可重试）：
+      ① 先解除保护（cache_manager.unprotect_dir，可能尚未落地 ⇒ 存在性检查）
+      ② 再删 job 目录（cache_manager.remove_job）+ 页元数据
+
+    :param session: 文档会话（鸭子类型：需要 pages / mode / ext / dpi /
+        exposure / reverse_back / output_path）
+    :param out_path: 输出路径；缺省用 session.output_path
+    :param extra_dirs: 额外输出目录（复制一份过去）
+    :param job_id: 额外要清理的 job_id（缺省只清会话引用过的 job）
+    :param groups: 可选，list[list[int]] —— 对**合并后页序**的下标分组
+        （多组产物，命名走 build_output_name 的多组规则）；缺省 = 一组
+    :param confirm: 体积预检的确认回调（返回 False ⇒ 抛 SaveAborted，
+        **不静默截断**）；None ⇒ 只记 warning 并继续
+    :return: **SaveResult**（list 子类）
+    """
+    if session is None:
+        raise ValueError("session 不能为空")
+    if not list(getattr(session, "pages", None) or []):
+        # 空会话 ⇒ 明确报错，**不产出 0 字节文件**
+        raise RuntimeError("会话没有可保存的页面（页列表为空）")
+
+    ext = str(getattr(session, "ext", "pdf") or "pdf").lower()
+    target = str(out_path or getattr(session, "output_path", "") or "")
+    if not target:
+        raise ValueError("没有指定输出路径（out_path 为空且会话未设置 output_path）")
+    base = _strip_output_ext(target)
+
+    merged = _session_merged_pages(session)
+    if not merged:
+        raise RuntimeError("会话没有可保存的页面（合并后为空）")
+
+    dpi = int(getattr(session, "dpi", 300) or 300)
+    exposure = getattr(session, "exposure", None)
+    exposure_active = _exposure_params(exposure) is not None
+
+    # ── 逐页落盘参数（纠偏角 / 手动旋转）────────────────────────────
+    settings = load_deskew_settings()
+    deskew_threshold = settings["deskew_apply_threshold"]
+    page_specs, deskew_angles = _session_page_specs(
+        merged, deskew_enabled=settings["deskew_enabled"])
+
+    # ── 分组（缺省：一组 = 全部页）───────────────────────────────────
+    if groups is None:
+        group_indices = [list(range(len(merged)))]
+    else:
+        group_indices = []
+        for group in groups:
+            idxs = [int(i) for i in group]
+            for i in idxs:
+                if i < 0 or i >= len(merged):
+                    raise ValueError(f"分组下标越界: {i}（共 {len(merged)} 页）")
+            group_indices.append(idxs)
+        if not group_indices:
+            raise ValueError("groups 为空 ⇒ 没有可保存的页面")
+    group_count = len(group_indices)
+
+    saved_files: list = []
+    failed_pages = 0
+    skipped_pages: list = []
+    warnings: list = []
+    saved_page_count = 0
+
+    for gi, indices in enumerate(group_indices, 1):
+        if ext == "pdf":
+            group_pages = [page_specs[i] for i in indices]
+            group_angles = [deskew_angles[i] for i in indices]
+            pdf_path = build_output_name(base, ext, group_count, gi, 1)
+            # 体积预检：在开始合并**之前**提示（不静默截断）
+            _precheck_pdf_volume(group_pages, confirm, warnings)
+            ok, failed, failed_idx = _write_pdf(
+                group_pages, pdf_path, dpi=dpi, exposure=exposure,
+                deskew_angles=group_angles, deskew_threshold=deskew_threshold)
+            failed_pages += failed
+            # failed_idx 是组内下标 ⇒ 映射回合并后页序的全局下标
+            skipped_pages.extend(indices[i] for i in failed_idx)
+            saved_page_count += ok
+            if not ok:
+                logger.warning("会话 PDF 分组 %d 没有任何页面转换成功，跳过: %s",
+                               gi, pdf_path)
+                continue
+            saved_files.append(pdf_path)
+        else:
+            for seq, idx in enumerate(indices, 1):
+                cache_file, rotation = page_specs[idx]
+                angle = deskew_angles[idx]
+                apply_angle = deskew_angle_to_apply(angle, deskew_threshold)
+                try:
+                    fpath = build_output_name(base, ext, group_count, gi, seq)
+                    if (ext in ("jpg", "jpeg") and not rotation
+                            and not exposure_active and not apply_angle
+                            and _is_intact_jpeg(cache_file)):
+                        # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径）
+                        shutil.copy2(cache_file, fpath)
+                    else:
+                        img = _open_page_image(cache_file, rotation, exposure,
+                                               deskew_angle=angle,
+                                               deskew_threshold=deskew_threshold)
+                        try:
+                            _write_image(img, fpath, ext)
+                        finally:
+                            img.close()
+                    saved_files.append(fpath)
+                    saved_page_count += 1
+                except Exception as e:
+                    failed_pages += 1
+                    skipped_pages.append(idx)
+                    logger.warning("会话页保存失败 [%s]: %s", cache_file, e)
+
+    # 一页都没存下来 ⇒ 明确报错（**不产出 0 字节文件**），且**什么都不清**
+    if not saved_files:
+        raise RuntimeError(
+            f"没有成功保存任何页面（共 {len(merged)} 页，失败 {failed_pages} 页）")
+
+    copy_to_extra_dirs(saved_files, extra_dirs)
+
+    # 清理：只在**全部页都合成成功**时清（部分失败 ⇒ 保留缓存以便重试）
+    job_ids = [str(j) for j in getattr(session, "referenced_job_ids", []) or []]
+    if job_id and str(job_id) not in job_ids:
+        job_ids.append(str(job_id))
+    if failed_pages:
+        warnings.append(
+            f"有 {failed_pages} 页未能保存，缓存目录已保留（可重试）："
+            f"{', '.join(job_ids)}")
+        logger.warning("会话落盘有 %d 页失败 ⇒ 保留缓存目录以便重试", failed_pages)
+    else:
+        _session_cleanup_jobs(job_ids)
+
+    if saved_files:
+        history_manager.append({
+            "device_name": device_name,
+            "device_ip": device_ip,
+            "page_count": saved_page_count,
+            "format": ext,
+            "file_path": saved_files[0],
+            "file_count": len(saved_files),
+            "exposure": exposure,
+        })
+
     return SaveResult(saved_files, failed_pages=failed_pages,
                        skipped_pages=skipped_pages, warnings=warnings,
                        saved_page_count=saved_page_count)
