@@ -107,9 +107,8 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
     """
     单页保存。返回实际落盘路径。
 
-    必须用 with 打开图片：Windows 上文件句柄未关闭时 shutil.rmtree
-    删不掉缓存目录，cache_manager.remove_job 的 ignore_errors=True 会
-    静默吞掉错误，缓存目录残留。
+    一律用 with 打开图片：显式管理文件句柄，不依赖 Pillow 内部
+    「读取后自动关句柄」的实现细节（该细节随版本变化）。
     """
     with Image.open(cache_path) as src:
         img = src.rotate(rotation, expand=True) if rotation else src.copy()
