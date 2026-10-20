@@ -179,6 +179,10 @@ class DocumentSession:
     exposure: Optional[dict] = None
     reverse_back: bool = True         # 双面：背面是否反转（默认反转）
     pages: list = field(default_factory=list)   # list[PageRef]
+    #: 页面列表是否"以本对象为准"（= 发生过删页）。
+    #: SessionStore.save() 默认 merge=True（只进不退），会把磁盘上多出来的页**复活** ——
+    #: 一旦本会话删过页，就必须整体覆盖写。删页由 remove_pages_from 置位此标志。
+    full_rewrite: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -274,6 +278,9 @@ class DocumentSession:
             return []
         self.pages = [p for p in self.pages
                       if not (p.job_id == jid and p.page_no >= cut)]
+        # ★ 这次删除必须能活过落盘：SessionStore.save() 默认 merge=True（只进不退），
+        #   会把磁盘上多出来的页**复活** ⇒ 置位 full_rewrite，让 save() 走整体覆盖。
+        self.full_rewrite = True
         self.updated_at = time.time()
         if drop_cache:
             for p in dropped:
@@ -342,6 +349,7 @@ class DocumentSession:
             "exposure": self.exposure,
             "reverse_back": self.reverse_back,
             "pages": [p.to_dict() for p in self.pages],
+            "full_rewrite": self.full_rewrite,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -370,6 +378,7 @@ class DocumentSession:
             exposure=exposure,
             reverse_back=bool(data.get("reverse_back", True)),
             pages=pages,
+            full_rewrite=bool(data.get("full_rewrite", False)),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             updated_at=float(data.get("updated_at", 0.0) or 0.0),
         )
@@ -677,6 +686,8 @@ class SessionStore:
         - `merge=True`（默认）：与磁盘上的现有内容**合并**（只进不退），
           ⇒ 两个 store 并发写同一个会话时**不丢更新**。
           代价：不能靠 save() 删掉某一页（需要删页时用 merge=False 整体覆盖）。
+          ⇒ 但 `remove_pages_from()` 会置位 `session.full_rewrite`，此时 save() **自动**
+            改走整体覆盖，调用方不需要自己记得传 merge=False。
         - `merge=False`：整体覆盖（丢弃磁盘上的旧内容）。
         - 原文件已损坏 ⇒ **跳过写入**（原文与备份都保留），绝不静默清空。
         - 写失败不抛异常（避免 GUI 因配置写失败而崩），只记 error 日志。
@@ -695,7 +706,16 @@ class SessionStore:
                                      path)
                         return
                     if merge and existing is not None:
-                        payload = _merge_payload(existing, payload)
+                        # ★ 会话删过页 ⇒ 必须整体覆盖。
+                        #   merge=True 会把磁盘上多出来的页"复活"（只进不退），
+                        #   使 remove_pages_from 的删除在落盘后**消失**。
+                        #   标志由 remove_pages_from 置位（并随 payload 持久化，
+                        #   所以"落盘 → 删页 → 再落盘""重启后删页"两条路都成立）。
+                        if getattr(session, "full_rewrite", False):
+                            logger.debug("会话发生过删页，改为整体覆盖写: %s", path)
+                            merge = False
+                        else:
+                            payload = _merge_payload(existing, payload)
                     config_io.atomic_write_json(path, payload)
             except config_io.ConfigLockTimeout as e:
                 logger.error("会话保存被跳过（拿不到跨进程锁，本次未写入）: %s（%s）",

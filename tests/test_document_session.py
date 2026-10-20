@@ -545,3 +545,51 @@ class TestRemovePagesFrom:
         again = store.load(s.session_id)
         assert again is not None
         assert [p.page_no for p in again.pages] == [1]
+
+    def test_removal_survives_a_second_save(self, tmp_path, store):
+        """★ 回归护栏：删页必须能活过**后续**的落盘。
+
+        `SessionStore.save()` 默认 merge=True（只进不退），会把磁盘上多出来的页
+        "复活" ⇒ 删除在落盘后消失。
+        ⚠️ 关键：**先落盘**（让磁盘上有内容）→ 再删页 → 再落盘，
+        否则磁盘上没有旧内容，`_merge_payload` 根本不会执行，测试就成了假绿灯。
+        """
+        s = _make_session(mode="batch")
+        s.add_pages("jobA", [self._mk_page(tmp_path, "jobA", i)
+                             for i in (1, 2, 3)])
+
+        # ① 第一次落盘 ⇒ 磁盘上有了 [1, 2, 3]
+        store.save(s)
+        disk_first = store.load(s.session_id)
+        assert disk_first is not None
+        assert [p.page_no for p in disk_first.pages] == [1, 2, 3]
+
+        # ② 删掉第 2 页及之后
+        s.remove_pages_from("jobA", 2)
+        assert [p.page_no for p in s.pages] == [1]
+
+        # ③ 再次落盘（默认 merge=True）⇒ 删除**不能**被复活
+        store.save(s)
+        disk_second = store.load(s.session_id)
+        assert disk_second is not None
+        assert [p.page_no for p in disk_second.pages] == [1], (
+            "删页被 merge 复活了：%s" % [p.page_no for p in disk_second.pages])
+
+    def test_full_rewrite_flag_is_persisted(self, tmp_path, store):
+        """删页标志要随 payload 持久化 ⇒ "落盘 → 重启 → 删页 → 落盘"也成立。"""
+        s = _make_session(mode="batch")
+        s.add_pages("jobA", [self._mk_page(tmp_path, "jobA", i)
+                             for i in (1, 2)])
+        s.remove_pages_from("jobA", 2)
+        store.save(s)
+
+        reloaded = store.load(s.session_id)
+        assert reloaded is not None
+        assert reloaded.full_rewrite is True
+
+        # 重启后再删一页并落盘 ⇒ 仍应是整体覆盖
+        reloaded.remove_pages_from("jobA", 1)
+        store.save(reloaded)
+        disk = store.load(s.session_id)
+        assert disk is not None
+        assert [p.page_no for p in disk.pages] == []
