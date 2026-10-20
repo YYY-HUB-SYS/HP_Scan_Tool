@@ -18,6 +18,7 @@ from PySide6.QtCore import QObject, QMutex, QMutexLocker, QRunnable, QThreadPool
 
 import cache_manager
 import history_manager
+import page_meta
 from escl_engine import (
     probe_escl, fetch_capabilities,
     probe_scanner_status, execute_scan, execute_multipage_scan,
@@ -370,7 +371,7 @@ class ScanCoordinator(QObject):
                     ext = page_ext
                     path = cache_manager.write_page(job_id, i, data, page_ext)
                     cached_paths.append(path)
-                    self._apply_a4_crop(path, resolution)
+                    _record_page_meta(job_id, i, data, path)
             else:
                 data, ext = execute_scan(
                     scanner=scanner, resolution=resolution, color_mode=color_mode,
@@ -381,7 +382,7 @@ class ScanCoordinator(QObject):
                     raise ScanCancelled(job_id)
                 path = cache_manager.write_page(job_id, 1, data, ext)
                 cached_paths.append(path)
-                self._apply_a4_crop(path, resolution)
+                _record_page_meta(job_id, 1, data, path)
 
             output_path = os.path.join(
                 output_dir,
@@ -435,23 +436,6 @@ class ScanCoordinator(QObject):
             return source_text
         return "Platen"
 
-    @staticmethod
-    def _apply_a4_crop(cache_path: str, dpi: int) -> None:
-        """扫描后处理：A4 居中裁剪（不超过原图）。失败不影响扫描结果。"""
-        try:
-            from escl_engine import crop_to_a4
-            with open(cache_path, "rb") as f:
-                raw = f.read()
-            img = Image.open(io.BytesIO(raw))
-            cropped = crop_to_a4(img, dpi=dpi)
-            if cropped.size != img.size:
-                buf = io.BytesIO()
-                cropped.convert("RGB").save(buf, format="JPEG")
-                with open(cache_path, "wb") as f:
-                    f.write(buf.getvalue())
-        except Exception as e:
-            logger.debug("A4 裁剪失败: %s", e)
-
     def execute_wia_to_cache(self, resolution, color_mode_ui, output_format):
         """WIA 降级扫描并写入缓存。返回 (job_id, ext, cache_path) 或 None。"""
         from wia_engine import try_wia_scan
@@ -488,6 +472,28 @@ class ScanCoordinator(QObject):
             "source": source_label,
         })
         self.save_config()
+
+
+def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str) -> None:
+    """
+    记录单页元数据（原始尺寸 + 缓存路径）。失败不影响扫描结果。
+
+    缓存里保留的永远是**原始扫描件**（不做任何像素改动），A4 归一推迟到
+    落盘时做。原始尺寸必须在这里落盘，否则后续的自动纠偏/双面合并/
+    断点续扫都没有可回溯的基准（本批次 deskew_angle 先留 0）。
+    """
+    width = height = 0
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+    except Exception as e:
+        logger.debug("读取页面尺寸失败 [%s]: %s", cache_path, e)
+    try:
+        store = page_meta.PageMetaStore(cache_manager._cache_root())
+        store.set_page(job_id, page_no, page_meta.PageMeta(
+            cache_path=cache_path, width=width, height=height))
+    except Exception as e:
+        logger.debug("写页元数据失败 [%s]: %s", job_id, e)
 
 
 def record_scan_history(device_name, device_ip, output_path, page_count,

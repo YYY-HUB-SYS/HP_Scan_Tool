@@ -5,3 +5,4 @@ PySide6>=6.5
 urllib3>=1.26
 wsdiscovery>=2.0
 pywin32>=306
+pypdf>=6.0

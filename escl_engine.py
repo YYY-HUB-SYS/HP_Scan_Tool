@@ -29,6 +29,7 @@ __all__ = [
     "fetch_capabilities", "get_scanner_status", "probe_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
     "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
+    "REQUEST_FORMAT",
 ]
 
 
@@ -518,6 +519,20 @@ MIME_EXT = {
     "application/octet-stream": "jpg",
 }
 
+# 用户选择的输出格式 → (向打印机请求的 MIME, 落盘扩展名)
+#
+# 打印机**永远只出图片**，PDF 由本地合成（save_manager）。这样"选 PDF"与
+# "选 JPG"走同一条代码路径，落盘层与请求层对 PDF 的理解不再冲突。
+# FORMAT_MIME / MIME_EXT 保留不动（可能有其它调用方引用），扫描请求才用这里。
+REQUEST_FORMAT = {
+    "jpg":  ("image/jpeg", "jpg"),
+    "jpeg": ("image/jpeg", "jpg"),
+    "png":  ("image/png",  "png"),
+    "tiff": ("image/tiff", "tiff"),
+    "tif":  ("image/tiff", "tiff"),
+    "pdf":  ("image/jpeg", "pdf"),   # 请求图片，落盘时本地合成 PDF
+}
+
 
 def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=1):
     """
@@ -529,8 +544,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
         raise RuntimeError("未配置 eSCL URL")
 
     base = escl_url.rstrip("/")
-    mime = FORMAT_MIME.get(output_format.lower(), "image/jpeg")
-    ext = MIME_EXT.get(mime, output_format)
+    mime, ext = REQUEST_FORMAT.get(output_format.lower(), ("image/jpeg", "jpg"))
 
     xml_body = _build_scan_job_xml(
         resolution=resolution,
@@ -750,11 +764,16 @@ def scan_to_file(
         timeout=timeout,
     )
 
-    # 如果要求 PDF 但打印机返回 JPEG（部分机型行为），用 Pillow 转换
-    if output_format.lower() == "pdf" and ext != "pdf":
-        img = Image.open(io.BytesIO(data))
+    # PDF：打印机只出图片（见 REQUEST_FORMAT），PDF 在本地合成。
+    # 若设备确实直出了 PDF 字节（老设备/直连调用方），原样落盘。
+    if output_format.lower() == "pdf":
         pdf_path = output_path.rsplit(".", 1)[0] + ".pdf"
-        img.convert("RGB").save(pdf_path, "PDF")
+        if data[:5] == b"%PDF-":
+            with open(pdf_path, "wb") as f:
+                f.write(data)
+        else:
+            with Image.open(io.BytesIO(data)) as src:
+                src.convert("RGB").save(pdf_path, "PDF")
         return pdf_path
 
     # 确保扩展名正确

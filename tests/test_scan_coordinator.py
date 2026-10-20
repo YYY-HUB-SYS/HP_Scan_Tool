@@ -257,6 +257,96 @@ class TestRunScanSync:
         assert "job_ok" not in scan_coordinator.cache_manager._active_jobs
 
 
+class TestPageMeta:
+    """页元数据落盘 + 缓存原件不被改写（I-9）"""
+
+    def test_page_meta_recorded_for_each_page(self, coordinator, scanner,
+                                              tmp_path, cache_root):
+        """每页都要有元数据：原始 width/height + cache_path。"""
+        import io
+
+        import page_meta
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (640, 480), "white").save(buf, "JPEG")
+        data = buf.getvalue()
+
+        with mock.patch("scan_coordinator.execute_scan",
+                        return_value=(data, "jpg")):
+            result = coordinator.run_scan_sync(scanner, _params(tmp_path),
+                                              job_id="job_meta")
+
+        pages = page_meta.PageMetaStore(cache_root).get_job("job_meta")
+        assert list(pages.keys()) == ["1"]
+        meta = pages["1"]
+        assert meta["width"] == 640
+        assert meta["height"] == 480
+        assert meta["cache_path"] == result.cached_paths[0]
+        assert meta["manual_rotation"] == 0
+        assert meta["deskew_angle"] == 0.0
+
+    def test_multipage_page_meta_recorded(self, coordinator, scanner,
+                                          tmp_path, cache_root):
+        """ADF 多页：每页都要有元数据。"""
+        import io
+
+        import page_meta
+        from PIL import Image
+
+        scanner.has_adf = True
+        pages_data = []
+        for i in range(3):
+            buf = io.BytesIO()
+            Image.new("RGB", (100 + i, 200), "white").save(buf, "JPEG")
+            pages_data.append((buf.getvalue(), "jpg"))
+
+        with mock.patch("scan_coordinator.probe_scanner_status",
+                        return_value=(True, {"state": "Idle", "adf_loaded": True})), \
+             mock.patch("scan_coordinator.execute_multipage_scan",
+                        return_value=pages_data):
+            result = coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"),
+                                              job_id="job_meta_multi")
+
+        pages = page_meta.PageMetaStore(cache_root).get_job("job_meta_multi")
+        assert sorted(pages.keys()) == ["1", "2", "3"]
+        for i, page_no in enumerate(("1", "2", "3")):
+            assert pages[page_no]["width"] == 100 + i
+            assert pages[page_no]["height"] == 200
+            assert pages[page_no]["cache_path"] == result.cached_paths[i]
+
+    def test_cache_file_bytes_unchanged(self, coordinator, scanner, tmp_path,
+                                        cache_root):
+        """I-9 回归护栏：缓存里的原始扫描件字节不得被改写。
+
+        改造前 scan_coordinator._apply_a4_crop 把 A4 裁剪结果写回同一个路径：
+        扩展名撒谎、原件不可恢复，纠偏角无法回溯重算。
+        这里故意用一张**大于 A4@300dpi** 的图（2600x3700）——旧实现会把它裁成
+        2480x3507 并重写文件，字节必然变化；现在必须逐字节保持原样。
+        """
+        import hashlib
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (2600, 3700), "white").save(buf, "JPEG", quality=80)
+        data = buf.getvalue()
+
+        with mock.patch("scan_coordinator.execute_scan",
+                        return_value=(data, "jpg")):
+            result = coordinator.run_scan_sync(scanner, _params(tmp_path),
+                                              job_id="job_raw")
+
+        cache_path = result.cached_paths[0]
+        with open(cache_path, "rb") as f:
+            written = f.read()
+        assert hashlib.sha256(written).hexdigest() == hashlib.sha256(data).hexdigest()
+        assert os.path.getsize(cache_path) == len(data)
+        with Image.open(cache_path) as im:
+            assert im.size == (2600, 3700)
+
+
 class TestSignals:
     def test_failed_signal_emitted(self, coordinator, scanner, tmp_path, cache_root):
         received = []
