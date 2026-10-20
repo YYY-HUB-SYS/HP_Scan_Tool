@@ -393,6 +393,12 @@ class ScanCoordinator(QObject):
                 cached_paths=cached_paths, output_path=output_path,
                 source=source, adf_detected=adf_detected,
             )
+        except BaseException:
+            # 扫描失败/被取消：该 job 的页元数据不再有用。
+            # 此时缓存目录可能还留着（孤儿清理按"目录已不存在"判定，
+            # 兜不住这种情况），必须显式清掉，否则元数据永久残留。
+            _discard_page_meta(job_id)
+            raise
         finally:
             cache_manager.unregister_job(job_id)
 
@@ -457,7 +463,22 @@ class ScanCoordinator(QObject):
     # ── 缓存清理 ──
 
     def cleanup_stale_cache(self):
+        """启动时清理过期缓存，并顺带清理孤儿页元数据"""
         cache_manager.cleanup_stale()
+        self.prune_orphan_page_meta()
+
+    def prune_orphan_page_meta(self) -> list[str]:
+        """
+        清理孤儿页元数据：缓存 job 目录已不存在的条目。
+
+        启动时调用一次（不在扫描热路径上）：覆盖"缓存被 eviction、
+        程序异常退出"等路径留下的残留，避免 page_meta.json 只增不减。
+        """
+        try:
+            return page_meta.prune_orphans(cache_manager._cache_root())
+        except Exception as e:
+            logger.debug("清理孤儿页元数据失败: %s", e)
+            return []
 
     # ── 持久化辅助 ──
 
@@ -494,6 +515,14 @@ def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str) -
             cache_path=cache_path, width=width, height=height))
     except Exception as e:
         logger.debug("写页元数据失败 [%s]: %s", job_id, e)
+
+
+def _discard_page_meta(job_id: str) -> None:
+    """丢弃某 job 的页元数据（失败不影响扫描结果）"""
+    try:
+        page_meta.PageMetaStore(cache_manager._cache_root()).remove_job(job_id)
+    except Exception as e:
+        logger.debug("清理页元数据失败 [%s]: %s", job_id, e)
 
 
 def record_scan_history(device_name, device_ip, output_path, page_count,
