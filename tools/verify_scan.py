@@ -12,7 +12,15 @@
 退出码:
     0  扫描成功，且实际页数与 --pages 期望值一致
     2  探测不到 eSCL 服务（设备不可达）
-    3  实际页数与 --pages 期望值不符，或扫描过程异常未取到页
+    3  实际页数与 --pages 期望值不符，或扫描过程异常未取到页，
+       或缓存页解码失败（设备返回的不是可解码图像）
+
+★ 落盘文件名与内容格式必须一致：文件名按**该页实际解码出来的格式**命名，
+  保存也用同一格式。旧实现按「最后一页声明的 ext」命名、内容恒为 JPEG ⇒
+  多页且各页 ext 不一致时会出现「.png 文件里装的是 JPEG」。
+
+★ 失败路径与「页数不符」走同一条路：退出码 3 + 写 report.json（记录失败
+  原因）+ 清理缓存目录，绝不留孤儿缓存、绝不抛未捕获异常。
 
 注意：会真的让打印机出纸。
 """
@@ -32,6 +40,17 @@ from escl_engine import (
     fetch_capabilities, execute_scan, execute_multipage_scan,
     probe_escl, crop_to_a4,
 )
+
+# 缓存页的**实际**格式 → (PIL 保存格式, 文件扩展名)。
+# 落盘文件名与内容格式由这张表绑定，杜绝「.png 里装 JPEG」。
+_SAVE_FORMAT = {
+    "JPEG": ("JPEG", "jpg"),
+    "PNG": ("PNG", "png"),
+    "TIFF": ("TIFF", "tiff"),
+    "BMP": ("BMP", "bmp"),
+    "GIF": ("GIF", "gif"),
+    "WEBP": ("WEBP", "webp"),
+}
 
 
 def _a4_crop(path, dpi):
@@ -81,6 +100,7 @@ def main():
     print("[2/5] 扫描中（打印机将出纸）...")
     t0 = time.time()
     cached = []
+    declared_exts = []   # 设备声明的每页 ext
     ext = "jpg"
     scan_error = None
     try:
@@ -90,6 +110,7 @@ def main():
                 output_format="jpg", source="Feeder", duplex=False, timeout=300.0)
             for i, (data, page_ext) in enumerate(pages, 1):
                 ext = page_ext
+                declared_exts.append(page_ext)
                 p = cache_manager.write_page(job_id, i, data, page_ext)
                 cached.append(p)
                 _a4_crop(p, args.resolution)
@@ -97,6 +118,7 @@ def main():
             data, ext = execute_scan(
                 scanner=scanner, resolution=args.resolution, color_mode="RGB24",
                 output_format="jpg", source="Platen", duplex=False, timeout=120.0)
+            declared_exts.append(ext)
             p = cache_manager.write_page(job_id, 1, data, ext)
             cached.append(p)
             _a4_crop(p, args.resolution)
@@ -111,40 +133,74 @@ def main():
     print("[3/5] 落盘...")
     from PIL import Image
     base = os.path.join(args.out, "HP_Scan_%s" % datetime.now().strftime("%Y%m%d_%H%M%S"))
-    saved = []
+    saved = {}          # 页序号 → 落盘路径
+    saved_exts = []     # 落盘文件实际用的扩展名（与内容格式一致）
+    page_error = None
     for i, cpath in enumerate(cached, 1):
-        target = "%s_%03d.%s" % (base, i, ext)
-        img = Image.open(cpath)
-        img.convert("RGB").save(target, "JPEG", quality=95)
-        saved.append(target)
+        try:
+            with Image.open(cpath) as img:
+                fmt = (img.format or "JPEG").upper()
+                pil_fmt, save_ext = _SAVE_FORMAT.get(fmt, ("JPEG", "jpg"))
+                target = "%s_%03d.%s" % (base, i, save_ext)
+                kwargs = {"quality": 95} if pil_fmt == "JPEG" else {}
+                img.convert("RGB").save(target, pil_fmt, **kwargs)
+        except Exception as e:
+            # 损坏页：与「页数不符」同一条失败路径（退出码 3），
+            # 不抛未捕获异常（那会让脚本退出码变成 1，且 report.json 丢失）
+            page_error = e
+            print("ERROR: 第 %d 页解码失败: %s" % (i, e), file=sys.stderr)
+            break
+        saved[i] = target
+        saved_exts.append(save_ext)
 
     print("[4/5] 采集元数据...")
-    from PIL import Image
     page_meta = []
     for i, cpath in enumerate(cached, 1):
-        img = Image.open(cpath)
-        page_meta.append({
-            "index": i,
-            "cache_file": os.path.basename(cpath),
-            "width": img.width,
-            "height": img.height,
-            "format": img.format,
-        })
-    for i, spath in enumerate(saved, 1):
+        entry = {"index": i, "cache_file": os.path.basename(cpath)}
+        try:
+            with Image.open(cpath) as img:
+                entry["width"] = img.width
+                entry["height"] = img.height
+                entry["format"] = img.format
+        except Exception as e:
+            entry["error"] = str(e)
+            if page_error is None:
+                page_error = e
+                print("ERROR: 第 %d 页元数据读取失败: %s" % (i, e), file=sys.stderr)
+        page_meta.append(entry)
+    for i, spath in saved.items():
         page_meta[i - 1]["saved_file"] = os.path.basename(spath)
         page_meta[i - 1]["saved_bytes"] = os.path.getsize(spath)
 
     print("[5/5] 清理缓存并写报告...")
-    cache_manager.remove_job(job_id)
+    try:
+        cache_manager.remove_job(job_id)
+    except Exception as e:
+        print("  [warn] 缓存清理失败: %s" % e, file=sys.stderr)
+
+    failures = []
+    if scan_error is not None:
+        failures.append({"stage": "scan", "error": str(scan_error)})
+    if page_error is not None:
+        failures.append({"stage": "decode", "error": str(page_error)})
+
+    if saved_exts:
+        result_ext = saved_exts[0] if len(set(saved_exts)) == 1 else "mixed"
+    else:
+        result_ext = declared_exts[-1] if declared_exts else "jpg"
 
     report = {
         "device": {"ip": args.ip, "model": scanner.model, "escl_url": url,
                    "has_adf": scanner.has_adf},
         "params": {"resolution": args.resolution, "source": args.source,
                    "requested_pages": args.pages},
-        "result": {"page_count": len(cached), "ext": ext,
+        "result": {"page_count": len(cached), "saved_page_count": len(saved),
+                   "ext": result_ext, "exts": saved_exts,
+                   "declared_exts": declared_exts,
                    "elapsed_sec": round(elapsed, 1)},
         "pages": page_meta,
+        "failures": failures,
+        "error": "; ".join(f["error"] for f in failures) or None,
     }
     report_path = os.path.join(args.out, "report.json")
     with open(report_path, "w", encoding="utf-8", newline="\n") as f:
@@ -159,7 +215,9 @@ def main():
         print("ERROR: 页数不符 — 期望 %d 页，实际 %d 页" % (args.pages, actual), file=sys.stderr)
     if scan_error is not None:
         print("ERROR: 扫描异常：%s" % scan_error, file=sys.stderr)
-    if actual != args.pages or scan_error is not None:
+    if page_error is not None:
+        print("ERROR: 页面解码失败：%s" % page_error, file=sys.stderr)
+    if actual != args.pages or scan_error is not None or page_error is not None:
         return 3
     return 0
 

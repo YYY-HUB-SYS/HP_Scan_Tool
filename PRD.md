@@ -737,7 +737,7 @@ MIME_EXT = {
     │       ├── POST ScanJobs → 201 → 可用
     │       └── 404/503 → 不可用
     │
-    ├── 端口 5357 开放 (WSD) → WSD 可用（未实现）
+    ├── UDP 3702 探测有响应 (WSD) → WSD 可用 ✅（已实现：wsd_engine.py，UDP 3702 发现 / 5357 元数据）
     │
     ├── Windows WIA 能找到 → WIA 降级可用 ✅
     │
@@ -848,7 +848,7 @@ python hp_scan_gui.py
 | # | 限制 | 影响 | 优先级 | 备注 |
 |---|------|------|--------|------|
 | 1 | 单线程扫描，不支持并发 | 一次只能扫描一台 | P2 | 当前用户场景无需并发 |
-| 2 | 不支持 WSD 协议 | WIA 兜底需要 Windows 识别到设备 | P3 | WSD 实现复杂度高 |
+| 2 | ~~不支持 WSD 协议~~ | ~~WIA 兜底需要 Windows 识别到设备~~ | ~~P3~~ | ✅ 已实现：wsd_engine.py（UDP 3702 发现 / 5357 元数据），CLI `discover --wsd-only` 与默认双协议路径均已接线 |
 | 3 | WIA 仅 USB | 网络扫描仪 WIA 不可用 | P2 | Windows WIA 栈限制 |
 | 4 | ~~M232 ScannerCapabilities 走 HTTPS 301~~ | ~~自签名证书导致能力查询失败~~ | ~~P2~~ | ✅ 已修复 (Bug #11)：全部请求加 verify=False |
 | 5 | 不支持扫描预览 | 扫描前无法预览 | P3 | 需要 eSCL Preview 端点 |
@@ -895,7 +895,7 @@ python hp_scan_gui.py
 | P1 | 扫描历史记录 | 列表展示最近扫描，支持一键打开 |
 | P1 | 多页 PDF 合成 | ADF 多页扫描 → 合并为单 PDF |
 | P2 | 扫描预览 | 低分辨率预览 → 确认 → 正式扫描 |
-| P2 | WSD 协议支持 | 扩展兼容老旧打印机 |
+| P2 | ~~WSD 协议支持~~ | ✅ 已实现（wsd_engine.py，UDP 3702 发现）—— 扩展兼容老旧打印机 |
 | P2 | 扫描区域裁剪 | 手动指定扫描区域 |
 | P3 | 批量扫描 | 多台打印机并发 |
 | P3 | 命令行模式 | 支持 `HP_Scan_Tool.exe --scan --ip=x --output=file.jpg` |

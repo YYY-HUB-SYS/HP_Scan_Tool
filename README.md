@@ -46,15 +46,23 @@ python build_exe.py
 ```
 hp_scan_gui_pyside.py   # GUI 主程序（PySide6）
 escl_engine.py          # eSCL/AirScan 协议引擎
-wia_engine.py           # WIA 降级引擎
-wsd_engine.py           # WS-Discovery 引擎
+wia_engine.py           # WIA 降级引擎（本地 USB 降级）
+wsd_engine.py           # WS-Discovery 引擎（UDP 3702 发现 / 5357 元数据）
 listen_engine.py        # 监听模式（等待面板触发）
 scan_coordinator.py     # 扫描编排器（业务逻辑层）
+save_manager.py         # 落盘（多页 PDF 合成 / A4 归一 / 曝光）
+exposure.py             # 曝光后处理（auto / manual）
+skew_detect.py          # 倾斜角检测引擎（纯 PIL；⚠ 尚未接入扫描流水线）
 cache_manager.py        # 磁盘缓存管理
 history_manager.py      # 扫描历史日志
 profile_manager.py      # 按设备保存扫描参数
+preset_manager.py       # 曝光 / 扫描预设（内置 4 个 + 用户自定义）
+page_meta.py            # 每页元数据（页码 / 尺寸 / 来源）
+config_io.py            # 配置 I/O 共享层（原子写 + 跨进程锁）
 cli.py                  # CLI 命令行入口
 build_exe.py            # PyInstaller 打包脚本
+tools/verify_scan.py    # 真机扫描验证脚本（产出 report.json）
+tests/                  # pytest 测试套件
 ```
 
 ## 🛠️ 技术栈
@@ -65,7 +73,9 @@ build_exe.py            # PyInstaller 打包脚本
 - python-zeroconf
 - WSDiscovery
 - requests
+- urllib3
 - pywin32（WIA）
+- pypdf（多页 PDF 合成）
 
 ## ⚙️ 配置文件
 
@@ -73,6 +83,7 @@ build_exe.py            # PyInstaller 打包脚本
 - `cache_config.json` — 缓存策略（上限、触发线、清理量）
 - `history.json` — 扫描历史日志（最多 500 条）
 - `profiles.json` — 按设备保存的扫描参数
+- `presets.json` — 用户自定义曝光 / 扫描预设
 
 所有配置文件位于 `%APPDATA%\HP_Scan_Tool\`。
 
