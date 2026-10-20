@@ -257,12 +257,19 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
         root = ET.fromstring(r.text)
 
         # 型号 / 序列号
+        # HP 真机报的是 pwg:MakeAndModel，部分机型报 Model，两个都认，
+        # 同时存在时 MakeAndModel 优先（它是机型全称）
+        model_tag = None
         for el in root.iter():
             t = _strip_ns(el)
-            if t == "Model" and el.text:
-                scanner.model = el.text.strip()
+            if t == "MakeAndModel" and el.text:
+                model_tag = el.text.strip()
+            elif t == "Model" and el.text and model_tag is None:
+                model_tag = el.text.strip()
             if t == "SerialNumber" and el.text:
                 scanner.serial = el.text.strip()
+        if model_tag:
+            scanner.model = model_tag
 
         # 平板 / 输稿器
         platen_sections = []
@@ -460,6 +467,30 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
 
     headers = {"Content-Type": "application/xml"}
     r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
+    if r.status_code == 409:
+        # 打印机上残留一个未完成的 ScanJob（此前某次扫描异常中断留下的）。
+        # 该型号不支持列举与整体删除（GET/DELETE /eSCL/ScanJobs 均返回 405），
+        # 客户端无法主动清理，只能等打印机侧 TTL 回收，这里做有限退避重试。
+        for delay in (2, 4, 8):
+            logger.info("扫描任务被占用 (409)，%s 秒后重试: %s", delay, scanner.ip)
+            time.sleep(delay)
+            r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
+            if r.status_code != 409:
+                break
+        else:
+            raise RuntimeError(
+                "打印机上有一个未完成的扫描任务（HTTP 409），重试 3 次仍未释放。"
+                "该型号不支持客户端清理，只能等打印机侧自动回收（实测约 15-20 分钟）。"
+                "请稍候再试；若持续失败，可在打印机面板上取消该任务或重启打印机。"
+            )
+    if r.status_code == 503:
+        # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
+        # 阶段就返回 503（设备在等纸），不是扫描超时。给出用户可执行动作。
+        raise RuntimeError(
+            "打印机当前不可用（HTTP 503）。"
+            "若选择的是输稿器(ADF)扫描，请确认输稿器里已放入纸张后重试；"
+            "否则请等待设备空闲后重试。"
+        )
     if r.status_code not in (200, 201, 202):
         raise RuntimeError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
 
