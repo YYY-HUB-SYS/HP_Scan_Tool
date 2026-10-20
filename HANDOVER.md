@@ -23,7 +23,7 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 - 缓存 → 预览 → 保存原始文件
 - 记录扫描历史
 
-**不再包含任何图像后处理逻辑**（曝光矫正、预设、直方图等已全部剥离）。
+**2026-10-20 起曝光/预设已并回本项目**（放弃独立 DocFix 软件，基础曝光/滤镜在本项目内闭环）：`exposure.py` / `preset_manager.py` 已入库，`ExposurePanel` 已接入两个预览对话框，曝光已接进落盘链路（`save_manager.py`），预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。直方图未实现、未纳入范围；扶正（自动纠偏）引擎已完成但尚未接入扫描流水线。
 
 ---
 
@@ -41,49 +41,71 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 ├── history_manager.py      # 扫描历史日志 — JSON 格式记录
 ├── profile_manager.py      # 扫描配置文件管理器 — 按设备 IP 保存独立参数
 ├── cli.py                  # CLI 命令行入口 — scan/discover/status/history 子命令
+├── save_manager.py         # 保存落盘层 — 曝光施加/分组命名/写历史/清缓存
+├── page_meta.py            # 页元数据模型 — 页序号/角度/分组等会话级元数据
+├── config_io.py            # 配置读写 helper — 原子写 + 跨进程锁
+├── exposure.py             # 曝光引擎 — off/auto/manual（2026-10-20 并回本项目，在用）
+├── preset_manager.py       # 曝光预设管理 — 内置 4 个 + 用户自定义（2026-10-20 并回本项目，在用）
+├── skew_detect.py          # 倾斜角检测引擎 — 纯 PIL 投影法（尚未接入扫描流水线 ⇒ 不随 EXE 交付）
 ├── build_exe.py            # PyInstaller 打包脚本
-├── app.ico                 # 多尺寸图标（16-256px，手写 ICO）
-├── icon_16.png             # 任务栏图标 16px（代码绘制几何图形）
-├── icon_32.png             # 任务栏图标 32px（代码绘制几何图形）
-├── icon_64.png             # 任务栏图标 64px（代码绘制几何图形）
-├── fonts/
-│   └── NotoSansSC-Regular.ttf
-├── resources/
+├── resources/              # 运行时资源（图标/字体/样式，随 EXE 打包）
 │   ├── fonts/
-│   ├── styles/
-│   │   └── app.qss
-│   └── icons/
-├── tests/                  # pytest 测试
+│   │   └── NotoSansSC-Regular.ttf
+│   ├── icons/
+│   │   ├── app.ico
+│   │   ├── icon_16.png
+│   │   ├── icon_32.png
+│   │   └── icon_64.png
+│   └── styles/
+│       └── app.qss
+├── tests/                  # pytest 测试（15 个文件：conftest.py + 14 个 test_*.py）
 │   ├── conftest.py
 │   ├── test_cache_manager.py
 │   ├── test_cli.py
-│   └── test_history_manager.py
+│   ├── test_config_concurrency.py
+│   ├── test_escl_robustness.py
+│   ├── test_exposure.py
+│   ├── test_exposure_integration.py
+│   ├── test_gui_consistency.py
+│   ├── test_history_manager.py
+│   ├── test_listen_engine.py
+│   ├── test_page_meta.py
+│   ├── test_preset_manager.py
+│   ├── test_save_manager.py
+│   ├── test_scan_coordinator.py
+│   └── test_skew_detect.py
 ├── docs/                     # 项目文档
 │   ├── SPEC-v3.3.md              # v3.3 规格文档（User Stories + 技术方案）
 │   ├── tickets.md                # 实施票据 T1-T10（含依赖图）
 │   ├── adr/                      # 架构决策记录（12 份 ADR）
 │   │   ├── 0001 ~ 0011           # 格式映射/多页/缓存/WSD/CLI 等
 │   │   └── 0012-platform-abstraction-runtime.md  # 平台抽象层（未实现）
+│   ├── audit/                    # 全量代码审计 / 审计发现修复计划（3 份）
+│   ├── design/                   # 新功能调研与方案 / 选型实测（3 份）
 │   ├── prototype/
 │   │   └── multipage-preview.jsx # 多页预览 UI 原型（React）
-│   └── research/
-│       └── wsd-discovery.md      # WSD 发现协议调研
-├── _docfix_reserve/        # ★ 剥离代码备份（供 DocFix 项目使用）
-│   ├── exposure.py             # 完整图像曝光引擎
-│   ├── preset_manager.py       # 完整预设管理器
-│   ├── test_preset_manager.py  # 预设管理测试
-│   └── stripped_code_reference.py  # 从各文件切除的代码段汇总
+│   ├── research/
+│   │   └── wsd-discovery.md      # WSD 发现协议调研
+│   ├── superpowers/              # 本轮设计规格与实施计划（plans / specs）
+│   └── verify/
+│       └── baseline_D1.md        # 真机基准（改造前）
+├── tools/
+│   └── verify_scan.py      # 真机基准脚本（D1/D2）
 ├── PRD.md                  # 产品需求文档 v3.1
 ├── CONTEXT.md              # 领域术语表
 ├── CODEBUDDY.md            # CodeBuddy 项目指引
+├── README.md               # 项目入口文档
+├── AGENTS.*.md             # 接手本项目的 agent 规则
 ├── requirements.txt        # Python 依赖
+├── deploy-config.example.md # 部署配置示例
 ├── run.bat                 # 开发模式启动脚本
 ├── backup.bat              # 下班存档脚本
 ├── .gitignore              # Git 忽略规则
-├── scan_config.json        # 运行时配置（自动生成）
-├── cache_config.json       # 缓存配置（自动生成）
-└── history.json            # 扫描历史（自动生成）
+├── .github/workflows/build.yml # CI：test → build → release
+└── LICENSE
 ```
+
+> 运行时配置文件（`scan_config.json` / `cache_config.json` / `history.json` / `profiles.json` / `presets.json`）**不在仓库内**，统一落在 `%APPDATA%\HP_Scan_Tool\`。
 
 ---
 
@@ -132,22 +154,24 @@ cli.py (CLI入口)               — argparse 子命令: scan/discover/status/hi
                                   cache_manager 清理缓存
 ```
 
-### 3.3 已剥离的后处理架构（迁移至 DocFix）
+### 3.3 后处理架构（2026-10-20 起已并回本项目）
 
 ```
-exposure.py (已停用)
+exposure.py (在用)
   ├── _auto_enhance()           — 高斯模糊除法文档增强（去灰底）
   ├── apply_exposure()          — 统一曝光入口（off/auto/manual）
   ├── _gamma_lut()              — Gamma 校正 LUT
   ├── _shadow_highlight_lut()   — 阴影/高光分离 LUT
   └── auto/manual_exposure()    — bytes 向后兼容接口
 
-preset_manager.py (已停用)
+preset_manager.py (在用)
   ├── _BUILTIN_PRESETS          — 4 个内置预设（文字增强/照片还原/去灰底/旧文件修复）
   ├── load_presets()            — 加载内置+用户预设
   ├── save/delete_user_preset() — 用户预设管理
   └── export/import_preset()    — 预设导入导出
 ```
+
+> **现状（2026-10-20）**：上述两个模块**已在扫描链路中启用** —— `hp_scan_gui_pyside.py` 静态 import 并挂出 `ExposurePanel`（单页/多页预览对话框各一个），`save_manager.py` 在落盘前施加曝光；预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。
 
 ---
 
@@ -188,17 +212,19 @@ preset_manager.py (已停用)
 | 并发扫描 | ✅ | 多台打印机同时扫描，独立缓存 |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
 
-### 4.3 架构分离（2026-07-19 完成）
+### 4.3 架构分离（2026-07-19 完成，**2026-10-20 已回退**）
 
 | 操作 | 详情 |
 |------|------|
-| 剥离 exposure.py | 从各模块中移除所有曝光调用 |
-| 剥离 preset_manager.py | 不再被任何活跃模块导入 |
-| 简化 PreviewDialog | 去掉曝光调整/直方图/预设，只保留预览+保存 |
-| 简化 MultiPagePreviewDialog | 去掉曝光控制/逐页覆盖，保留缩略图/分组/保存 |
-| 清理 spec 文件 | 移除 exposure/preset_manager/ImageFilter/ImageMath |
-| 清理测试 | 移除 conftest.py 和 test_cli.py 中的曝光相关内容 |
-| 备份到 _docfix_reserve/ | 完整文件 + 切除代码段参考文档 |
+| 剥离 exposure.py | 从各模块中移除所有曝光调用 —— **2026-10-20 已回流**（见下） |
+| 剥离 preset_manager.py | 不再被任何活跃模块导入 —— **2026-10-20 已回流** |
+| 简化 PreviewDialog | 去掉曝光调整/直方图/预设，只保留预览+保存 —— **2026-10-20 已恢复曝光面板（`ExposurePanel`）** |
+| 简化 MultiPagePreviewDialog | 去掉曝光控制/逐页覆盖，保留缩略图/分组/保存 —— **2026-10-20 已恢复曝光面板** |
+| 清理 spec 文件 | 移除 exposure/preset_manager/ImageFilter/ImageMath —— **2026-10-20 已回流**（`exposure.py` 用到 `ImageFilter` / `ImageMath`） |
+| 清理测试 | 移除 conftest.py 和 test_cli.py 中的曝光相关内容 —— **2026-10-20 已补回**（`tests/test_exposure.py` / `test_exposure_integration.py` / `test_preset_manager.py`） |
+| 备份到 _docfix_reserve/ | 完整文件 + 切除代码段参考文档 —— **该目录已在 `8aaa4f1` 移出仓库，现不存在** |
+
+**回流说明（2026-10-20）**：放弃独立 DocFix 软件，基础曝光/滤镜并回本项目。依据 `docs/adr/0008-exposure-enhancement.md` + `docs/design/2026-10-20_新功能调研与方案_双面_续扫_纠偏_曝光_v1.0.md` §0 需求 F。曝光/预设代码入库（`267a360`），接入预览 GUI 与落盘链路（`8bde8dc`）。
 
 ---
 
@@ -233,7 +259,7 @@ preset_manager.py (已停用)
 - 动态 import 的模块必须加入 hiddenimports
 - EXE 被占用时用 `--distpath` 指定不同目录绕过文件锁
 - 字体/图标由 `build_exe.py` 的 `--add-data resources;resources` 一并打包
-- 单文件 EXE 约 62MB（2026-10-20 实测 64,968,184 字节）
+- 单文件 EXE 约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测）
 
 ---
 
@@ -250,31 +276,31 @@ preset_manager.py (已停用)
 ### 6.2 关键决策历程
 
 1. **图标问题**（经历 ~8 轮迭代）：AI 图片 → 手绘 ICO → iconbitmap → WM_SETICON → 最终 iconphoto + PNG 解决
-2. **曝光功能归属**：最初考虑在 HP Scan Tool 内加曝光面板 → 用户提议做成独立软件 → 讨论后决定曝光+扶正等功能全部剥离到独立的 DocFix 工具
+2. **曝光功能归属**：最初考虑在 HP Scan Tool 内加曝光面板 → 用户提议做成独立软件 → 讨论后决定曝光+扶正等功能全部剥离到独立的 DocFix 工具 → **2026-10-20 决定放弃独立 DocFix 软件，曝光/预设并回本项目**（扶正仍未并入）
 3. **打印机排序**：用户要求可调整打印机优先级，重启后记住 → 通过 list 重排 + config 持久化实现
-4. **架构分离**：用户提出"HP Scan Tool 仅用于扫描" → 剥离所有图像后处理代码到 `_docfix_reserve/`
+4. **架构分离**：用户提出"HP Scan Tool 仅用于扫描" → 剥离所有图像后处理代码到 `_docfix_reserve/`（**2026-10-20 该决策对曝光/预设已回退，见 §4.3**）
 5. **UI 框架迁移**：从 CustomTkinter 迁移到 PySide6，解决 CTk 的渲染和兼容性问题
 
 ---
 
 ## 7. 后续工作
 
-### 7.1 DocFix 项目（计划中）
+### 7.1 曝光/预设（2026-10-20 起并回本项目）
 
-**目标**: 独立的文档图像处理工具
-**代码来源**: `_docfix_reserve/` 目录包含完整的剥离代码和参考文档
+**目标**: 基础曝光/滤镜在本项目内闭环，放弃独立 DocFix 软件
+**代码来源**: 本仓库 `exposure.py` / `preset_manager.py`（原 `_docfix_reserve/` 备份目录已在 `8aaa4f1` 移出仓库，现不存在）
 **核心功能**:
-- 曝光矫正（去灰底/亮度/对比度/Gamma/阴影高光/通道增益）
-- 预设系统（4 个内置预设 + 用户自定义）
-- 文档扶正/去歪斜（待实现，推荐 `deskew` 库，522 stars）
+- 曝光矫正（去灰底/亮度/对比度/Gamma/阴影高光/通道增益）—— ✅ 已交付（`ExposurePanel` + 落盘链路）
+- 预设系统（4 个内置预设 + 用户自定义）—— ✅ 已交付（`%APPDATA%\HP_Scan_Tool\presets.json`）
+- 文档扶正/去歪斜 —— ⚠️ **倾斜角检测引擎已完成**（`skew_detect.py`，纯 PIL 零依赖），**但尚未接入扫描流水线 ⇒ 当前不随 EXE 交付**
 - 后续可能加：裁边、去污、OCR
 
 **技术要点**:
 - `exposure.py` 的 `apply_exposure()` 是统一入口，支持 off/auto/manual 三种模式
 - auto 模式用高斯模糊除法（CamScanner/ScanTailor 同源算法），全分辨率 0.4 秒
 - manual 模式处理链：channel_gains → shadows/highlights → gamma → brightness/contrast
-- `preset_manager.py` 的预设数据结构：`{name, mode, brightness, contrast, gamma, shadows, highlights, channel_gains}`
-- `stripped_code_reference.py` 包含从 hp_scan_gui.py 中切除的 UI 代码（滑块/直方图/预设选择/逐页覆盖等）
+- `preset_manager.py` 的预设数据结构：`{name, mode, brightness, contrast, gamma, shadows, highlights, channel_gains, builtin}`
+- 曝光 UI 的滑块/预设选择等代码已随 2026-10-20 回流由 `ExposurePanel` 重新实现（原 `stripped_code_reference.py` 随 `_docfix_reserve/` 一并移出仓库）
 
 ### 7.2 HP Scan Tool 低优先级待办
 
@@ -282,9 +308,9 @@ preset_manager.py (已停用)
 |------|------|
 | macOS 平台抽象层 | `platform_engine.py`，ADR-0012 已记录未实现 |
 | `os.startfile` 跨平台适配 | macOS 需用 `open` 命令 |
-| CONTEXT.md 更新 | 术语表中"曝光"和"预览"的定义需要更新，反映已剥离的事实 |
-| PRD.md 更新 | 需求文档中关于曝光预设的描述需要标注为"已迁移至 DocFix" |
-| exposure.py / preset_manager.py 清理 | 项目根目录的已停用文件是否删除（目前保留供参考） |
+| CONTEXT.md 更新 | ✅ 已完成（2026-10-20：术语表边界说明改为"曝光/预设已并回本项目"） |
+| PRD.md 更新 | ✅ 已完成（2026-10-20：PRD 顶部边界说明与决策 #39 同步订正） |
+| exposure.py / preset_manager.py 清理 | ✅ 不适用 —— 两个文件**已在用**（`hp_scan_gui_pyside.py` / `save_manager.py` 引用），不可删除 |
 
 ### 7.3 已知限制
 
@@ -292,7 +318,7 @@ preset_manager.py (已停用)
 |------|------|
 | M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，当前未跟随 |
 | 无扫描预览（原图查看） | 简化后的 PreviewDialog 只加载缩略图，不做全分辨率预览 |
-| 单文件 EXE 体积 | 约 62MB（2026-10-20 实测 64,968,184 字节），包含所有依赖 |
+| 单文件 EXE 体积 | 约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测），包含所有依赖 |
 | 无自动更新 | 当前版本无自动检查更新机制 |
 
 ---
@@ -317,7 +343,7 @@ python build_exe.py
 
 输出：`dist/HP_Scan_Tool.exe`（单文件便携版）
 
-注意：打包前确认 `build_exe.py` 里的 `--add-data` 资源路径与 `--hidden-import` 模块列表与当前代码一致（新增项目内模块时需补进 hidden-imports）。
+注意：打包前确认 `build_exe.py` 里的 `--add-data` 资源路径与 `--hidden-import` 模块列表与当前代码一致。**当前项目内模块全部是静态 import**（`exposure` / `preset_manager` / `page_meta` / `config_io` / `pypdf` 等已由 PyInstaller 依赖分析器实测自动收录），**只有改成动态 import 的模块才需要补进 hidden-imports** —— 否则会变成打包后运行时 ImportError。
 
 ### 8.3 CLI 模式
 
@@ -348,7 +374,7 @@ python cli.py history --limit 10
 }
 ```
 
-注意：`exposure_mode`、`brightness`、`contrast` 字段已从配置中移除。旧配置文件中的这些字段会被忽略。
+注意：`exposure_mode`、`brightness`、`contrast` 字段**不在** `scan_config.json` 里。曝光参数（模式/亮度/对比度/gamma/阴影高光/通道增益）由 `ExposurePanel` 在运行时持有，用户预设持久化在 `%APPDATA%\HP_Scan_Tool\presets.json`；旧配置文件中的这些字段会被忽略。
 
 ### cache_config.json
 
@@ -370,8 +396,7 @@ cd <PROJECT_DIR>
 pytest tests/ -v
 ```
 
-测试覆盖：cache_manager、history_manager、cli 参数解析。
-注意：test_preset_manager.py 已移至 `_docfix_reserve/`，不在测试范围内。
+测试覆盖：缓存 / 历史 / CLI / 配置并发 / eSCL 健壮性 / 预设 / 曝光 / 曝光集成 / GUI 一致性 / 监听 / 页元数据 / 保存 / 协调器 / 倾斜检测 等，见 `tests/`（当前 15 个测试文件：`conftest.py` + 14 个 `test_*.py`）。
 
 ---
 
@@ -384,11 +409,11 @@ pytest tests/ -v
 1. **README.md** — 项目入口，快速了解功能与使用
 2. **本文档 (HANDOVER.md)** — 全貌概览，架构与经验教训
 3. **CODEBUDDY.md** — CodeBuddy 项目指引，包含架构、资源、配置等关键信息
-4. **PRD.md** — 产品需求文档，了解产品定位和功能规格（注意：其中关于曝光预设的描述已迁移至 DocFix）
+4. **PRD.md** — 产品需求文档，了解产品定位和功能规格（注意：曝光/预设已于 2026-10-20 并回本项目，PRD 顶部边界说明已同步订正）
 5. **docs/SPEC-v3.3.md** — v3.3 规格文档，User Stories 和技术方案（历史文档）
-6. **docs/tickets.md** — 实施票据和依赖图（注意：T2/T3 关于曝光的内容已剥离，T10 CLI 的 `--exposure` 已移除）
+6. **docs/tickets.md** — 实施票据和依赖图（注意：T2/T3 关于曝光的内容已于 2026-10-20 并回本项目并接线；T10 CLI 的 `--exposure` 参数仍未实现）
 7. **docs/adr/** — 架构决策记录，了解关键技术选型
-8. **CONTEXT.md** — 领域术语表（注意：部分术语如"曝光""预览"定义需更新）
+8. **CONTEXT.md** — 领域术语表（注意：曝光/曝光预设的边界说明已于 2026-10-20 订正，术语表正文尚未补这两个词条）
 9. **源代码** — 按以下顺序阅读：
    - `scan_coordinator.py` → 业务层入口
    - `escl_engine.py` → 核心协议
@@ -399,11 +424,11 @@ pytest tests/ -v
 
 | 文档 | 状态 | 说明 |
 |------|------|------|
-| README.md | ✅ 最新 | 项目入口文档 |
+| README.md | ⚠️ 部分过时 | 项目结构/配置文件/技术栈三块未含本轮新增模块（`save_manager` / `exposure` / `preset_manager` / `skew_detect` / `page_meta` / `config_io` / `presets.json` / `pypdf`），本轮未纳入范围 |
 | HANDOVER.md | ✅ 最新 | 本文档，反映 v4.0 PySide6 架构 |
-| CODEBUDDY.md | ✅ 最新 | CodeBuddy 项目指引 |
-| PRD.md | ⚠️ 部分过时 | 曝光预设相关章节已迁移，其余有效 |
-| CONTEXT.md | ⚠️ 部分过时 | "曝光""预览""曝光预设"术语定义需更新 |
-| docs/SPEC-v3.3.md | ⚠️ 部分过时 | 关于曝光增强/预设系统的 User Story 已迁移 |
-| docs/tickets.md | ⚠️ 部分过时 | T2/T3 已剥离，T10 的 --exposure 已移除 |
+| CODEBUDDY.md | ⚠️ 部分过时 | `:112` 仍写"曝光/预设已剥离至 `_docfix_reserve/`、不得在新代码中引用"，与代码相反（2026-10-20 已并回本项目），**待该文件责任人订正** |
+| PRD.md | ⚠️ 部分过时 | 曝光/预设边界已订正；结构块与线程模型仍停留在 v3.1 CustomTkinter 时代 |
+| CONTEXT.md | ⚠️ 部分过时 | 曝光/预设边界说明已订正；术语表正文尚未补 曝光/曝光预设 词条 |
+| docs/SPEC-v3.3.md | ⚠️ 部分过时 | 关于曝光增强/预设系统的 User Story 为 v3.3 历史记载（现已并回本项目） |
+| docs/tickets.md | ⚠️ 部分过时 | T2/T3 已于 2026-10-20 并回本项目并接线；T10 的 --exposure 未实现 |
 | docs/adr/ | ✅ 有效 | 12 份 ADR 均有效，ADR-0012 未实现但不影响当前功能 |

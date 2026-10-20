@@ -1,6 +1,7 @@
 # HP Scan Tool — 领域术语表
 
-> ⚠️ 术语表中"曝光""曝光预设"相关定义已随 v3.3 剥离至 DocFix；本项目只负责扫描与文件落盘。
+> ⚠️ **2026-10-20 起，曝光/曝光预设已并回本项目**：放弃独立 DocFix 软件，基础曝光/滤镜在本项目内闭环。依据 `docs/adr/0008-exposure-enhancement.md` + `docs/design/2026-10-20_新功能调研与方案_双面_续扫_纠偏_曝光_v1.0.md` §0 需求 F。现状：`exposure.py` / `preset_manager.py` 已入库，`ExposurePanel` 已接入预览 GUI，曝光已接进落盘链路（`save_manager.py`），预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。
+> （历史：v3.3—2026-10-20 期间相关定义曾随 DocFix 剥离，该表述于 2026-10-20 作废。）
 
 ## 核心概念
 
