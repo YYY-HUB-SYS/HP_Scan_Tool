@@ -5,7 +5,6 @@
 """
 
 import io
-import json
 import logging
 import os
 import sys
@@ -20,12 +19,13 @@ import history_manager
 import page_meta
 import preset_manager
 import profile_manager
+import scan_coordinator
 import save_manager
 from exposure import apply_exposure
 from scan_coordinator import (
-    ScanCoordinator, ScannerInfo, save_config, load_config,
+    ScanCoordinator, ScannerInfo, save_config,
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
-    COLOR_MODE_MAP, SOURCE_MAP,
+    COLOR_MODE_MAP,
 )
 from escl_engine import auto_crop
 
@@ -63,24 +63,23 @@ logger.info(f"cwd={os.getcwd()}")
 
 # ────────── PySide6 导入 ──────────
 from PySide6.QtCore import (
-    Qt, Signal, QTimer, QSize, QRectF, QPointF,
-    QPropertyAnimation, QEasingCurve, QParallelAnimationGroup,
-    QAbstractAnimation, QPoint, QRect, QObject,
+    Qt, Signal, QTimer, QSize,
+    QPropertyAnimation, QEasingCurve,
+    QRect, QObject,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
-    QPainter, QColor, QPen, QBrush, QLinearGradient,
-    QAction, QKeySequence, QShortcut, QPalette, QTransform,
+    QPainter, QColor, QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGridLayout, QStackedLayout, QLabel, QPushButton, QFrame,
+    QGridLayout, QLabel, QPushButton, QFrame,
     QComboBox, QLineEdit, QCheckBox, QProgressBar, QScrollArea,
-    QFileDialog, QMessageBox, QDialog, QDialogButtonBox,
-    QGroupBox, QButtonGroup, QRadioButton, QSpinBox,
-    QSizePolicy, QSpacerItem, QFrame, QStatusBar,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
-    QTabWidget, QTextEdit, QSplitter, QToolBar, QToolButton,
+    QFileDialog, QMessageBox, QDialog,
+    QGroupBox, QSpinBox,
+    QSizePolicy, QFrame, QStatusBar,
+    QTreeWidget, QTreeWidgetItem,
+    QSplitter, QToolButton,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
     QSlider, QInputDialog,
 )
@@ -3807,18 +3806,11 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         super().reject()
 
     def _build_groups(self):
-        if not self.splits:
-            return [list(range(len(self.pages)))]
-        sorted_splits = sorted(self.splits)
-        groups = []
-        start = 0
-        for split in sorted_splits:
-            if split > start:
-                groups.append(list(range(start, split)))
-            start = split
-        if start < len(self.pages):
-            groups.append(list(range(start, len(self.pages))))
-        return groups
+        """分组计算统一走协调器实现（scan_coordinator.compute_page_groups）
+
+        与协调器同源 ⇒ GUI 与协调器的分组语义不会再分叉。
+        """
+        return scan_coordinator.compute_page_groups(self.splits, len(self.pages))
 
 
 class HistoryDialog(QDialog):

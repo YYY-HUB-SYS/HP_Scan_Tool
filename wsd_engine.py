@@ -12,10 +12,6 @@ from escl_engine import ScannerInfo, probe_escl, fetch_capabilities
 
 logger = logging.getLogger(__name__)
 
-# WSD 常量
-WSD_MULTICAST_ADDR = "239.255.255.250"
-WSD_PORT = 3702
-
 
 def discover_wsd(timeout: float = 4.0) -> list[ScannerInfo]:
     """

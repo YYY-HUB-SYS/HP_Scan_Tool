@@ -15,7 +15,7 @@ import time
 
 import requests
 
-from escl_engine import ScannerInfo, _create_scan_job, MIME_EXT
+from escl_engine import ScannerInfo, _create_scan_job
 
 logger = logging.getLogger(__name__)
 
