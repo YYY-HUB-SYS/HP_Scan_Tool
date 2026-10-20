@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -78,6 +79,7 @@ from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize,
     QPropertyAnimation, QEasingCurve,
     QRect, QObject, QMutexLocker,
+    QEventLoop,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
@@ -484,13 +486,19 @@ def _post_to_ui(fn):
     _ensure_ui_dispatcher().post(fn)
 
 
-def _run_in_background(work, on_done, on_error):
+def _run_in_background(work, on_done, on_error, label="background"):
     """
     把 work 丢到后台线程跑；完成/失败都回**主线程**回调。
 
     用普通的 threading.Thread（和本文件里曝光重算的工作线程同一套写法），
     不用 QThreadPool/QRunnable：autoDelete 的 QRunnable 被 Qt 回收后，
     Python 包装对象再被 GC 会二次释放 ⇒ 进程 heap corruption。
+
+    ★ 线程**不是 daemon**（复审 A1-R2）：
+      daemon 线程在进程退出时被**强杀** ⇒ 用户在落盘**中途**关窗 ⇒ 磁盘上留下
+      **截断**的 PDF（能打开、页数却不对）。非 daemon 线程会被 Python 在退出前
+      join 掉 ⇒ 写完才退。配套：`ScanApp.closeEvent` 里**有界等待**在途任务。
+    ★ 每个线程都登记进 `_BACKGROUND_TASKS` ⇒ 关窗时知道还有谁在跑。
     """
     def _runner():
         try:
@@ -503,10 +511,192 @@ def _run_in_background(work, on_done, on_error):
             _post_to_ui(lambda: on_error(err))
         else:
             _post_to_ui(lambda: on_done(result))
+        finally:
+            _unregister_background_task(threading.current_thread())
 
-    thread = threading.Thread(target=_runner, daemon=True)
+    thread = threading.Thread(target=_runner, daemon=False)
+    _register_background_task(thread, label)
     thread.start()
     return thread
+
+
+# ────────── 后台任务登记（关窗时等落盘用）──────────
+#
+# ★ 复审 A1-R2：落盘线程是 daemon ⇒ 用户在落盘**中途**关窗 ⇒ 进程被直接杀掉
+#   ⇒ 磁盘上留下**截断**的 PDF（能打开、页数却不对）。
+#   两道保险：
+#     ① 落盘线程**不是 daemon** ⇒ 进程退出前 Python 会 join 它（写完才退）；
+#     ② `ScanApp.closeEvent` 里**有界等待**在途任务，等不到就**阻止关闭**。
+_BACKGROUND_TASKS: "dict[threading.Thread, str]" = {}
+_BACKGROUND_TASKS_LOCK = threading.Lock()
+
+
+def _register_background_task(thread, label):
+    """登记在途后台任务（关窗时按这张表等待）。"""
+    with _BACKGROUND_TASKS_LOCK:
+        _BACKGROUND_TASKS[thread] = label
+
+
+def _unregister_background_task(thread):
+    """注销已结束的后台任务（幂等）。"""
+    with _BACKGROUND_TASKS_LOCK:
+        _BACKGROUND_TASKS.pop(thread, None)
+
+
+def pending_background_tasks():
+    """在途后台任务 [(线程, 标签)]。"""
+    with _BACKGROUND_TASKS_LOCK:
+        return [(t, lbl) for t, lbl in _BACKGROUND_TASKS.items() if t.is_alive()]
+
+
+class _SaveTracker:
+    """
+    在途保存任务登记（按标签计数）。
+
+    ★ 为什么不能是单个布尔标志（复审 A1-R1）：
+      落盘后台化之后，**可能有多个保存同时在飞**（用户扫完一份、落盘还没结束又扫一份）。
+      老的 `self._direct_save_finished` 是**一个布尔量**：第二次开始时把它置 False，
+      而**先结束的那次**的回调会把它置 True ⇒ 第二个保存还在跑，标志却已经变成
+      "全部完成"。这里用「标签 → 计数」：几个在跑就减几个。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts: dict = {}
+
+    def begin(self, label: str) -> None:
+        """登记一次在途保存。"""
+        with self._lock:
+            self._counts[label] = self._counts.get(label, 0) + 1
+
+    def end(self, label: str) -> None:
+        """注销一次在途保存（多减不会变成负数）。"""
+        with self._lock:
+            n = self._counts.get(label, 0) - 1
+            if n > 0:
+                self._counts[label] = n
+            else:
+                self._counts.pop(label, None)
+
+    def count(self, label=None) -> int:
+        """在途保存数（label=None ⇒ 全部标签合计）。"""
+        with self._lock:
+            if label is None:
+                return sum(self._counts.values())
+            return self._counts.get(label, 0)
+
+    def all_done(self, label=None) -> bool:
+        """是否**全部**保存都已结束。"""
+        return self.count(label) == 0
+
+
+def _save_tracker_of(app):
+    """
+    取某个 app 的在途保存计数器（没有就懒建一个）。
+
+    ★ 做成模块级函数而不是方法：本文件里 `_direct_save_result` 之类的方法会被
+      既有测试的**最小替身**借用（替身只有那几个方法）⇒ 不能假设替身上
+      也有本文件新加的方法。
+    """
+    tracker = getattr(app, "_save_tracker", None)
+    if not isinstance(tracker, _SaveTracker):
+        tracker = _SaveTracker()
+        try:
+            app._save_tracker = tracker
+        except Exception:       # pragma: no cover - 极端替身（属性不可写）
+            pass
+    return tracker
+
+
+def _pending_save_count(app, label=None) -> int:
+    """在途保存任务数（label=None ⇒ 全部标签合计）。"""
+    return _save_tracker_of(app).count(label)
+
+
+def _refresh_scan_button(app):
+    """
+    按「落盘在途」刷新扫描按钮状态。
+
+    ★ 复审 A1-R1：直接保存后台化之后，**落盘期间扫描按钮被重新启用**
+      ⇒ 用户能再点一次扫描 ⇒ 两个 save_pages 并发重叠（产物还可能互相覆盖）。
+      这里把「落盘在途」当成一等状态：落盘结束前按钮保持禁用（文案也换掉，
+      让用户知道界面为什么点不动）。
+    ★ 扫描进行中也不能点（与改造前的行为一致）。
+    """
+    btn = getattr(app, "scan_btn", None)
+    if btn is None:
+        return
+    pending = _pending_save_count(app)
+    scanning = bool(getattr(app, "_scan_in_progress", False))
+    try:
+        if pending:
+            btn.setText("保存中...")
+            btn.setEnabled(False)
+        elif scanning:
+            btn.setText("扫描中...")
+            btn.setEnabled(False)
+        else:
+            btn.setText("扫描")
+            btn.setEnabled(True)
+    except RuntimeError:       # pragma: no cover - 控件已销毁
+        logger.debug("刷新扫描按钮状态失败（控件已销毁）")
+
+
+class _OutputNameGuard:
+    """
+    输出文件名唯一性守卫（GUI 侧兜底）。
+
+    ★ 复审 A1-R1 ③：协调器给的结果文件名精度**只到秒**
+      （`scan_coordinator.py:727`：`HP_Scan_%Y%m%d_%H%M%S.ext`）
+      ⇒ 同一秒内完成的两批会算出**同一个文件名** ⇒ 后写的覆盖先写的。
+      协调器不在本文件的修改范围内 ⇒ GUI 侧兜底：给每批输出占一个
+      **没被占用**的 base（`{base}` → `{base}_1` → `{base}_2` …）。
+    ★ 占用记录**跨实例共享**（模块级单例）⇒ 同一进程里两次落盘不会撞名。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._claimed = set()
+
+    def claim(self, output_path):
+        """给一批输出占一个唯一的 base，返回可用的输出路径。"""
+        if not output_path:
+            return output_path
+        base, ext = os.path.splitext(output_path)
+        with self._lock:
+            candidate = base
+            n = 0
+            while self._taken(candidate):
+                n += 1
+                candidate = f"{base}_{n}"
+            self._claimed.add(candidate)
+        return candidate + ext
+
+    def _taken(self, base):
+        """这个 base 是不是已经有人要了 / 磁盘上已经有东西了。"""
+        if base in self._claimed:
+            return True
+        directory = os.path.dirname(base) or "."
+        prefix = os.path.basename(base)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return False
+        for name in names:
+            # 产物名要么是 `{base}.{ext}`，要么是 `{base}_001.{ext}` /
+            # `{base}_001_002.{ext}`（多组多页）⇒ 认前缀即可
+            if (name == prefix or name.startswith(prefix + ".")
+                    or name.startswith(prefix + "_")):
+                return True
+        return False
+
+
+OUTPUT_NAME_GUARD = _OutputNameGuard()
+
+
+def _unique_output_path(output_path):
+    """输出路径唯一化（同一秒完成的两批不会互相覆盖）。"""
+    return OUTPUT_NAME_GUARD.claim(output_path)
 
 
 # ────────── 自定义 Widget ──────────
@@ -1422,6 +1612,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self._exposure_state = None
         # WIA 路径的取消信号（GUI 兜底持有；正常已登记进协调器）
         self._wia_cancel_event = None
+        # ★ 复审 A1-R1：在途保存用**计数**登记（不是单个布尔标志）
+        #   ⇒ 几个在跑就减几个；"全部完成"只在计数归零时成立。
+        self._save_tracker = _SaveTracker()
+        # 扫描进行中（扫描按钮禁用由它统一裁决）
+        self._scan_in_progress = False
+        # ★ 复审 A1-R2：关窗等待落盘期间置 True ⇒ 不弹模态框（会卡住关闭）
+        self._closing = False
 
         # ── 文档会话（批次 4 · B4-6）──
         # ★ 必须在 _setup_ui() 之前建好：界面构建时会连接模式切换信号，
@@ -2257,6 +2454,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if not self.selected:
             QMessageBox.warning(self, "提示", "请先选择一台打印机")
             return
+        # ★ 复审 A1-R1：落盘在途时**不许**再开一次扫描。
+        #   扫描按钮在落盘期间是禁用的（见 `_refresh_scan_button`），
+        #   这里只是程序化调用时的兜底。
+        if _pending_save_count(self):
+            self.status_bar.showMessage("正在保存中，请等保存结束后再扫描")
+            return
 
         # 每次扫描都是新文档 ⇒ 清掉上一份文档残留的曝光参数（I-6）。
         # 曝光是「预览里的临时调整」，跨文档静默套用会让用户扫出来的图被改过。
@@ -2308,6 +2511,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
         self.scan_btn.setText("扫描中...")
         self.scan_btn.setEnabled(False)
+        self._scan_in_progress = True
         self.status_bar.showMessage("正在扫描...")
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
@@ -2414,12 +2618,25 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # getattr：ScanApp 的最小替身（只借用方法）可能没有这个属性。
         exposure = getattr(self, "_exposure_state", None)
         total_pages = len(page_specs)
-        # 完成标记（供调用方/测试等待；回调落地时置 True）
+        # ★ 复审 A1-R1 ③：输出路径必须**唯一** —— 协调器的文件名精度只到秒
+        #   （scan_coordinator.py:727）⇒ 同秒完成的两批算出同一个文件名 ⇒
+        #   后写的覆盖先写的。协调器不在本文件范围内 ⇒ GUI 侧兜底。
+        output_path = _unique_output_path(result.output_path)
+        # ★ 复审 A1-R1 ②：在途保存用**计数**登记（不是单个布尔标志）
+        #   ⇒ 几个在跑就减几个；"全部完成"只在计数归零时才成立。
+        saves = _save_tracker_of(self)
+        saves.begin("direct")
         self._direct_save_finished = False
+        # ★ 复审 A1-R1 ①：落盘在途 ⇒ 扫描按钮保持禁用（不许再点一次扫描）
+        _refresh_scan_button(self)
+        try:
+            self.status_bar.showMessage(f"正在保存到 {output_path} …")
+        except Exception:       # pragma: no cover - 替身没有状态栏
+            pass
 
         def _work():
             return _save_page_specs(
-                result.job_id, result.ext, result.output_path, page_specs, groups,
+                result.job_id, result.ext, output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs or [], device_name=dev_name,
                 device_ip=dev_ip, exposure=exposure)
 
@@ -2430,6 +2647,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             lambda files: self._on_direct_save_done(
                 files, result, total_pages, exposure),
             lambda err: self._on_direct_save_error(err, result),
+            label="直接保存",
         )
 
     def _on_direct_save_done(self, saved_files, result, total_pages, exposure):
@@ -2452,25 +2670,37 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     f"已保存 {len(saved_files)} 个文件，但有 {failed_pages} 页保存失败")
             else:
                 self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
-            QMessageBox.information(
-                self, "保存完成" if not failed_pages else "保存部分失败", summary)
+            # ★ 关窗等待期间不弹模态框（弹窗会卡住关闭流程）
+            if not getattr(self, "_closing", False):
+                QMessageBox.information(
+                    self, "保存完成" if not failed_pages else "保存部分失败", summary)
         except RuntimeError:
             # 主窗口已被销毁（用户提前关窗）—— 不用再提示
             logger.debug("直接保存完成时主窗口已销毁")
         finally:
-            self._direct_save_finished = True
+            # ★ 完成标志由**计数器**派生：还有别的保存在跑 ⇒ 仍是 False
+            #   （复审 A1-R1 ②：单个布尔标志会被"先结束的那次"提前置 True）
+            saves = _save_tracker_of(self)
+            saves.end("direct")
+            self._direct_save_finished = saves.all_done("direct")
+            _refresh_scan_button(self)
 
     def _on_direct_save_error(self, err, result):
         """主线程：直接保存失败 —— 必须让用户看见，不能静默。"""
         try:
             logger.error("直接保存失败: %s", err, exc_info=True)
             self.status_bar.showMessage("直接保存失败")
-            QMessageBox.critical(self, "保存失败", f"直接保存失败: {err}")
+            if not getattr(self, "_closing", False):
+                QMessageBox.critical(self, "保存失败", f"直接保存失败: {err}")
         except RuntimeError:
             logger.debug("直接保存失败时主窗口已销毁")
         finally:
             _release_job_protection(result.job_id)
-            self._direct_save_finished = True
+            # ★ 同上：完成标志由计数器派生
+            saves = _save_tracker_of(self)
+            saves.end("direct")
+            self._direct_save_finished = saves.all_done("direct")
+            _refresh_scan_button(self)
 
     def _release_job(self, job_id):
         """解除 job 的缓存保护（幂等）—— 见模块级 _release_job_protection。"""
@@ -2499,8 +2729,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
     def _reset_scan_ui(self):
         """重置扫描 UI"""
-        self.scan_btn.setText("扫描")
-        self.scan_btn.setEnabled(True)
+        # ★ 落盘在途时**不许**重新启用扫描按钮（复审 A1-R1）：
+        #   后台化之后这里原本无条件 setEnabled(True) ⇒ 用户能在落盘途中再扫一份
+        #   ⇒ 两个 save_pages 并发重叠。改成"落盘在途 ⇒ 保持禁用"。
+        self._scan_in_progress = False
+        _refresh_scan_button(self)
         self.listen_btn.setEnabled(True)
         self.scan_progress.setVisible(False)
         # 移除取消监听按钮
@@ -2857,11 +3090,17 @@ class ScanApp(QMainWindow, _UiPostMixin):
         scanner = self.selected
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = (scanner.ip or "") if scanner else ""
-        out_path = session.output_path or self._default_session_output_path()
+        # ★ 输出路径唯一化（复审 A1-R1 ③）：默认路径精度只到秒 ⇒ 同秒的两批会撞名
+        out_path = _unique_output_path(
+            session.output_path or self._default_session_output_path())
         extra_dirs = list(self.extra_dirs or [])
         session.ext = self.output_format_val or session.ext
         session.dpi = int(self.resolution_val or session.dpi)
         self._session_save_finished = False
+        # ★ 在途保存登记（计数）⇒ 落盘期间扫描按钮保持禁用
+        saves = _save_tracker_of(self)
+        saves.begin("session")
+        _refresh_scan_button(self)
         _ensure_ui_dispatcher()
 
         def _work():
@@ -2869,7 +3108,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
                 session, out_path=out_path, extra_dirs=extra_dirs,
                 device_name=dev_name, device_ip=dev_ip)
 
-        _run_in_background(_work, self._on_session_saved, self._on_session_save_error)
+        _run_in_background(_work, self._on_session_saved,
+                           self._on_session_save_error, label="会话落盘")
 
     def _on_session_saved(self, saved_files):
         """主线程：会话落盘完成"""
@@ -2892,12 +3132,17 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     logger.error("会话状态落盘失败: %s", e)
             summary = _format_save_summary(saved_files, total, failed, warnings)
             self.status_bar.showMessage(f"会话已保存：{len(saved_files)} 个文件")
-            QMessageBox.information(
-                self, "保存完成" if not failed else "保存部分失败", summary)
+            # ★ 关窗等待期间不弹模态框（弹窗会卡住关闭流程）
+            if not getattr(self, "_closing", False):
+                QMessageBox.information(
+                    self, "保存完成" if not failed else "保存部分失败", summary)
         except RuntimeError:
             logger.debug("会话保存完成时主窗口已销毁")
         finally:
             self._session_save_finished = True
+            saves = _save_tracker_of(self)
+            saves.end("session")
+            _refresh_scan_button(self)
             self._update_session_ui()
 
     def _on_session_save_error(self, err):
@@ -2905,11 +3150,16 @@ class ScanApp(QMainWindow, _UiPostMixin):
         try:
             logger.error("会话落盘失败: %s", err, exc_info=True)
             self.status_bar.showMessage("会话保存失败")
-            QMessageBox.critical(self, "保存失败", f"会话保存失败: {err}")
+            # ★ 关窗等待期间不弹模态框（弹窗会卡住关闭流程）
+            if not getattr(self, "_closing", False):
+                QMessageBox.critical(self, "保存失败", f"会话保存失败: {err}")
         except RuntimeError:
             logger.debug("会话保存失败时主窗口已销毁")
         finally:
             self._session_save_finished = True
+            saves = _save_tracker_of(self)
+            saves.end("session")
+            _refresh_scan_button(self)
             self._update_session_ui()
 
     # ── 跨进程恢复 ──
@@ -3372,6 +3622,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
         # 取消入口：与 eSCL 路径一致（状态栏上的「取消扫描」按钮）
         self.scan_btn.setEnabled(False)
+        self._scan_in_progress = True
         self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
         self.cancel_scan_btn.clicked.connect(self._cancel_scan)
         self.status_bar.addPermanentWidget(self.cancel_scan_btn)
@@ -3533,6 +3784,30 @@ class ScanApp(QMainWindow, _UiPostMixin):
         return False
 
     # ────────── 窗口关闭时保存设置 ──────────
+
+    # 关闭时等待在途落盘的上限（秒）—— **有界** ⇒ 界面不会无限期卡住
+    CLOSE_SAVE_WAIT_SECONDS = 30.0
+
+    def _wait_background_tasks(self, tasks, timeout):
+        """
+        有界等待在途后台任务结束。返回 True = 全部结束。
+
+        ★ 等待期间**继续泵事件**（界面不冻结），但**排除用户输入**
+          （用户在点"关闭"了，别让别的点击插进来）。
+        ★ 关窗等待期间不弹模态框（弹窗会卡住关闭流程）⇒ 由 `_closing` 统一抑制。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if not any(t.is_alive() for t, _lbl in tasks):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            except Exception as e:        # pragma: no cover - 事件循环异常
+                logger.debug("关窗等待时泵事件失败: %s", e)
+            time.sleep(0.02)
+
     def closeEvent(self, event):
         """关闭窗口时保存窗口大小和位置"""
         self.cfg["window_width"] = self.width()
@@ -3540,6 +3815,32 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.cfg["window_x"] = self.x()
         self.cfg["window_y"] = self.y()
         self._save_cfg()
+        # ★ 复审 A1-R2：落盘线程原来是 daemon ⇒ 用户在落盘**中途**关窗 ⇒
+        #   进程被直接杀掉 ⇒ 磁盘上留下**截断**的 PDF（能打开、页数却不对）。
+        #   这里在关窗前**有界等待**在途后台任务；等不到就**阻止关闭**并
+        #   明确告知用户"有未完成的保存"（落盘线程已改成非 daemon ⇒
+        #   即便用户强行结束进程，Python 也会 join 它把文件写完）。
+        pending = pending_background_tasks()
+        if pending:
+            self._closing = True
+            try:
+                finished = self._wait_background_tasks(
+                    pending, self.CLOSE_SAVE_WAIT_SECONDS)
+            finally:
+                self._closing = False
+            if not finished:
+                names = "、".join(lbl for _t, lbl in pending)
+                logger.error("关闭被阻止：仍有后台任务未完成: %s", names)
+                try:
+                    QMessageBox.warning(
+                        self, "保存尚未完成",
+                        f"还有 {len(pending)} 个保存任务没有完成（{names}）。\n\n"
+                        "已阻止关闭，以免留下写了一半的文件。\n"
+                        "请等保存结束后再关闭窗口。")
+                except RuntimeError:       # pragma: no cover - 主窗口已销毁
+                    pass
+                event.ignore()
+                return
         try:
             self.coordinator.shutdown()
         except Exception:
