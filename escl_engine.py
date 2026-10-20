@@ -26,7 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
-    "fetch_capabilities", "get_scanner_status",
+    "fetch_capabilities", "get_scanner_status", "probe_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
     "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
 ]
@@ -233,6 +233,37 @@ def _probe_adf_from_status(scanner: ScannerInfo, base: str, timeout: float):
         pass
 
 
+def _http_get_loose_tls(url: str, timeout: float):
+    """
+    用宽松 cipher 的独立连接请求 HTTPS。
+
+    某些老打印机（实测 17.17.171.203 / .208）把 ScannerCapabilities 301 到
+    HTTPS，而它们的 TLS 只支持老旧 cipher suite，OpenSSL 3.x 默认禁用导致
+    握手失败（SSLV3_ALERT_HANDSHAKE_FAILURE）。
+
+    仅用于**局域网内自签证书**设备兜底：check_hostname=False +
+    verify_mode=CERT_NONE + 宽松 cipher 集合，且只作为 HTTP 路径已失败后的
+    备用路径。返回 (status_code, text)；失败直接抛异常，由调用方兜住。
+    """
+    import ssl
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.set_ciphers("ALL:@SECLEVEL=0")
+    except Exception:
+        pass
+    try:
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except Exception:
+        pass
+
+    http = urllib3.PoolManager(ssl_context=ctx, cert_reqs="CERT_NONE")
+    resp = http.request("GET", url, timeout=urllib3.Timeout(timeout))
+    return resp.status, resp.data.decode("utf-8", errors="replace")
+
+
 def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInfo:
     """
     从 /eSCL/ScannerCapabilities 解析扫描仪全部能力。
@@ -245,16 +276,47 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
     url = base + "/ScannerCapabilities"
 
     try:
-        # 不用自动跳转：部分 HP 打印机 HTTP→HTTPS 重定向但 TLS 握手失败
-        r = requests.get(url, timeout=(2.0, timeout), verify=False, allow_redirects=False)
-        if r.status_code in (301, 302, 307, 308):
-            alt_url = url.replace("https://", "http://")
-            r = requests.get(alt_url, timeout=(2.0, timeout), verify=False, allow_redirects=False)
-        if r.status_code != 200:
+        status = 0
+        text = ""
+        location = ""
+
+        try:
+            r = requests.get(url, timeout=(2.0, timeout), verify=False,
+                             allow_redirects=False)
+            status = r.status_code
+            text = r.text
+            location = r.headers.get("Location", "")
+        except requests.RequestException as e:
+            # https 直连握手失败（老机型 cipher 不兼容）→ 用宽松 TLS 重试
+            logger.debug("能力查询直连失败，尝试宽松 TLS: %s", e)
+            if url.lower().startswith("https://"):
+                try:
+                    status, text = _http_get_loose_tls(url, timeout)
+                except Exception as e2:
+                    logger.debug("宽松 TLS 重试失败: %s", e2)
+            if status == 0:
+                raise
+
+        if status in (301, 302, 307, 308):
+            # (a) 重定向目标是同协议的 http 路径 → 直接跟
+            if location.lower().startswith("http://"):
+                r2 = requests.get(location, timeout=(2.0, timeout), verify=False,
+                                  allow_redirects=False)
+                status = r2.status_code
+                text = r2.text
+                location = r2.headers.get("Location", "")
+            # (b) 目标是 https，且这类老机型 TLS 只支持老旧 cipher
+            if status in (301, 302, 307, 308) and location.lower().startswith("https://"):
+                try:
+                    status, text = _http_get_loose_tls(location, timeout)
+                except Exception as e:
+                    logger.debug("宽松 TLS 回退失败: %s", e)
+
+        if status != 200:
             # ScannerCapabilities 失败 → 回退到 ScannerStatus 探测 ADF
             _probe_adf_from_status(scanner, base, timeout)
             return scanner
-        root = ET.fromstring(r.text)
+        root = ET.fromstring(text)
 
         # 型号 / 序列号
         # HP 真机报的是 pwg:MakeAndModel，部分机型报 Model，两个都认，
@@ -359,26 +421,42 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
     return scanner
 
 
-def get_scanner_status(escl_url: str, timeout: float = 5.0) -> dict:
-    """查询扫描仪状态（Idle / Processing / ...）和 ADF 是否有纸"""
-    url = escl_url.rstrip("/") + "/ScannerStatus"
+def probe_scanner_status(escl_url: str, timeout: float = 5.0) -> tuple:
+    """
+    查询扫描仪状态，返回 (探测是否成功, 状态字典)。
+
+    与 get_scanner_status 的区别：后者把连接失败、非 200、XML 畸形
+    全部吞掉、返回 {"state": "Unknown", "adf_loaded": False}，调用方
+    无法区分"探测失败"与"设备合法上报了 Unknown 状态"。协调器需要这个
+    区分，否则设备上报 <State>Unknown</State> 时会被误判成探测失败，
+    从而改变用户显式选择的来源。
+
+    返回：
+        (True,  {"state": "Idle", "adf_loaded": False})   探测成功
+        (False, {"state": "Unknown", "adf_loaded": False}) 探测失败
+    """
     status = {"state": "Unknown", "adf_loaded": False}
     try:
-        r = requests.get(url, timeout=timeout, verify=False)
+        r = requests.get(escl_url.rstrip("/") + "/ScannerStatus",
+                         timeout=timeout, verify=False)
         if r.status_code != 200:
-            return status
+            return False, status
         root = ET.fromstring(r.text)
-
         for el in root.iter():
             t = _strip_ns(el)
             if t == "State" and el.text:
                 status["state"] = el.text.strip()
             if t == "AdfState" and el.text:
                 status["adf_loaded"] = "Loaded" in (el.text.strip() or "")
-    except requests.RequestException as e:
-        logging.debug("状态查询失败: %s", e)
-    except ET.ParseError as e:
-        logging.debug("状态 XML 解析失败: %s", e)
+        return True, status
+    except (requests.RequestException, ET.ParseError) as e:
+        logger.debug("状态查询失败: %s", e)
+        return False, status
+
+
+def get_scanner_status(escl_url: str, timeout: float = 5.0) -> dict:
+    """查询扫描仪状态（保留原有契约：失败时返回 Unknown 状态字典）"""
+    ok, status = probe_scanner_status(escl_url, timeout)
     return status
 
 

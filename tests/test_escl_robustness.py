@@ -1,11 +1,12 @@
 """
 escl_engine 协议层健壮性测试 — HP Scan Tool v4.0
-覆盖: 机型标签 MakeAndModel 解析 / ScanJob 409 冲突退避重试
+覆盖: 机型标签 MakeAndModel 解析 / ScanJob 409 冲突退避重试 / 301→HTTPS 宽松 TLS 兜底 / 状态探测成败显式区分
 """
 
 from unittest import mock
 
 import pytest
+import requests
 
 import escl_engine
 from escl_engine import ScannerInfo, fetch_capabilities
@@ -34,6 +35,49 @@ LEGACY_CAPS_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <pwg:MaxHeight>3508</pwg:MaxHeight>
   </scan:Platen>
 </scan:ScannerCapabilities>"""
+
+# 两个机型标签同时存在（Model 在前、MakeAndModel 在后）
+BOTH_TAGS_CAPS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScannerCapabilities xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"
+                          xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.63</pwg:Version>
+  <pwg:Model>HP Generic Model</pwg:Model>
+  <pwg:MakeAndModel>HP LaserJet MFP M232dwc</pwg:MakeAndModel>
+  <pwg:SerialNumber>VNP6N40672</pwg:SerialNumber>
+  <scan:Platen>
+    <pwg:MaxWidth>2550</pwg:MaxWidth>
+    <pwg:MaxHeight>3508</pwg:MaxHeight>
+  </scan:Platen>
+</scan:ScannerCapabilities>"""
+
+# 两个机型标签同时存在，顺序反过来（MakeAndModel 在前、Model 在后）
+BOTH_TAGS_REVERSED_CAPS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScannerCapabilities xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"
+                          xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.63</pwg:Version>
+  <pwg:MakeAndModel>HP LaserJet MFP M232dwc</pwg:MakeAndModel>
+  <pwg:Model>HP Generic Model</pwg:Model>
+  <pwg:SerialNumber>VNP6N40672</pwg:SerialNumber>
+  <scan:Platen>
+    <pwg:MaxWidth>2550</pwg:MaxWidth>
+    <pwg:MaxHeight>3508</pwg:MaxHeight>
+  </scan:Platen>
+</scan:ScannerCapabilities>"""
+
+STATUS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScannerStatus xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"
+                    xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.63</pwg:Version>
+  <pwg:State>Idle</pwg:State>
+  <scan:AdfState>ScannerAdfEmpty</scan:AdfState>
+</scan:ScannerStatus>"""
+
+UNKNOWN_STATE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<scan:ScannerStatus xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03"
+                    xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">
+  <pwg:Version>2.63</pwg:Version>
+  <pwg:State>Unknown</pwg:State>
+</scan:ScannerStatus>"""
 
 
 class _Resp:
@@ -69,6 +113,22 @@ class TestModelParsing:
         s = ScannerInfo(name="WSD-Scanner-1.2.3.4", ip="1.2.3.4", model="HP M232")
         assert s.display_name == "HP M232"
 
+    def test_make_and_model_wins_over_model(self):
+        """两个标签同时存在时，MakeAndModel 优先"""
+        s = _scanner()
+        with mock.patch("escl_engine.requests.get",
+                        return_value=_Resp(200, BOTH_TAGS_CAPS_XML)):
+            s = fetch_capabilities(s, timeout=3.0)
+        assert s.model == "HP LaserJet MFP M232dwc"
+
+    def test_make_and_model_wins_regardless_of_tag_order(self):
+        """标签顺序反过来时也必须 MakeAndModel 优先（守住 model_tag is None 守卫）"""
+        s = _scanner()
+        with mock.patch("escl_engine.requests.get",
+                        return_value=_Resp(200, BOTH_TAGS_REVERSED_CAPS_XML)):
+            s = fetch_capabilities(s, timeout=3.0)
+        assert s.model == "HP LaserJet MFP M232dwc"
+
 
 class TestScanJobConflict:
     def test_conflict_then_success_after_backoff(self):
@@ -85,12 +145,14 @@ class TestScanJobConflict:
         assert job_uri.endswith("/7")
         assert session.post.call_count == 3
         assert sleeper.call_count == 2
+        # 退避入参必须逐个锁定（2 秒起步，逐次翻倍）
+        assert [c.args[0] for c in sleeper.call_args_list] == [2, 4]
 
     def test_persistent_conflict_raises_actionable_message(self):
         s = _scanner()
         session = mock.MagicMock()
         session.post.return_value = _Resp(409, "busy")
-        with mock.patch("escl_engine.time.sleep"):
+        with mock.patch("escl_engine.time.sleep") as sleeper:
             with pytest.raises(RuntimeError) as exc:
                 escl_engine._create_scan_job(
                     session, s, 300, "RGB24", "jpg", "Platen", False)
@@ -99,6 +161,8 @@ class TestScanJobConflict:
         assert "未完成" in msg
         assert "打印机面板" in msg
         assert session.post.call_count == 4
+        # 3 次退避的完整入参序列必须是 2/4/8 秒
+        assert [c.args[0] for c in sleeper.call_args_list] == [2, 4, 8]
 
     def test_non_conflict_error_keeps_original_message(self):
         s = _scanner()
@@ -108,6 +172,8 @@ class TestScanJobConflict:
             escl_engine._create_scan_job(
                 session, s, 300, "RGB24", "jpg", "Platen", False)
         assert "500" in str(exc.value)
+        # 原句前缀不得被改动
+        assert str(exc.value).startswith("创建扫描任务失败 HTTP 500")
         assert session.post.call_count == 1
 
     def test_service_unavailable_raises_actionable_message(self):
@@ -121,4 +187,108 @@ class TestScanJobConflict:
         msg = str(exc.value)
         assert "503" in msg
         assert "输稿器" in msg
+        # 必须给出"放纸"这个可执行动作，不能只说设备名
+        assert "纸张" in msg
         assert session.post.call_count == 1
+
+    def test_conflict_then_other_error_keeps_original_message(self):
+        s = _scanner()
+        session = mock.MagicMock()
+        session.post.side_effect = [_Resp(409, "busy"), _Resp(500, "boom")]
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(RuntimeError) as exc:
+                escl_engine._create_scan_job(
+                    session, s, 300, "RGB24", "jpg", "Platen", False)
+        assert "500" in str(exc.value)
+        assert "未完成" not in str(exc.value)
+
+
+class TestLooseTlsFallback:
+    """301 跳 HTTPS 的老机型：TLS cipher 不兼容时的兜底路径"""
+
+    def test_http_redirect_to_https_uses_loose_tls(self):
+        s = _scanner()
+        s.escl_url = "http://1.2.3.4:80/eSCL/"
+        with mock.patch("escl_engine.requests.get",
+                        return_value=_Resp(301, "",
+                                           {"Location": "https://1.2.3.4/eSCL/ScannerCapabilities"})), \
+             mock.patch("escl_engine._http_get_loose_tls",
+                        return_value=(200, CAPS_XML)) as loose:
+            s = fetch_capabilities(s, timeout=3.0)
+        assert loose.called, "301 指向 https 时应走宽松 TLS 备用路径"
+        assert s.model == "HP LaserJet MFP M232dwc"
+        assert s.max_width == 2550
+
+    def test_https_direct_failure_falls_back_to_loose_tls(self):
+        s = _scanner()
+        s.escl_url = "https://1.2.3.4/eSCL/"
+        with mock.patch("escl_engine.requests.get",
+                        side_effect=requests.exceptions.SSLError("handshake failure")), \
+             mock.patch("escl_engine._http_get_loose_tls",
+                        return_value=(200, CAPS_XML)) as loose:
+            s = fetch_capabilities(s, timeout=3.0)
+        assert loose.called
+        assert s.model == "HP LaserJet MFP M232dwc"
+
+    def test_loose_tls_failure_is_silent(self):
+        """宽松 TLS 也失败时静默回退，不抛异常、不影响扫描"""
+        s = _scanner()
+        with mock.patch("escl_engine.requests.get",
+                        return_value=_Resp(301, "",
+                                           {"Location": "https://1.2.3.4/eSCL/ScannerCapabilities"})), \
+             mock.patch("escl_engine._http_get_loose_tls",
+                        side_effect=Exception("boom")):
+            s = fetch_capabilities(s, timeout=3.0)
+        assert s.model == ""
+
+    def test_http_redirect_to_http_is_followed(self):
+        """301 指向 http:// 路径时直接跟随，不走宽松 TLS"""
+        s = _scanner()
+        s.escl_url = "http://1.2.3.4:80/eSCL/"
+        caps_url = "http://1.2.3.4:80/eSCL/ScannerCapabilities"
+        with mock.patch("escl_engine.requests.get",
+                        side_effect=[_Resp(301, "", {"Location": caps_url}),
+                                     _Resp(200, CAPS_XML)]) as getter, \
+             mock.patch("escl_engine._http_get_loose_tls") as loose:
+            s = fetch_capabilities(s, timeout=3.0)
+        assert getter.call_count == 2
+        assert not loose.called
+        assert s.model == "HP LaserJet MFP M232dwc"
+
+
+class TestProbeScannerStatus:
+    """探测成败必须显式可区分，不能靠状态字符串推断"""
+
+    def test_probe_success_returns_ok_true(self):
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, STATUS_XML)):
+            ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert ok is True
+        assert st["state"] == "Idle"
+        assert st["adf_loaded"] is False
+
+    def test_probe_failure_returns_ok_false(self):
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(500, "")):
+            ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert ok is False
+        assert st["state"] == "Unknown"
+
+    def test_legit_unknown_state_is_not_a_failure(self):
+        """设备合法上报 <State>Unknown</State> 时，探测仍算成功"""
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, UNKNOWN_STATE_XML)):
+            ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert ok is True
+        assert st["state"] == "Unknown"
+
+    def test_probe_malformed_xml_returns_ok_false(self):
+        """XML 畸形属探测失败，必须显式返回 ok=False"""
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, "<not-xml")):
+            ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert ok is False
+        assert st["state"] == "Unknown"
+
+    def test_get_scanner_status_contract_unchanged(self):
+        """get_scanner_status 必须保持原有返回契约（cli.py cmd_status 依赖它）"""
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, STATUS_XML)):
+            st = escl_engine.get_scanner_status("http://1.2.3.4/eSCL/")
+        assert set(st.keys()) == {"state", "adf_loaded"}
+        assert st["state"] == "Idle"
