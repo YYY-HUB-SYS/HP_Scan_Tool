@@ -47,16 +47,6 @@ def cache_root(tmp_path, monkeypatch):
     return root
 
 
-@pytest.fixture
-def qt_app():
-    """Qt 事件循环（跨线程信号靠它投递到主线程）"""
-    from PySide6.QtCore import QCoreApplication
-    app = QCoreApplication.instance()
-    if app is None:
-        app = QCoreApplication([])
-    yield app
-
-
 def _params(tmp_path, **kw):
     p = {
         "resolution": 300,

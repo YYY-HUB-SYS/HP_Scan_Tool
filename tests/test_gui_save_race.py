@@ -51,11 +51,15 @@ finally:
 
 
 @pytest.fixture(scope="module")
-def qapp():
-    """整个模块共用一个 QApplication（offscreen，不显示窗口）"""
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    yield app
+def qapp(qt_app):
+    """整个模块共用一个 QApplication（offscreen，不显示窗口）
+
+    ★ 复用**会话级**实例（tests/conftest.py 的 `qt_app`）。
+      自己写 `QApplication.instance() or QApplication([])` 会在进程里
+      残留 QCoreApplication 时取到**错误**的实例 ⇒ 后续创建 widget
+      直接崩（0xC0000409，见 tests/test_qt_app_singularity.py）。
+    """
+    return qt_app
 
 
 class _FakeMessageBox:

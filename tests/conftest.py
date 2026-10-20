@@ -30,6 +30,10 @@ import tempfile
 
 import pytest
 
+# 必须在**任何** application 实例被创建之前设置：禁止弹出真实窗口。
+# 放在 conftest（而不是各测试文件里）⇒ 比模块级 import 更早、更统一。
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # 确保项目根目录在 sys.path 中
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -50,6 +54,50 @@ def _cleanup_session_appdata():
     """会话结束后清掉沙箱 APPDATA 目录"""
     yield
     shutil.rmtree(_SESSION_APPDATA, ignore_errors=True)
+
+
+# ── Qt application 唯一性（会话级，全项目共用一个） ────────────────────────
+
+@pytest.fixture(scope="session")
+def qt_app():
+    """
+    整个 pytest 进程**唯一**的 Qt application 实例（QApplication，offscreen）。
+
+    ★ 为什么必须统一在这里建（2026-10-21 的 0xC0000409 崩溃根因）
+    ------------------------------------------------------------------
+    实测事实（探针 `%TEMP%\\hp_qapp_probe2.py`，非推断）：
+
+    - 进程里只有 **QCoreApplication** 时，`QApplication.instance()`
+      返回的**就是那个 QCoreApplication**（**非 None**），
+      且 `isinstance(x, QApplication)` 为 **False**。
+    - `del` 掉 Python 引用后 `QCoreApplication.instance()` **依然返回它**
+      ⇒ PySide6 一直持有该实例 ⇒ function 级 fixture 根本"析构"不掉。
+
+    于是旧写法 `QApplication.instance() or QApplication([])` 会**短路**
+    ⇒ QApplication **从未被创建** ⇒ 第一个 widget（QCheckBox）创建即
+    `QWidget: Cannot create a QWidget without QApplication` ⇒ 进程
+    `0xC0000409` 硬崩（pytest 连 traceback 都来不及打）。
+
+    ★ 契约
+      - 全项目**只有**本 fixture 能创建 application 实例。
+      - 任何测试文件都不得自己 `QCoreApplication(...)` / `QApplication(...)`。
+      - 若进程里已存在 QCoreApplication，这里**立刻**抛可读错误，
+        而不是让后续某个 widget 静默崩溃。
+    """
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if not isinstance(app, QApplication):
+        core = QCoreApplication.instance()
+        if core is not None:
+            raise RuntimeError(
+                "进程里已存在 QCoreApplication（%s）—— QCoreApplication 与 "
+                "QApplication 不能混用。请改用 tests/conftest.py 的会话级 "
+                "qt_app fixture，不要自己 new application 实例。"
+                % type(core).__name__)
+        app = QApplication([])
+    return app
 
 
 @pytest.fixture(autouse=True)
