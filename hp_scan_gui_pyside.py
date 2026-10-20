@@ -373,6 +373,10 @@ def _save_page_specs(job_id, ext, output_path, page_specs, groups, **kwargs):
     """
     if len(page_specs) == 1 and len(groups) == 1:
         cache_file, rotation = page_specs[0]
+        # ★ `save_single` **没有** confirm 形参（单页不做 PDF 体积预检 ——
+        #   1 页不可能超 1.5GB 门禁）⇒ 这里必须把 confirm 摘掉，
+        #   否则直存的单页路径会 TypeError。
+        kwargs.pop("confirm", None)
         path = save_manager.save_single(
             cache_file, ext, output_path, rotation=rotation, job_id=job_id, **kwargs)
         return save_manager.SaveResult([path], failed_pages=0, saved_page_count=1)
@@ -655,11 +659,11 @@ class _OutputNameGuard:
       ⇒ 同一秒内完成的两批会算出**同一个文件名** ⇒ 后写的覆盖先写的。
       当时协调器不在本文件的修改范围内 ⇒ GUI 侧兜底：给每批输出占一个
       **没被占用**的 base（`{base}` → `{base}_1` → `{base}_2` …）。
-    ★ 现状（2026-10-21）：协调器侧的文件名精度已提到**毫秒**
+    ★ 现状（2026-10-21）：协调器侧的文件名精度已提到**微秒**
       （`scan_coordinator.py` 的 `HP_Scan_%Y%m%d_%H%M%S_%f`）⇒「同秒撞名」
       这个具体成因已消除；但本守卫**仍要保留**，真正的理由是：
         - **直存与会话落盘共用同一个协调器 path** ⇒ 两条入口拿到的
-          `output_path` 可能是**同一个**；毫秒精度救不了"同一个 path"。
+          `output_path` 可能是**同一个**；微秒精度救不了"同一个 path"。
         - 兜底是**跨实例共享**（模块级单例）+ 查磁盘 ⇒ 重名时改用 `{base}_1`，
           而不是像协调器那样把上一次产物整个覆盖掉。
       所以守卫不是冗余，是最后一道防线。
@@ -2616,6 +2620,40 @@ class ScanApp(QMainWindow, _UiPostMixin):
         except RuntimeError:
             logger.debug("配置保存失败提示时主窗口已销毁")
 
+    def _make_confirm_callback(self):
+        """
+        PDF 体积预检的确认回调（`save_manager` 在**后台线程**里调它）。
+
+        ★ 为什么直存 / 会话落盘这两条路径**也必须**接上（终审 Important）：
+          `save_manager._precheck_pdf_volume` 在预计 PDF 合成内存峰值超过
+          **1.5GB 门禁**时，会问用户「仍要继续吗」；`confirm` 为 None 时
+          **只记 warning 并继续** ⇒ 门禁形同虚设 ⇒ 超大文档直接吃到一次 OOM。
+          预览对话框那条路径早就接了（`MultiPagePreviewDialog._make_confirm_callback`），
+          但**直存**与**会话落盘**是批次 4 之后才有的两条新主路径 ⇒ 漏了。
+        ★ 弹窗必须在**主线程**（落盘在后台线程）⇒ 回主线程弹，并阻塞等待用户回答。
+        ★ 不拿本窗口当 parent（它可能已被销毁 ⇒ 野指针 ⇒ 堆损坏）。
+        """
+        def _confirm(msg):
+            answer = {"ok": True}
+            done = threading.Event()
+
+            def _ask():
+                try:
+                    reply = QMessageBox.question(
+                        None, "文件可能很大", msg + "\n\n仍然继续保存吗？",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                    answer["ok"] = (reply == QMessageBox.Yes)
+                except RuntimeError:
+                    logger.debug("体积确认弹窗时主窗口已销毁，按「继续」处理")
+                finally:
+                    done.set()
+
+            _post_to_ui(_ask)
+            done.wait()
+            return answer["ok"]
+
+        return _confirm
+
     def _on_scan_finished(self, job_id, result):
         self._reset_scan_ui()
         if not result.cached_paths:
@@ -2679,8 +2717,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         exposure = getattr(self, "_exposure_state", None)
         total_pages = len(page_specs)
         # ★ 复审 A1-R1 ③：输出路径必须**唯一** —— 协调器给的文件名精度现已到
-        #   **毫秒**（秒级撞名已消除），但直存与会话落盘**共用同一个协调器 path**
-        #   ⇒ 两条入口仍可能拿到同一个 output_path ⇒ 毫秒精度救不了
+        #   **微秒**（秒级撞名已消除），但直存与会话落盘**共用同一个协调器 path**
+        #   ⇒ 两条入口仍可能拿到同一个 output_path ⇒ 微秒精度救不了
         #   ⇒ 仍需 GUI 侧兜底（_OutputNameGuard：改用 `{base}_1` 而不是覆盖）。
         output_path = _unique_output_path(result.output_path)
         # ★ 复审 A1-R1 ②：在途保存用**计数**登记（不是单个布尔标志）
@@ -2695,11 +2733,23 @@ class ScanApp(QMainWindow, _UiPostMixin):
         except Exception:       # pragma: no cover - 替身没有状态栏
             pass
 
+        # ★ PDF 体积门禁的确认回调（后台线程会调它 ⇒ 内部回主线程弹窗）。
+        #   直存是批次 4 之后才有的主路径，此前**漏接** ⇒ 超过 1.5GB 门禁时
+        #   用户看不到任何提示（终审 Important）。
+        #   getattr 兜底：既有测试的最小替身只借了几个方法，没有这个。
+        confirm = None
+        _maker = getattr(self, "_make_confirm_callback", None)
+        if _maker is not None:
+            try:
+                confirm = _maker()
+            except Exception as e:       # pragma: no cover - 极端情况
+                logger.debug("创建体积确认回调失败: %s", e)
+
         def _work():
             return _save_page_specs(
                 result.job_id, result.ext, output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs or [], device_name=dev_name,
-                device_ip=dev_ip, exposure=exposure)
+                device_ip=dev_ip, exposure=exposure, confirm=confirm)
 
         # 投递器必须在主线程创建（跨线程 emit 的接收端必须活在主线程）
         _ensure_ui_dispatcher()
@@ -3165,10 +3215,21 @@ class ScanApp(QMainWindow, _UiPostMixin):
         _refresh_scan_button(self)
         _ensure_ui_dispatcher()
 
+        # ★ PDF 体积门禁的确认回调（后台线程会调它 ⇒ 内部回主线程弹窗）。
+        #   会话落盘是批次 4 之后才有的主路径，此前**漏接** ⇒ 超过 1.5GB 门禁时
+        #   用户看不到任何提示（终审 Important）。
+        confirm = None
+        _maker = getattr(self, "_make_confirm_callback", None)
+        if _maker is not None:
+            try:
+                confirm = _maker()
+            except Exception as e:       # pragma: no cover - 极端情况
+                logger.debug("创建体积确认回调失败: %s", e)
+
         def _work():
             return save_manager.save_session(
                 session, out_path=out_path, extra_dirs=extra_dirs,
-                device_name=dev_name, device_ip=dev_ip)
+                device_name=dev_name, device_ip=dev_ip, confirm=confirm)
 
         _run_in_background(_work, self._on_session_saved,
                            self._on_session_save_error, label="会话落盘")
