@@ -646,11 +646,17 @@ class _OutputNameGuard:
     """
     输出文件名唯一性守卫（GUI 侧兜底）。
 
-    ★ 复审 A1-R1 ③：协调器给的结果文件名精度**只到秒**
-      （`scan_coordinator.py:727`：`HP_Scan_%Y%m%d_%H%M%S.ext`）
+    ★ 复审 A1-R1 ③ 的由来：当时协调器给的结果文件名精度**只到秒**
       ⇒ 同一秒内完成的两批会算出**同一个文件名** ⇒ 后写的覆盖先写的。
-      协调器不在本文件的修改范围内 ⇒ GUI 侧兜底：给每批输出占一个
+      当时协调器不在本文件的修改范围内 ⇒ GUI 侧兜底：给每批输出占一个
       **没被占用**的 base（`{base}` → `{base}_1` → `{base}_2` …）。
+    ★ 现状（2026-10-21）：协调器侧的文件名精度已提到**毫秒**
+      （`scan_coordinator.py` 的 `HP_Scan_%Y%m%d_%H%M%S_%f`）⇒ 跨进程
+      撞名概率已极低；但本守卫**继续保留**：
+        - 同一毫秒内完成的两批（大批量扫描可能出现）仍会撞；
+        - 兜底是**跨实例共享**（模块级单例）+ 查磁盘 ⇒ 重名时改用 `{base}_1`，
+          而协调器的毫秒名会把上一次产物整个覆盖掉。
+      所以守卫不是冗余，是最后一道防线。
     ★ 占用记录**跨实例共享**（模块级单例）⇒ 同一进程里两次落盘不会撞名。
     """
 
@@ -3083,7 +3089,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
         out_dir = self.dir_entry.text() or self.output_dir
         ext = self.output_format_val or "pdf"
         return os.path.join(
-            out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+            out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
 
     def _save_session_now(self, session):
         """会话落盘（**后台线程**：几百页合并 PDF 要几十秒）"""
@@ -3352,7 +3358,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
                         for i, (data, ext) in enumerate(pages, 1):
                             cache_manager.write_page(job_id, i, data, ext)
                             del data
-                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
                         self._post_ui(lambda: self._show_multi_preview(
                             job_id, ext, output_path, len(pages), scanner))
                     else:
@@ -3375,7 +3381,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
                         cache_manager.register_job(job_id)
                         cache_path = cache_manager.write_page(job_id, 1, data, ext)
                         del data
-                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
                         self._post_ui(lambda: self._show_preview(
                             cache_path, ext, output_path, job_id, scanner))
                     else:
@@ -3643,7 +3649,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     out_dir = self.dir_entry.text() or self.output_dir
                     output_path = os.path.join(
                         out_dir,
-                        f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+                        f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
                     )
                     self._post_ui(lambda: self._show_preview(
                         cache_path, ext, output_path, job_id))

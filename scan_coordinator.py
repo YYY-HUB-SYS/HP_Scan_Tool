@@ -722,9 +722,11 @@ class ScanCoordinator(QObject):
                 _record_page_meta(job_id, 1, data, path, deskew_angle=angle)
                 self._note_skew(job_id, 1, angle, path, skew_streak, settings)
 
+            # 文件名精度到**毫秒**（原先只到秒 ⇒ 同一秒内完成的两批会互相覆盖）
+            # 与本文件 job_id 的口径（%Y%m%d_%H%M%S_%f）保持一致
             output_path = os.path.join(
                 output_dir,
-                f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+                f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
 
             result = ScanResult(
                 job_id=job_id, ext=ext, page_count=len(cached_paths),
