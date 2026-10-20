@@ -253,7 +253,7 @@ M232 系列 ApolloLedmServer 固件创建 ScanJob 后立刻删除 job 记录，�
 
 #### 2.4.3 PDF 合成
 
-**打印机永远只出图片，PDF 由本地合成**（`escl_engine.py:559` 的口径）：选 PDF 时请求层仍要 `image/jpeg`（`REQUEST_FORMAT["pdf"] = ("image/jpeg", "pdf")`），落盘层再用 Pillow 把图片合成为 PDF：
+**打印机永远只出图片，PDF 由本地合成**（`escl_engine.py:562` 的口径）：选 PDF 时请求层仍要 `image/jpeg`（`REQUEST_FORMAT["pdf"] = ("image/jpeg", "pdf")`），落盘层再用 Pillow 把图片合成为 PDF：
 
 ```
 execute_scan 返回 (jpeg_bytes, "jpg")        # 请求的是 jpg，落盘扩展名标为 pdf
@@ -265,7 +265,7 @@ save_manager._write_pdf()  ← 逐页 Image.open + 合成 A4 画布 + 保存 PDF
 返回 pdf_path
 ```
 
-> **2026-10-21 订正**：本节原写「引擎用 Pillow 把 JPEG 转为 PDF」，流程图里的 `scan_to_file 检测 output_format="pdf" && ext!="pdf"` 随 `scan_to_file()` 一起于 `50aeb59` 删除。现在**引擎层零 PDF 转换**，转换点唯一且在 `save_manager._write_pdf()`（`save_manager.py:630`）。
+> **2026-10-21 订正**：本节原写「引擎用 Pillow 把 JPEG 转为 PDF」，流程图里的 `scan_to_file 检测 output_format="pdf" && ext!="pdf"` 随 `scan_to_file()` 一起于 `50aeb59` 删除。现在**引擎层零 PDF 转换**，转换点唯一且在 `save_manager._write_pdf()`（`save_manager.py:662`）。
 
 #### 2.4.4 ADF 自动检测
 
@@ -397,7 +397,7 @@ CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 
 #### 2.6.2 主题系统
 
-> ⚠️ **v3.1 遗留（整节失效）**：全仓 `*.py` 搜 `theme` **零命中**，`ctk.set_appearance_mode()` 在 v4.0 不存在，配置里也没有 `theme` 键。v4.0 是**单主题**（`resources/styles/app.qss` + `hp_scan_gui_pyside.py:89 COLORS`）。
+> ⚠️ **v3.1 遗留（整节失效）**：全仓 `*.py` 搜 `theme` **零命中**，`ctk.set_appearance_mode()` 在 v4.0 不存在，配置里也没有 `theme` 键。v4.0 是**单主题**（`resources/styles/app.qss` + `hp_scan_gui_pyside.py:152 COLORS`）。
 
 | 属性 | 值 |
 |------|---|
@@ -794,7 +794,7 @@ REQUEST_FORMAT = {
 
 ## 7. UI 规范
 
-> ⚠️ **v3.1 遗留**：本节整体描述 v3.1 的 CustomTkinter UI（`[light│dark]` 切换、`gray55`/`gray40`、`CTkToplevel`、`messagebox.*`）。v4.0 已迁移到 **PySide6**（`hp_scan_gui_pyside.py`）：**无主题切换**、卡片配色取自 `hp_scan_gui_pyside.py:89 COLORS`、对话框用 `QDialog`、提示用 `QMessageBox.*`。以下条目凡点名 `ctk.*` / `CTk*` / `messagebox.*` 的，一律**以代码为准**。
+> ⚠️ **v3.1 遗留**：本节整体描述 v3.1 的 CustomTkinter UI（`[light│dark]` 切换、`gray55`/`gray40`、`CTkToplevel`、`messagebox.*`）。v4.0 已迁移到 **PySide6**（`hp_scan_gui_pyside.py`）：**无主题切换**、卡片配色取自 `hp_scan_gui_pyside.py:152 COLORS`、对话框用 `QDialog`、提示用 `QMessageBox.*`。以下条目凡点名 `ctk.*` / `CTk*` / `messagebox.*` 的，一律**以代码为准**。
 
 ### 7.1 布局结构
 
@@ -829,7 +829,7 @@ REQUEST_FORMAT = {
 | 未选中 | `gray55` / `gray40` | 1px |
 | 选中 | `#3B8ED0` / `#1F6AA5` | 2px |
 
-> ⚠️ `gray55` / `gray40` 是 CustomTkinter 的颜色名，v4.0 实际取自 `hp_scan_gui_pyside.py:89 COLORS`（单主题）。
+> ⚠️ `gray55` / `gray40` 是 CustomTkinter 的颜色名，v4.0 实际取自 `hp_scan_gui_pyside.py:152 COLORS`（单主题）。
 
 ### 7.3 对话框
 

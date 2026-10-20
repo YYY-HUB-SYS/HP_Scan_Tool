@@ -203,15 +203,15 @@ preset_manager.py (在用)
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| 深色/浅色主题 | ⚠️ v3.1 遗留 | **v4.0 无主题机制** —— 全仓 `*.py` 搜 `theme` 零命中，GUI 是单主题（`hp_scan_gui_pyside.py:89 COLORS` + `resources/styles/app.qss`），既无切换控件也无 `theme` 配置键。PRD §2.6.2 已把整节标为 v3.1 遗留 |
+| 深色/浅色主题 | ⚠️ v3.1 遗留 | **v4.0 无主题机制** —— 全仓 `*.py` 搜 `theme` 零命中，GUI 是单主题（`hp_scan_gui_pyside.py:152 COLORS` + `resources/styles/app.qss`），既无切换控件也无 `theme` 配置键。PRD §2.6.2 已把整节标为 v3.1 遗留 |
 | 打印机自定义名称 | ✅ | 按 IP 关联，配置持久化 |
 | 打印机优先级排序 | ✅ | ▲▼ 按钮调整顺序，重启后记住 |
 | 扫描仪选中持久化 | ✅ | 按 IP 恢复上次选中的扫描仪 |
-| 任务栏图标清晰 | ✅ | PySide6 实际走 `QIcon`：`get_resource_path("icons/icon_64.png")`（`hp_scan_gui_pyside.py:1101`）。⚠️ `iconphoto` 是 CustomTkinter 的 API，v4.0 已不存在 |
+| 任务栏图标清晰 | ✅ | PySide6 实际走 `QIcon`：`get_resource_path("icons/icon_64.png")`（`hp_scan_gui_pyside.py:203`）。⚠️ `iconphoto` 是 CustomTkinter 的 API，v4.0 已不存在 |
 | 任务栏图标不闪烁 | ⚠️ v3.1 遗留 | v4.0 **没有** `SetCurrentProcessExplicitAppUserModelID` 调用（全仓零命中），未做显式任务栏分组设置 |
 | 窗口防逐帧渲染 | ✅ | withdraw → build → update_idletasks → deiconify |
 | 嵌入式字体 | ✅ | AddFontResourceExW 私有加载，ClearType 优化 |
-| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:360`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
+| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:375`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
 | 页面删除 | ✅ | 多页预览中删除不需要的页面 |
 | 并发扫描 | ⚠️ 后端支持 / GUI 未开放 | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:305-306`）；但 GUI 扫描期间 `scan_btn.setEnabled(False)`（`hp_scan_gui_pyside.py:1851`）、只跟踪单个 `_current_job_id` ⇒ **GUI 上一次只能扫一台**，与 `PRD.md` §13「单线程扫描，不支持并发」一致 |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
@@ -258,7 +258,7 @@ GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）*
 
 ### 5.1 图标方案（经过大量迭代）
 
-**v4.0 实际方案**：PySide6 `QIcon` + PNG 资源 —— `hp_scan_gui_pyside.py:1101` `get_resource_path(os.path.join("icons", "icon_64.png"))`
+**v4.0 实际方案**：PySide6 `QIcon` + PNG 资源 —— `hp_scan_gui_pyside.py:203` `get_resource_path(os.path.join("icons", "icon_64.png"))`
 
 > ⚠️ **2026-10-21 订正**：本节原先描述的是 **CustomTkinter（v3.1）** 方案 —— `iconphoto(True/False, Npx PNG)`、`SetProcessDpiAwareness(2)`、`SetCurrentProcessExplicitAppUserModelID("HP.ScanTool.v4.0")`。这三个 API 在 v4.0（PySide6）代码里**全部不存在**：全仓 `*.py` 搜 `iconphoto|SetProcessDpiAwareness|SetCurrentProcessExplicitAppUserModelID` 只命中 `hp_scan_gui_pyside.py:4154` 的一句**注释**（"提前设置环境变量可抑制 Qt 内部的 SetProcessDpiAwarenessContext 警告"），不是实现。
 > 下半段的**经验教训仍然有效**，但**机制部分一律以代码为准**。
