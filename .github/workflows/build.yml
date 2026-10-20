@@ -9,6 +9,31 @@ on:
     branches: [ main ]
 
 jobs:
+  # 测试门禁：与打包并行、互不阻塞。
+  # test 失败会让本次 workflow 标红（CI 界面可见红色 test job），
+  # 但 build 不依赖 test，打包与产物上传照常执行。
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   build:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -20,7 +45,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Install dependencies
         run: |
