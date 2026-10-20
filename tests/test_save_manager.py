@@ -362,7 +362,13 @@ class TestPdfOutput:
         assert dt < 60, f"20 页合成耗时过长: {dt:.1f}s"
 
     def test_tmp_files_cleaned(self, tmp_path, jpg, isolated, monkeypatch):
-        """阶段一的单页 PDF 临时文件用完即删，系统临时目录不留残留。"""
+        """阶段一的单页 PDF 临时文件用完即删，**本次运行的**临时目录不留残留。
+
+        ★ 断言范围限定在本次运行自己的目录（tmp_path）：
+        旧写法去扫**系统共享临时目录**（tempfile.gettempdir()）里所有
+        "hp_scan_pdf_" 前缀的残留 —— 别的进程、别的 pytest 会话同时在做 PDF 合并
+        就会互相干扰，出现**假红**（单独重跑即过，核销第一轮就撞上过）。
+        """
         import tempfile
 
         created = []
@@ -381,9 +387,9 @@ class TestPdfOutput:
         assert created, "应当创建过临时目录"
         for d in created:
             assert not os.path.exists(d), f"临时目录未清理: {d}"
-        leftovers = [p for p in os.listdir(tempfile.gettempdir())
-                     if p.startswith("hp_scan_pdf_")]
-        assert not leftovers, f"系统临时目录有残留: {leftovers}"
+        # 只扫本次运行的临时目录（mkdtemp 默认前缀 "tmp"），不扫系统共享目录
+        leftovers = [p for p in os.listdir(str(tmp_path)) if p.startswith("tmp")]
+        assert not leftovers, f"本次运行的临时目录有残留: {leftovers}"
 
     def test_page_meta_removed_after_save(self, tmp_path, jpg, isolated):
         """保存后该 job 的页元数据必须一并清理。"""

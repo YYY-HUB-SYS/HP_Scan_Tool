@@ -7,10 +7,80 @@ manual 模式: channel_gains → shadows/highlights → gamma → brightness/con
 
 import io
 import logging
+import math
 
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+# ── 曝光参数的合法域 ──────────────────────────────────────────────────
+# 与 GUI 滑块范围一致（hp_scan_gui_pyside._SLIDER_SPECS）：
+#   明暗/对比度/阴影/高光 -100~100、gamma 0.1~3.0、通道增益 0.5~1.5。
+# 超出合法域的输入**回落默认值**，不抛异常 —— 预设 JSON 是用户可编辑的，
+# 一个坏数字不该让整批保存整批失败。
+PARAM_MIN = -100
+PARAM_MAX = 100
+GAMMA_MIN = 0.1
+GAMMA_MAX = 3.0
+DEFAULT_GAMMA = 1.0
+DEFAULT_GAINS = (1.0, 1.0, 1.0)
+
+
+def sanitize_number(value, default, lo=None, hi=None, name="参数") -> float:
+    """
+    把外部数值安全地转成 float。
+
+    规则（**回落**，不抛）：
+      - None / 布尔 / 非数字字符串 / NaN / Inf ⇒ default
+      - 数字字符串（"12" / "1.5"）⇒ 正常转换（预设 JSON 里可能是字符串）
+      - 超出合法域 [lo, hi] ⇒ default（默认值本身就是"什么都不做"）
+
+    仍然抛 TypeError 的唯一情况：**类型完全不对**（dict / list / 自定义对象）——
+    那是内部契约被破坏，不是外部脏数据，不该被静默吞掉。
+    """
+    if value is None or isinstance(value, bool):
+        return float(default)
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return float(default)
+    else:
+        raise TypeError(f"{name} 的类型不对: {type(value).__name__}")
+    if not math.isfinite(number):
+        return float(default)
+    if lo is not None and number < lo:
+        return float(default)
+    if hi is not None and number > hi:
+        return float(default)
+    return number
+
+
+def sanitize_int(value, default=0, lo=None, hi=None, name="参数") -> int:
+    """sanitize_number 的整数版（截断，与旧的 int(...) 语义一致）。"""
+    return int(sanitize_number(value, default, lo, hi, name))
+
+
+def sanitize_gains(value, default=DEFAULT_GAINS) -> tuple:
+    """
+    通道增益必须是**恰好 3 个有限数字**；否则整组回落默认值。
+
+    长度不对（2 个 / 4 个）曾经让 Image.merge 抛
+    "ValueError: wrong number of bands"，把整次保存带崩。
+    """
+    if value is None or isinstance(value, (str, bytes)):
+        return tuple(default)
+    try:
+        gains = tuple(float(g) for g in value)
+    except (TypeError, ValueError):
+        return tuple(default)
+    if len(gains) != 3:
+        return tuple(default)
+    if not all(math.isfinite(g) for g in gains):
+        return tuple(default)
+    return gains
 
 
 def _auto_enhance(img: Image.Image) -> Image.Image:
@@ -56,6 +126,9 @@ def _auto_enhance(img: Image.Image) -> Image.Image:
 
 def _gamma_lut(gamma: float) -> list:
     """生成 gamma 校正 LUT。gamma > 1 变亮，< 1 变暗。"""
+    # 非法 gamma（0 / 负数 / 非数字）⇒ 回落 1.0 —— 否则 1.0/gamma 会除零、
+    # 0.0 ** 负数会抛 ZeroDivisionError。
+    gamma = sanitize_number(gamma, DEFAULT_GAMMA, GAMMA_MIN, GAMMA_MAX, "gamma")
     inv = 1.0 / gamma
     return [max(0, min(255, int(255 * ((v / 255) ** inv)))) for v in range(256)]
 
@@ -92,9 +165,27 @@ def apply_exposure(img: Image.Image, mode: str = "off",
     auto: 高斯模糊除法去灰底
     manual: channel_gains → shadows/highlights → gamma → brightness/contrast
     直接操作 PIL Image 对象，避免 bytes 序列化往返。
+
+    ★ **非法参数回落默认值，不抛异常**（N3）：
+      gamma 非数字 / ≤0 / 超出 [0.1, 3.0] ⇒ 1.0；
+      通道增益长度 ≠ 3 或含非数字 ⇒ (1.0, 1.0, 1.0)；
+      明暗 / 对比度 / 阴影 / 高光 非数字 ⇒ 0（超范围也 ⇒ 0）；
+      未知 mode ⇒ "off"（原样返回）。
+      理由：预设 JSON 由用户编辑，一个坏数字不该让整批扫描件保存失败。
+      **类型完全不对**（dict / list 之类）仍抛 TypeError —— 那是内部契约破坏。
     """
-    if mode == "off":
+    mode = mode.strip().lower() if isinstance(mode, str) else ""
+    if mode not in ("auto", "manual"):
+        # "off" 与未知 mode 都原样返回（未知 mode 不该被当成 manual 偷偷改像素）
         return img
+
+    # 数值参数净化：非法 ⇒ 回落默认值（外部脏数据不炸，内部契约破坏仍抛）
+    brightness = sanitize_int(brightness, 0, PARAM_MIN, PARAM_MAX, "brightness")
+    contrast = sanitize_int(contrast, 0, PARAM_MIN, PARAM_MAX, "contrast")
+    shadows = sanitize_int(shadows, 0, PARAM_MIN, PARAM_MAX, "shadows")
+    highlights = sanitize_int(highlights, 0, PARAM_MIN, PARAM_MAX, "highlights")
+    gamma = sanitize_number(gamma, DEFAULT_GAMMA, GAMMA_MIN, GAMMA_MAX, "gamma")
+    channel_gains = sanitize_gains(channel_gains)
 
     # 确保图像模式为 RGB 或 L（扫描仪可能产出 P/PA 等非标准模式）
     if img.mode not in ("RGB", "L"):

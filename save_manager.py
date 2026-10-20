@@ -28,7 +28,9 @@ from PIL import Image, UnidentifiedImageError
 import cache_manager
 import history_manager
 import page_meta
-from exposure import apply_exposure
+from exposure import (DEFAULT_GAMMA, DEFAULT_GAINS, GAMMA_MAX, GAMMA_MIN,
+                      PARAM_MAX, PARAM_MIN, apply_exposure, sanitize_gains,
+                      sanitize_int, sanitize_number)
 
 try:
     from pypdf import PdfWriter
@@ -155,12 +157,38 @@ def build_output_name(base: str, ext: str, group_count: int,
     return f"{base}_{group_index:03d}_{in_group_seq:03d}.{ext}"
 
 
+def _int_param(exposure, key: str) -> int:
+    """净化层取值：标量参数非法 ⇒ 回落 0；类型完全不对 ⇒ 也回落 0。
+
+    这里是**外部输入边界**（预设 JSON / GUI 回填），什么脏值都可能出现，
+    因此这里不抛 —— 引擎层（exposure.apply_exposure）仍然对类型错误抛 TypeError。
+    """
+    try:
+        return sanitize_int(exposure.get(key), 0, PARAM_MIN, PARAM_MAX, key)
+    except TypeError:
+        return 0
+
+
+def _gamma_param(exposure) -> float:
+    """净化层取值：gamma 非法 ⇒ 回落 1.0（不抛）。"""
+    try:
+        return sanitize_number(exposure.get("gamma"), DEFAULT_GAMMA,
+                               GAMMA_MIN, GAMMA_MAX, "gamma")
+    except TypeError:
+        return DEFAULT_GAMMA
+
+
 def _exposure_params(exposure) -> dict | None:
     """
     把曝光参数字典规范化成 apply_exposure 的 kwargs。
 
     返回 None 表示「曝光不生效」——此时调用方必须走与改造前完全一致的路径，
     保证 exposure=None / mode="off" 时产物逐字节不变（向后兼容）。
+
+    ★ **净化层**（N3）：这一层与引擎层（exposure.apply_exposure）**都要**挡住
+    非法值 —— 预设 JSON 由用户编辑，gamma="abc" / gamma=-1 / brightness="x"
+    这类脏值不能一路传到引擎，更不能让整次保存失败。
+    这里的净化结果同时决定「曝光是否生效」（见 save_pages 的快路径判断）。
     """
     if not exposure:
         return None
@@ -168,22 +196,15 @@ def _exposure_params(exposure) -> dict | None:
     if mode not in ("auto", "manual"):
         return None
 
-    gains = exposure.get("channel_gains") or (1.0, 1.0, 1.0)
-    try:
-        gains = tuple(float(g) for g in gains)
-    except (TypeError, ValueError):
-        gains = (1.0, 1.0, 1.0)
-    if len(gains) != 3:
-        gains = (1.0, 1.0, 1.0)
-
     return {
         "mode": mode,
-        "brightness": int(exposure.get("brightness") or 0),
-        "contrast": int(exposure.get("contrast") or 0),
-        "gamma": float(exposure.get("gamma") or 1.0),
-        "shadows": int(exposure.get("shadows") or 0),
-        "highlights": int(exposure.get("highlights") or 0),
-        "channel_gains": gains,
+        "brightness": _int_param(exposure, "brightness"),
+        "contrast": _int_param(exposure, "contrast"),
+        "gamma": _gamma_param(exposure),
+        "shadows": _int_param(exposure, "shadows"),
+        "highlights": _int_param(exposure, "highlights"),
+        "channel_gains": sanitize_gains(exposure.get("channel_gains"),
+                                        DEFAULT_GAINS),
     }
 
 
@@ -202,6 +223,32 @@ def _read_cache_image(cache_file: str) -> Image.Image:
     """把缓存页读进内存（脱离文件句柄）。返回**新**图像，调用方负责 close()。"""
     with Image.open(cache_file) as src:
         return src.copy()
+
+
+def _is_intact_jpeg(path: str) -> bool:
+    """
+    轻量校验缓存页是不是一张**完整**的 JPEG（只看头尾，不解码像素）。
+
+    快路径（jpg 直接复制原始字节）必须先过这一关：否则损坏的缓存页
+    （写盘中断 / 被截断 / 其实是 PDF 字节）会被原样复制成 .jpg 交付给用户，
+    而调用方看到的 failed_pages=0 —— **静默交付坏文件**（N2）。
+
+    判据：
+      - 头 3 字节 = FFD8FF（SOI）
+      - 尾部若干字节里能找到 FFD9（EOI）—— 允许文件末尾有少量填充字节
+    代价恒定（两次小读），几百页也只是毫秒级。
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.read(3) != b"\xff\xd8\xff":
+                return False
+            try:
+                f.seek(-64, os.SEEK_END)
+            except OSError:      # 文件比 64 字节还小
+                return False
+            return b"\xff\xd9" in f.read()
+    except OSError:
+        return False
 
 
 def _expose_and_rotate(img: Image.Image, rotation: int, exposure) -> Image.Image:
@@ -236,14 +283,24 @@ def _a4_canvas(img, dpi: int = 300) -> Image.Image:
     返回值**可能是入参本身**（入参已是 RGB 且尺寸恰好等于 A4 画布时），
     调用方必须用 `canvas is not img` 判断所有权，不能无条件 close() 入参。
     单页 PDF 与多页 PDF 共用这一个函数 —— 两者页面尺寸一致由此保证。
+
+    ★ **返回值必须是「可继续使用」的图像**（N1）：
+    旧实现把"即将返回的那张图"也放进了 finally 的 close() 里 ——
+    灰度/黑白页（mode != "RGB"）恰好是 A4 尺寸时，返回的是一张**已关闭**的图，
+    调用方 canvas.save() 抛 "Operation on closed image"，
+    于是灰度 A4 页在多页 PDF 里被**整页静默丢弃**、单页时直接报错。
+    现在：**尺寸精确匹配的分支提前 return，不经过 close 逻辑**；
+    只有"新建画布"那条路径才 close 中间产物（像素已复制进画布，close 无害）。
     """
     a4_w = int(210 / 25.4 * dpi)
     a4_h = int(297 / 25.4 * dpi)
     w, h = img.size
     rgb = img if img.mode == "RGB" else img.convert("RGB")
+    if w == a4_w and h == a4_h:
+        # 尺寸精确匹配 ⇒ 直接返回（可能是入参本身，也可能是转换后的副本）。
+        # ★ 这里**不能** close()：返回值的所有权交给调用方。
+        return rgb
     try:
-        if w == a4_w and h == a4_h:
-            return rgb
         canvas = Image.new("RGB", (a4_w, a4_h), "white")
         if w > a4_w or h > a4_h:
             # 源图大于画布 ⇒ 等比缩小后居中（绝不裁切）
@@ -565,10 +622,15 @@ def save_pages(job_id: str, ext: str, output_path: str,
                 cache_file, rotation = page_specs[page_idx]
                 try:
                     fpath = build_output_name(base, ext, group_count, gi, seq)
-                    if ext in ("jpg", "jpeg") and not rotation and not exposure_active:
+                    if (ext in ("jpg", "jpeg") and not rotation
+                            and not exposure_active
+                            and _is_intact_jpeg(cache_file)):
                         # 无曝光且无旋转 ⇒ 直接复制原始字节（快路径，逐字节一致）
                         shutil.copy2(cache_file, fpath)
                     else:
+                        # 快路径的前置条件不满足（曝光/旋转，或缓存页不是完整 JPEG）
+                        # ⇒ 走解码路径：能解码就正常落盘，解不开就由下面的
+                        #    except 计入 failed_pages —— **绝不谎报成功**（N2）。
                         img = _open_page_image(cache_file, rotation, exposure)
                         try:
                             _write_image(img, fpath, ext)
@@ -582,7 +644,12 @@ def save_pages(job_id: str, ext: str, output_path: str,
                     logger.warning("保存页失败 [%s]: %s", cache_file, e)
 
     # 一页都没存下来时必须报错：否则调用方（GUI）会"提示成功但产出 0 个文件"
-    if not saved_files and page_specs:
+    # ★ 空页列表与"全部失败"同等对待（N5）：旧写法 `and page_specs` 让
+    #   page_specs=[] 短路 ⇒ 返回 ok=False 的空 SaveResult，调用方只看
+    #   len(result) 就会误报成功。现在返回即非空：要么有文件，要么抛异常。
+    if not saved_files:
+        if not page_specs:
+            raise RuntimeError("没有可保存的页面（页列表为空）")
         raise RuntimeError(
             f"没有成功保存任何页面（共 {len(page_specs)} 页，失败 {failed_pages} 页）")
 
