@@ -27,6 +27,11 @@
 | `result.ext` | jpg | jpg | ✅ |
 | 缓存文件命名 | `page_001.jpg` | `page_001.jpg` | ✅ |
 | 落盘文件命名 | `HP_Scan_20261020_210142_001.jpg` | `HP_Scan_20261021_003626_001.jpg` | ✅ 同规则 |
+  > **2026-10-21 订正**：本行是 **基准采集脚本 `tools/verify_scan.py`** 的产物名
+  > （它自己造名 ⇒ 与 D1 逐字可比）。**应用本身**（协调器 / GUI / CLI）的产物名
+  > 已改为 `HP_Scan_<秒级时间戳>_<uuid 短后缀>_NNN.ext` —— 因 Windows 时钟粒度
+  > 只有 15.625 ms，同一 tick 内 `%f` 有 99.5% 相同 ⇒ 同 tick 的两批扫描
+  > 会算出同一文件名、后者静默覆盖前者（丢扫描产物、零报错）。详见 `742b84a`。
 | `device.escl_url` | `http://17.17.171.111:80/eSCL/` | 同 | ✅ |
 | `params.resolution` / `source` / `requested_pages` | 300 / Platen / 1 | 同 | ✅ |
 | **`device.model`** | **`""`（空）** | **`"HP LaserJet MFP M232dwc"`** | ⚠️ **有变更，原因是修复而非回归**（见下） |

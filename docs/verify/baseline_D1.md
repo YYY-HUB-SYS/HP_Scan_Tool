@@ -173,6 +173,14 @@ D1 基准按实际跑出的 report.json 记录为 `""`，不做美化。改造�
 - 格式：`pages[0].format == "JPEG"`，且 `result.ext == "jpg"`
 - 缓存文件命名 `page_NNN.ext`：实测 `page_001.jpg`
 - 落盘文件命名 `HP_Scan_<时间戳>_NNN.ext`：实测 `HP_Scan_20261020_210142_001.jpg`
+  > **2026-10-21 订正**：本条指的是 **基准采集脚本 `tools/verify_scan.py` 的产物**
+  > （它自己造名 ⇒ 与 D1/D2 的历史记录**逐字可比**，故 D1/D2 的实测值不变）。
+  > **应用本身**（协调器 / GUI / CLI）的产物名已改为
+  > `HP_Scan_<秒级时间戳>_<uuid 短后缀>_NNN.ext` —— 加随机后缀的原因是：
+  > **Windows 系统时钟粒度只有 15.625 ms**，同一 tick 内 `strftime("%f")` 有 **99.5% 相同**
+  > ⇒ 同一 tick 内完成的两批扫描会算出**同一个文件名**、后者**静默覆盖**前者
+  > ⇒ 丢的是**扫描产物**且**零报错**。（提交 `742b84a`；
+  > 此前 `30f8be1` 的「秒→微秒」并不足以避免撞名，根因是把时钟当唯一键。）
 - eSCL URL：`device.escl_url == "http://17.17.171.111:80/eSCL/"`
 - 扫描参数：`params.resolution == 300`、`params.source == "Platen"`、`params.requested_pages == 1`
 - 型号字段：`device.model == ""`（当前为空；若 D2 有变更须显式标注）
