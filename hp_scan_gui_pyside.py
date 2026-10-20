@@ -673,6 +673,34 @@ class LoadingDialog(QDialog):
         self.progress.setValue(value)
 
 
+# ────────── 缓存配置契约（GUI ↔ cache_manager）──────────
+# 缓存设置对话框读写的键名必须与 cache_manager._DEFAULTS 完全一致。
+# 历史缺陷：GUI 侧写的是 "limit_mb"，而 cache_manager 真实键是 "cache_limit_mb"
+# —— 用户改了上限保存后完全没效果。tests/test_gui_consistency.py 会断言两者一致。
+CACHE_SETTING_KEYS = ("cache_limit_mb", "trigger_ratio", "cleanup_mb", "stale_hours")
+
+# 历史版本误用过的键名：保存时一并清掉，避免残留在配置文件里误导排查
+_LEGACY_CACHE_KEYS = ("limit_mb",)
+
+
+def apply_cache_settings(config: dict, limit_mb: int, trigger_percent: int,
+                         cleanup_mb: int) -> dict:
+    """
+    把「缓存设置」对话框上的值写入缓存配置字典（原地修改并返回）。
+
+    键名严格取自 cache_manager._DEFAULTS —— GUI 与 cache_manager 之间只靠这一份
+    键名契约对齐，改名必须两边同时改。stale_hours 对话框不暴露，属于同一份配置
+    契约，这里做缺省补齐，保证写出的键集合与 _DEFAULTS 一致。
+    """
+    config["cache_limit_mb"] = int(limit_mb)
+    config["trigger_ratio"] = float(trigger_percent) / 100.0
+    config["cleanup_mb"] = int(cleanup_mb)
+    config.setdefault("stale_hours", cache_manager._DEFAULTS["stale_hours"])
+    for legacy in _LEGACY_CACHE_KEYS:
+        config.pop(legacy, None)
+    return config
+
+
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow):
     """主窗口（UI 优化版）"""
@@ -998,6 +1026,7 @@ class ScanApp(QMainWindow):
 
         # 直接保存（跳过预览）
         self.direct_save_check = QCheckBox("直接保存（跳过预览）")
+        self._sync_direct_save_checkbox()
         self.direct_save_check.stateChanged.connect(self._on_direct_save_changed)
         params_layout.addWidget(self.direct_save_check, 5, 0, 1, 2)
 
@@ -1162,6 +1191,18 @@ class ScanApp(QMainWindow):
         self.direct_save_val = bool(state)
         self.cfg["direct_save"] = self.direct_save_val
         save_config(self.cfg)
+
+    def _sync_direct_save_checkbox(self):
+        """
+        复选框显示状态必须与实际生效状态一致。
+
+        direct_save_val 来自配置（上次退出时的勾选状态），而复选框默认未勾选
+        —— 不对齐的话会出现"框是灰的、实际却在直接保存"的错觉。屏蔽信号避免
+        启动时多写一次配置文件。
+        """
+        self.direct_save_check.blockSignals(True)
+        self.direct_save_check.setChecked(bool(self.direct_save_val))
+        self.direct_save_check.blockSignals(False)
 
     def _update_duplex_visibility(self):
         """根据来源更新双面复选框可见性（自动模式也视作可能使用ADF）"""
@@ -1488,12 +1529,45 @@ class ScanApp(QMainWindow):
             self.status_bar.showMessage("扫描未产生任何页面")
             return
         scanner = self.selected
+        # 「直接保存」勾选 ⇒ 跳过预览对话框，直接落盘
+        if self.direct_save_val:
+            self._direct_save_result(result)
+            return
         if result.page_count > 1:
             self._show_multi_preview(result.job_id, result.ext, result.output_path,
                                     result.page_count, scanner)
         else:
             self._show_preview(result.cached_paths[0], result.ext, result.output_path,
                               result.job_id, scanner)
+
+    def _direct_save_result(self, result):
+        """
+        「直接保存」模式：跳过预览，直接把缓存页落盘。
+
+        save_pages 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
+        设备名/IP 取自当前选中设备；未选中设备时留空，不报错。
+        """
+        scanner = self.selected
+        dev_name = (scanner.model or "") if scanner else ""
+        dev_ip = (scanner.ip or "") if scanner else ""
+        page_specs = [(path, 0) for path in result.cached_paths]
+        groups = [list(range(len(page_specs)))]
+        try:
+            saved_files = save_manager.save_pages(
+                result.job_id, result.ext, result.output_path, page_specs, groups,
+                extra_dirs=self.extra_dirs or [], device_name=dev_name,
+                device_ip=dev_ip)
+        except Exception as e:
+            logger.error("直接保存失败: %s", e, exc_info=True)
+            QMessageBox.critical(self, "保存失败", f"直接保存失败: {e}")
+            self.status_bar.showMessage("直接保存失败")
+            return
+        if not saved_files:
+            self.status_bar.showMessage("直接保存未产生文件")
+            return
+        saved = saved_files[0]
+        self.status_bar.showMessage(f"已保存到 {saved}")
+        QMessageBox.information(self, "保存完成", f"已保存到:\n{saved}")
 
     def _on_scan_failed(self, job_id, error):
         self._reset_scan_ui()
@@ -1896,7 +1970,7 @@ class ScanApp(QMainWindow):
         limit_layout.addWidget(QLabel("缓存限制 (MB):"))
         limit_spin = QSpinBox()
         limit_spin.setRange(100, 5000)
-        limit_spin.setValue(config.get("limit_mb", 1024))
+        limit_spin.setValue(config.get("cache_limit_mb", cache_manager._DEFAULTS["cache_limit_mb"]))
         limit_layout.addWidget(limit_spin)
         layout.addLayout(limit_layout)
 
@@ -1905,7 +1979,7 @@ class ScanApp(QMainWindow):
         trigger_layout.addWidget(QLabel("触发比例 (%):"))
         trigger_spin = QSpinBox()
         trigger_spin.setRange(50, 99)
-        trigger_spin.setValue(int(config.get("trigger_ratio", 0.95) * 100))
+        trigger_spin.setValue(int(config.get("trigger_ratio", cache_manager._DEFAULTS["trigger_ratio"]) * 100))
         trigger_layout.addWidget(trigger_spin)
         layout.addLayout(trigger_layout)
 
@@ -1914,7 +1988,7 @@ class ScanApp(QMainWindow):
         cleanup_layout.addWidget(QLabel("清理大小 (MB):"))
         cleanup_spin = QSpinBox()
         cleanup_spin.setRange(50, 500)
-        cleanup_spin.setValue(config.get("cleanup_mb", 200))
+        cleanup_spin.setValue(config.get("cleanup_mb", cache_manager._DEFAULTS["cleanup_mb"]))
         cleanup_layout.addWidget(cleanup_spin)
         layout.addLayout(cleanup_layout)
 
@@ -1934,9 +2008,8 @@ class ScanApp(QMainWindow):
         layout.addLayout(btn_layout)
 
         def _save():
-            config["limit_mb"] = limit_spin.value()
-            config["trigger_ratio"] = trigger_spin.value() / 100.0
-            config["cleanup_mb"] = cleanup_spin.value()
+            apply_cache_settings(config, limit_spin.value(), trigger_spin.value(),
+                                 cleanup_spin.value())
             cache_manager.save_cache_config(config)
             self.status_bar.showMessage("缓存设置已保存")
             dialog.accept()
@@ -2156,6 +2229,26 @@ class PreviewDialog(QDialog):
             QMessageBox.critical(self, "保存失败", str(e))
 
 
+def adjust_splits_after_delete(splits, page_idx: int):
+    """
+    删除第 page_idx 页（0 基索引）后调整分组分割点。
+
+    语义与 scan_coordinator.delete_cached_page 完全一致：
+      - sp <  page_idx → 保留（该分割点之前的页不受影响）
+      - sp == page_idx → 移除（分割点正好落在被删页上）
+      - sp >  page_idx → 前移 1（被删页之后的页号整体前移，分割点同步前移）
+
+    splits 与 page_idx 都是「页列表下标」空间的量，与协调器一致。
+    """
+    new_splits = set()
+    for sp in splits:
+        if sp < page_idx:
+            new_splits.add(sp)
+        elif sp > page_idx:
+            new_splits.add(sp - 1)
+    return new_splits
+
+
 class MultiPagePreviewDialog(QDialog):
     """多页预览对话框（UI 优化版）"""
 
@@ -2371,6 +2464,7 @@ class MultiPagePreviewDialog(QDialog):
             return
 
         page_num = self.pages[self.selected_idx]
+        deleted_idx = self.selected_idx
         reply = QMessageBox.question(
             self, "确认", f"确定要删除第 {self.selected_idx + 1} 页吗？")
         if reply != QMessageBox.Yes:
@@ -2385,9 +2479,13 @@ class MultiPagePreviewDialog(QDialog):
             pass
 
         # 从列表中移除
-        self.pages.pop(self.selected_idx)
+        self.pages.pop(deleted_idx)
         self._rotations.pop(page_num, None)
         self._cropped.discard(page_num)
+
+        # 分组边界同步调整：页号前移 ⇒ 分割点前移；落在被删页上的分割点移除
+        # （与 scan_coordinator.delete_cached_page 语义一致）
+        self.splits = adjust_splits_after_delete(self.splits, deleted_idx)
 
         # 调整选中索引
         if self.selected_idx >= len(self.pages):
