@@ -32,3 +32,9 @@ env/
 # 系统
 Thumbs.db
 .DS_Store
+
+# 本地验证环境与产物
+.venv-local/
+.verify_out/
+dist_verify/
+build_verify/

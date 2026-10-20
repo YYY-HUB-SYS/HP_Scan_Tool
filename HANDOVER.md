@@ -105,8 +105,13 @@ hp_scan_gui_pyside.py (GUI 层 — PySide6)
   ├── MultiPagePreviewDialog   — 多页预览：缩略图 + 分组 + 批量保存
   └── HistoryDialog            — 扫描历史浏览器
 
-scan_coordinator.py (业务层)
-  └── ScanCoordinator          — 扫描仪发现/探活/扫描执行/缓存协调
+scan_coordinator.py (业务层 — 事件驱动，依赖 PySide6.QtCore)
+  └── ScanCoordinator(QObject) — 扫描仪发现/探活/扫描执行/缓存协调
+      ├── 信号 scan_started/progress/finished/failed/cancelled
+      └── QThreadPool 任务层，run_scan_sync 为同步可测体
+
+save_manager.py (I/O 层 — 纯 Python，不依赖 GUI)
+  └── save_pages / save_single — 落盘/分组命名/额外目录/清缓存/写历史
 
 escl_engine.py (协议层)        — eSCL/AirScan 完整实现
 wia_engine.py (协议层)         — WIA 降级方案
@@ -231,7 +236,7 @@ preset_manager.py (已停用)
 - 动态 import 的模块必须加入 hiddenimports
 - EXE 被占用时用 `--distpath` 指定不同目录绕过文件锁
 - spec 的 datas 打包字体/图标文件
-- 单文件 EXE 约 22MB
+- 单文件 EXE 约 62MB（2026-10-20 实测 64,968,184 字节）
 
 ---
 
@@ -290,7 +295,7 @@ preset_manager.py (已停用)
 |------|------|
 | M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，当前未跟随 |
 | 无扫描预览（原图查看） | 简化后的 PreviewDialog 只加载缩略图，不做全分辨率预览 |
-| 单文件 EXE 体积 | 约 22MB，包含所有依赖 |
+| 单文件 EXE 体积 | 约 62MB（2026-10-20 实测 64,968,184 字节），包含所有依赖 |
 | 无自动更新 | 当前版本无自动检查更新机制 |
 
 ---

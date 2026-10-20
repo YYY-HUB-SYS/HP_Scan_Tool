@@ -40,6 +40,7 @@ cmd = [
     "--hidden-import", "wsd_engine",
     "--hidden-import", "listen_engine",
     "--hidden-import", "scan_coordinator",
+    "--hidden-import", "save_manager",
     "--hidden-import", "cache_manager",
     "--hidden-import", "history_manager",
     "--hidden-import", "profile_manager",

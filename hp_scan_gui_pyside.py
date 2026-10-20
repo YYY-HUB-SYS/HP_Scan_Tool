@@ -8,10 +8,8 @@ import io
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
-import time
 from datetime import datetime
 from typing import Optional
 
@@ -62,7 +60,7 @@ logger.info(f"cwd={os.getcwd()}")
 
 # ────────── PySide6 导入 ──────────
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QTimer, QSize, QRectF, QPointF,
+    Qt, Signal, QTimer, QSize, QRectF, QPointF,
     QPropertyAnimation, QEasingCurve, QParallelAnimationGroup,
     QAbstractAnimation, QPoint, QRect,
 )
@@ -163,24 +161,6 @@ def load_embedded_font():
     font_path = get_resource_path(os.path.join("fonts", "NotoSansSC-Regular.ttf"))
     if os.path.exists(font_path):
         QFontDatabase.addApplicationFont(font_path)
-
-
-
-def save_as_a4_pdf(img, path, dpi=300):
-    """把图片居中放到 A4 画布上，保存为标准尺寸 PDF"""
-    a4_w = int(210 / 25.4 * dpi)  # A4 210mm @dpi
-    a4_h = int(297 / 25.4 * dpi)  # A4 297mm @dpi
-    w, h = img.size
-    if w != a4_w or h != a4_h:
-        canvas = Image.new("RGB", (a4_w, a4_h), "white")
-        x = (a4_w - w) // 2
-        y = (a4_h - h) // 2
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        canvas.paste(img, (x, y))
-        canvas.save(path, "PDF", resolution=dpi)
-    else:
-        img.convert("RGB").save(path, "PDF", resolution=dpi)
 
 
 def pil_to_qpixmap(img):
