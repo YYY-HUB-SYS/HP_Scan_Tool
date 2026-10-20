@@ -2,6 +2,12 @@
 扫描编排器 — HP Scan Tool v4.0
 从 hp_scan_gui 提取的业务逻辑层，不依赖 tkinter。
 负责: 配置持久化 / 扫描仪发现与探活 / 扫描执行与缓存 / 保存确认与历史。
+
+自动纠偏（批次 4）：
+- 每页写入缓存之后调用 skew_detect.estimate_skew 测一次倾斜角，
+  写进 page_meta.deskew_angle（**绝不旋转缓存原件**）
+- 连续 N 页角度超阈值 ⇒ 发 skew_warning 信号（弹窗由 GUI 侧接线）
+- 落盘时的实际纠偏由 save_manager 施加（曝光 → 旋转 → 纠偏 → A4 归一）
 """
 
 import copy
@@ -20,12 +26,14 @@ import cache_manager
 import config_io
 import history_manager
 import page_meta
+import skew_detect
 from escl_engine import (
     probe_escl, fetch_capabilities,
     probe_scanner_status, execute_scan, execute_multipage_scan,
     ScannerInfo,
     ScanCancelled as EngineScanCancelled,
 )
+from save_manager import (DESKEW_CONFIG_DEFAULTS, resolve_deskew_settings)
 from wsd_engine import discover_all_scanners
 
 logger = logging.getLogger(__name__)
@@ -212,6 +220,26 @@ def load_config() -> dict:
         return {}
 
 
+def apply_deskew_defaults(cfg: dict) -> bool:
+    """
+    把纠偏阈值的缺省值补进配置字典（就地修改）。返回**是否真的补了键**。
+
+    ★ 补了键才值得落盘（scan_config.json）：
+      deskew_enabled / deskew_apply_threshold / skew_warn_threshold /
+      skew_warn_consecutive —— 用户可在 GUI 里改，改完由 GUI 写回同一个文件。
+    ★ 默认值本体在 save_manager.DESKEW_CONFIG_DEFAULTS（唯一真源），
+      协调器与落盘层共用同一份语义，不会两处漂移。
+    """
+    if not isinstance(cfg, dict):
+        return False
+    changed = False
+    for key, default in DESKEW_CONFIG_DEFAULTS.items():
+        if key not in cfg:
+            cfg[key] = default
+            changed = True
+    return changed
+
+
 def save_config(cfg: dict) -> bool:
     """
     原子写入 scan_config.json。
@@ -257,6 +285,17 @@ class ScanCoordinator(QObject):
     # F-3：来源决策的**用户可见提示**（能力未确认 / 被回退到平板等）。
     # GUI 侧接线：连到状态栏或 QMessageBox（接线点在片 3 修复波次）。
     source_warning = Signal(str)
+    # ★ 批次 4：倾斜强提醒（自动纠偏接线）。
+    #   签名：skew_warning(job_id: str, page_no: int, angle: float, cache_path: str)
+    #     - job_id     ：该页所属的扫描任务 id
+    #     - page_no    ：页号（1 基，与 page_meta 的页号一致）
+    #     - angle      ：该页的纠偏角（度，PIL 角度语义，可直接施加）
+    #     - cache_path ：该页的缓存原件路径（弹窗预览图从这里离屏加载）
+    #   触发条件：**连续 N 页**（skew_warn_consecutive，默认 3）
+    #             角度绝对值 > skew_warn_threshold（默认 3.0°）。
+    #   ★ 在**工作线程**发出 ⇒ GUI 侧必须走现有的 `_UiPostMixin._post_ui`
+    #     投递到主线程，**不要**在工作线程里直接弹窗。
+    skew_warning = Signal(str, int, float, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -271,12 +310,28 @@ class ScanCoordinator(QObject):
     # ── 配置 ──
 
     def load_config(self):
-        self.cfg = load_config()
+        cfg = load_config()
+        changed = apply_deskew_defaults(cfg)
+        self.cfg = cfg
+        if changed:
+            # 纠偏阈值写进 scan_config.json（缺省值落盘，用户可在 GUI 里改）
+            self.save_config()
         return self.cfg
 
     def save_config(self):
         """保存配置。返回是否真的写入（False = 本次未存上）。"""
         return save_config(self.cfg)
+
+    def deskew_settings(self) -> dict:
+        """
+        取纠偏相关阈值（deskew_enabled / deskew_apply_threshold /
+        skew_warn_threshold / skew_warn_consecutive）。
+
+        优先用内存里的 self.cfg（GUI 启动时 load_config 读进来、用户改完也写回）；
+        self.cfg 为空时读一次配置文件。缺省/非法值一律回落默认值。
+        """
+        cfg = self.cfg if isinstance(self.cfg, dict) and self.cfg else load_config()
+        return resolve_deskew_settings(cfg)
 
     def set_custom_name(self, ip: str, name: str):
         """设置设备自定义名称"""
@@ -498,6 +553,30 @@ class ScanCoordinator(QObject):
             return "Feeder", True, None
         return "Platen", False, None
 
+    def _note_skew(self, job_id: str, page_no: int, angle: float,
+                   cache_path: str, streak: int, settings: dict) -> int:
+        """
+        累计"连续超阈值"的页数；攒够 N 页就发一次 skew_warning。返回新的计数。
+
+        规则（与 brief 一致）：
+          - 只有 deskew_enabled=True 时才提醒（关掉总开关 ⇒ 只检测不纠偏也不提醒）
+          - 角度绝对值 **>** skew_warn_threshold 才算"歪"（严格大于）
+          - **连续** N 页都歪 ⇒ 发信号；中间只要有一页不歪，连续计数清零
+          - 提醒后计数清零 ⇒ 每连续 N 页提醒一次，不会连着刷屏
+            （GUI 侧另有"本批次不再提醒"的标志位，由 GUI 负责）
+        """
+        if not settings.get("deskew_enabled"):
+            return 0
+        if angle is None or abs(angle) <= settings.get("skew_warn_threshold", 3.0):
+            return 0
+        streak += 1
+        if streak >= settings.get("skew_warn_consecutive", 3):
+            self.skew_warning.emit(job_id, page_no, float(angle), cache_path)
+            logger.warning("连续 %d 页倾斜超阈值，页 %d 角度 %.2f°",
+                           streak, page_no, angle)
+            return 0
+        return streak
+
     def run_scan_sync(self, scanner, params: dict, cancel_event=None,
                       job_id: str = None) -> ScanResult:
         """
@@ -536,6 +615,12 @@ class ScanCoordinator(QObject):
             cached_paths = []
             ext = output_format
 
+            # ── 自动纠偏（批次 4）────────────────────────────────────
+            # 每页写入缓存之后检测一次倾斜角，写进 page_meta.deskew_angle；
+            # 连续 N 页超阈值时发 skew_warning（弹窗由 GUI 侧接线）。
+            settings = self.deskew_settings()
+            skew_streak = 0
+
             if source == "Feeder":
                 def _progress(n, _total):
                     self.scan_progress.emit(job_id, f"已扫描 {n} 页", n)
@@ -554,7 +639,12 @@ class ScanCoordinator(QObject):
                     ext = page_ext
                     path = cache_manager.write_page(job_id, i, data, page_ext)
                     cached_paths.append(path)
-                    _record_page_meta(job_id, i, data, path)
+                    _check_cancel(cancel_event, job_id)
+                    angle = _estimate_page_skew(data)
+                    _check_cancel(cancel_event, job_id)
+                    _record_page_meta(job_id, i, data, path, deskew_angle=angle)
+                    skew_streak = self._note_skew(job_id, i, angle, path,
+                                                 skew_streak, settings)
             else:
                 data, ext = execute_scan(
                     scanner=scanner, resolution=resolution, color_mode=color_mode,
@@ -565,7 +655,11 @@ class ScanCoordinator(QObject):
                     raise ScanCancelled(job_id)
                 path = cache_manager.write_page(job_id, 1, data, ext)
                 cached_paths.append(path)
-                _record_page_meta(job_id, 1, data, path)
+                _check_cancel(cancel_event, job_id)
+                angle = _estimate_page_skew(data)
+                _check_cancel(cancel_event, job_id)
+                _record_page_meta(job_id, 1, data, path, deskew_angle=angle)
+                self._note_skew(job_id, 1, angle, path, skew_streak, settings)
 
             output_path = os.path.join(
                 output_dir,
@@ -666,13 +760,57 @@ class ScanCoordinator(QObject):
         self.save_config()
 
 
-def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str) -> None:
+def _check_cancel(cancel_event, job_id: str) -> None:
     """
-    记录单页元数据（原始尺寸 + 缓存路径）。失败不影响扫描结果。
+    取消检查：用户点了取消就立刻停（抛 ScanCancelled）。
 
-    缓存里保留的永远是**原始扫描件**（不做任何像素改动），A4 归一推迟到
-    落盘时做。原始尺寸必须在这里落盘，否则后续的自动纠偏/双面合并/
-    断点续扫都没有可回溯的基准（本批次 deskew_angle 先留 0）。
+    ★ 为什么每页都要查：倾斜检测每页约 0.11 秒，40 页的批次不查就是
+      4.4 秒的"假死"（界面没反应、取消按钮按了像没按）。
+      ⇒ 检测前后各查一次，最坏延迟 = 一页的检测时间。
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        raise ScanCancelled(job_id)
+
+
+def _estimate_page_skew(data: bytes) -> float:
+    """
+    估计单页的纠偏角（度）。**无法判定时返回 0.0**（空白页/非图片/解不开）。
+
+    ★ 角度语义与 skew_detect 一致：PIL `Image.rotate` 的角度，
+      已经是**可直接施加**的纠偏量（调用方不要再取负）。
+    ★ 返回 None（skew_detect 对空白页/稀疏页的判定）在这里归一为 0.0：
+      0.0 = "没有需要纠正的倾斜"，既不纠偏也不提醒。
+    """
+    if not data:
+        return 0.0
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            angle = skew_detect.estimate_skew(img)
+    except Exception as e:
+        logger.debug("倾斜检测失败（按 0 度处理）: %s", e)
+        return 0.0
+    if angle is None:
+        return 0.0
+    try:
+        return float(angle)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str,
+                      deskew_angle: float = 0.0) -> None:
+    """
+    记录单页元数据（原始尺寸 + 缓存路径 + 纠偏角）。失败不影响扫描结果。
+
+    缓存里保留的永远是**原始扫描件**（不做任何像素改动），A4 归一与自动
+    纠偏都推迟到落盘时做。原始尺寸必须在这里落盘，否则后续的自动纠偏/
+    双面合并/断点续扫都没有可回溯的基准。
+
+    ★ deskew_angle：扫描时测出来的纠偏角（度）。落盘时由 save_manager
+      取回来施加；**这里绝不旋转缓存原件**（page_meta 的契约：
+      cache_path 指向永不修改的原始扫描件）。
+    ★ 不覆盖已有的 manual_rotation / crop_rect —— 那两个字段由 GUI 的
+      预览同步写入（手动旋转 / 裁边），扫描侧补写元数据时必须保住它们。
     """
     width = height = 0
     try:
@@ -682,10 +820,40 @@ def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str) -
         logger.debug("读取页面尺寸失败 [%s]: %s", cache_path, e)
     try:
         store = page_meta.PageMetaStore(cache_manager._cache_root())
+        # 保留 GUI 侧已写入的手动旋转 / 裁边框
+        existing = {}
+        try:
+            existing = store.get_job(job_id).get(str(page_no), {}) or {}
+        except Exception as e:
+            logger.debug("读取既有页元数据失败 [%s]: %s", job_id, e)
+            existing = {}
+        crop_rect = existing.get("crop_rect")
         store.set_page(job_id, page_no, page_meta.PageMeta(
-            cache_path=cache_path, width=width, height=height))
+            cache_path=cache_path, width=width, height=height,
+            manual_rotation=_safe_int(existing.get("manual_rotation")),
+            deskew_angle=_safe_float(deskew_angle),
+            a4_normalized=bool(existing.get("a4_normalized", False)),
+            crop_rect=tuple(crop_rect) if crop_rect else None,
+        ))
     except Exception as e:
         logger.debug("写页元数据失败 [%s]: %s", job_id, e)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """脏值容忍的整数转换（非法值 ⇒ 默认值，不抛）"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """脏值容忍的浮点转换（非法值 ⇒ 默认值，不抛）"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return default if result != result else result   # NaN ⇒ 默认值
 
 
 def _discard_page_meta(job_id: str) -> None:

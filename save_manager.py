@@ -13,11 +13,20 @@ PDF 路径（批次 2）：
   ⇒ 合并前用 `estimate_pdf_peak_bytes` 做体积预检（门禁 1.5GB）
 - 单页与多页 PDF 共用 _a4_canvas，页面尺寸必然一致
 - 最终 PDF 先写同目录临时文件、成功后再 os.replace（不留半截文件）
+
+自动纠偏（批次 4）：
+- 顺序固定为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**
+- 纠偏角来自页元数据（page_meta.deskew_angle，扫描时由 skew_detect 测出）
+- 阈值：|angle| >= deskew_apply_threshold（默认 0.5°）才施加；
+  角度为 0 时**一个像素都不动** ⇒ 直页产物与改造前逐字节相同
+- skew_detect 是**静态 import** ⇒ PyInstaller 依赖分析会自动收录它
 """
 
 import io
+import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -26,8 +35,10 @@ from dataclasses import dataclass, field
 from PIL import Image, UnidentifiedImageError
 
 import cache_manager
+import config_io
 import history_manager
 import page_meta
+import skew_detect
 from exposure import (DEFAULT_GAMMA, DEFAULT_GAINS, GAMMA_MAX, GAMMA_MIN,
                       PARAM_MAX, PARAM_MIN, apply_exposure, sanitize_gains,
                       sanitize_int, sanitize_number)
@@ -44,12 +55,220 @@ __all__ = [
     "estimate_pdf_peak_bytes", "run_save_job",
     "SaveRequest", "SaveResult", "SaveAborted",
     "PDF_PEAK_FACTOR", "PDF_PEAK_LIMIT_BYTES",
+    "DESKEW_CONFIG_DEFAULTS", "resolve_deskew_settings", "load_deskew_settings",
+    "deskew_angle_to_apply", "load_job_deskew_angles", "resolve_deskew_angles",
 ]
 
 # PDF 合成的内存峰值系数：实测阶段二峰值 ≈ 2.1 × 最终 PDF 体积
 PDF_PEAK_FACTOR = 2.1
 # PDF 合成的内存峰值门禁（与批次 4 门禁一致）：1.5GB
 PDF_PEAK_LIMIT_BYTES = int(1.5 * 1024 ** 3)
+
+# ── 自动纠偏策略（批次 4）────────────────────────────────────────────────
+# 这四个键写进 scan_config.json（scan_coordinator 用 load_config/save_config 落盘）。
+# ★ 这里是**唯一真源**：scan_coordinator 从这里 import，避免两处默认值漂移。
+#
+# ★★ 两个角度阈值不是一回事，务必分清：
+#   · 0.75°（skew_detect._MIN_EFFECTIVE_ANGLE）= **检出**下限 ——
+#     estimate_skew 低于它就直接返回 0.0/None ⇒ 这个角度**根本测不出来**，
+#     所以它决定"能不能测到"，与"要不要施加"无关。
+#   · 0.5°（deskew_apply_threshold）= **施加**下限 ——
+#     已经测出来了，但小于它就不做重采样（避免一次无谓的 BICUBIC + 四角补白）。
+#   默认 0.5 < 0.75 ⇒ **施加阈值在默认配置下永不生效**：
+#   凡是非零的检出角必然 >= 0.75°，一定会被施加。
+#   把 deskew_apply_threshold 调高（例如 1.5）才会出现"测得出来但不施加"。
+DESKEW_CONFIG_DEFAULTS = {
+    "deskew_enabled": True,          # 总开关：关掉 ⇒ 只检测不纠偏、也不提醒
+    "deskew_apply_threshold": 0.5,   # 施加纠偏的最小角度（度）
+    "skew_warn_threshold": 3.0,      # 强提醒阈值（度）
+    "skew_warn_consecutive": 3,      # 连续几页超阈值才提醒
+}
+
+# 缓存页文件名里的页号（page_003.jpg / crop_page_003.jpg 都认）
+_PAGE_NUM_RE = re.compile(r"page_(\d+)\.", re.IGNORECASE)
+
+
+def _as_bool(value, default: bool) -> bool:
+    """脏值容忍的布尔解析（"false"/"0"/"关" 都认；认不出 ⇒ 用默认值）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on", "是", "开"):
+            return True
+        if text in ("0", "false", "no", "off", "否", "关"):
+            return False
+    return default
+
+
+def _as_float(value, default: float, minimum: float = 0.0) -> float:
+    """脏值容忍的浮点解析（非数/NaN/低于下限 ⇒ 回落默认值）。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result:          # NaN
+        return default
+    if result < minimum:
+        return default
+    return result
+
+
+def _as_int(value, default: int, minimum: int = 1) -> int:
+    """脏值容忍的整数解析（低于下限 ⇒ 回落默认值）。"""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return result if result >= minimum else default
+
+
+def resolve_deskew_settings(cfg=None) -> dict:
+    """
+    从配置字典解析纠偏阈值（缺省/非法值 ⇒ 回落默认值）。
+
+    纯函数，不碰磁盘 —— 协调器（检测/提醒）与落盘（施加）共用这一份语义。
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    defaults = DESKEW_CONFIG_DEFAULTS
+    return {
+        "deskew_enabled": _as_bool(cfg.get("deskew_enabled"),
+                                   defaults["deskew_enabled"]),
+        "deskew_apply_threshold": _as_float(
+            cfg.get("deskew_apply_threshold"),
+            defaults["deskew_apply_threshold"]),
+        "skew_warn_threshold": _as_float(
+            cfg.get("skew_warn_threshold"),
+            defaults["skew_warn_threshold"]),
+        "skew_warn_consecutive": _as_int(
+            cfg.get("skew_warn_consecutive"),
+            defaults["skew_warn_consecutive"]),
+    }
+
+
+def load_deskew_settings() -> dict:
+    """
+    读 scan_config.json 里的纠偏阈值（文件缺失/损坏 ⇒ 回落默认值）。
+
+    ★ 与 scan_coordinator.load_config 读的是**同一个文件**
+      （%APPDATA%\\HP_Scan_Tool\\scan_config.json）：协调器负责写，这里只读。
+    ★ 只读不写 ⇒ 落盘路径上不会碰用户配置。
+    """
+    path = os.path.join(config_io.config_dir(), "scan_config.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    return resolve_deskew_settings(cfg)
+
+
+def deskew_angle_to_apply(angle, threshold=None) -> float:
+    """
+    返回**真正要施加**的纠偏角（0.0 ⇒ 不施加，像素一个都不动）。
+
+    施加阈值 = deskew_apply_threshold（默认 0.5°），与"检出下限 0.75°"是两回事。
+    """
+    if angle is None:
+        return 0.0
+    try:
+        value = float(angle)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value:            # NaN
+        return 0.0
+    if threshold is None:
+        threshold = DESKEW_CONFIG_DEFAULTS["deskew_apply_threshold"]
+    try:
+        limit = float(threshold)
+    except (TypeError, ValueError):
+        limit = DESKEW_CONFIG_DEFAULTS["deskew_apply_threshold"]
+    if limit < 0:
+        limit = 0.0
+    if abs(value) < limit or value == 0.0:
+        return 0.0
+    return value
+
+
+def _norm_path(path) -> str:
+    """路径归一（用于比对缓存页路径）"""
+    try:
+        return os.path.normcase(os.path.abspath(str(path)))
+    except Exception:
+        return str(path)
+
+
+def _page_no_from_path(path) -> int | None:
+    """从缓存页文件名里认页号（page_003.jpg / crop_page_003.jpg 都认）。"""
+    match = _PAGE_NUM_RE.search(os.path.basename(str(path)))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def load_job_deskew_angles(job_id: str) -> tuple[dict, dict]:
+    """
+    读某 job 的页元数据 ⇒ (按页号, 按缓存路径) 的纠偏角表。
+
+    纠偏角是**扫描时**测出来的，写在 page_meta.deskew_angle 里；
+    落盘时从这里取回施加角度（原件始终不动）。
+    """
+    by_page: dict = {}
+    by_path: dict = {}
+    if not job_id:
+        return by_page, by_path
+    try:
+        store = page_meta.PageMetaStore(cache_manager._cache_root())
+        job = store.get_job(job_id) or {}
+    except Exception as e:
+        logger.debug("读页元数据（纠偏角）失败 [%s]: %s", job_id, e)
+        return by_page, by_path
+    if not isinstance(job, dict):
+        return by_page, by_path
+    for key, payload in job.items():
+        if not isinstance(payload, dict):
+            continue
+        try:
+            angle = float(payload.get("deskew_angle") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            page_no = int(key)
+        except (TypeError, ValueError):
+            continue
+        by_page[page_no] = angle
+        cache_path = payload.get("cache_path")
+        if cache_path:
+            by_path[_norm_path(cache_path)] = angle
+    return by_page, by_path
+
+
+def resolve_deskew_angles(job_id: str, page_specs) -> list[float]:
+    """
+    按页解析纠偏角（返回与 page_specs 等长的角度列表）。
+
+    匹配优先级：
+      ① 缓存路径精确匹配（page_meta 记的 cache_path）
+      ② 文件名里的页号（page_003.jpg / crop_page_003.jpg）
+      ③ page_specs 下标 + 1
+    """
+    by_page, by_path = load_job_deskew_angles(job_id)
+    angles: list[float] = []
+    for index, spec in enumerate(page_specs or []):
+        cache_file = spec[0] if isinstance(spec, (tuple, list)) else spec
+        angle = by_path.get(_norm_path(cache_file), 0.0)
+        if not angle:
+            page_no = _page_no_from_path(cache_file)
+            if page_no is None:
+                page_no = index + 1
+            angle = by_page.get(page_no, 0.0)
+        angles.append(float(angle))
+    return angles
 
 
 class SaveAborted(RuntimeError):
@@ -251,12 +470,26 @@ def _is_intact_jpeg(path: str) -> bool:
         return False
 
 
-def _expose_and_rotate(img: Image.Image, rotation: int, exposure) -> Image.Image:
+def _expose_and_rotate(img: Image.Image, rotation: int, exposure,
+                       deskew_angle: float = 0.0,
+                       deskew_threshold=None) -> Image.Image:
     """
-    按固定顺序 **曝光 → 旋转** 处理图像。
+    按固定顺序 **曝光 → 手动旋转 → 自动纠偏** 处理图像。
 
     **接管 img 的所有权**：返回的图像由调用方负责 close（可能就是 img 本身）。
-    顺序是硬约定：曝光作用于原始像素，旋转只是几何变换，不能颠倒。
+    顺序是硬约定：
+      - 曝光作用于原始像素，必须最先做；
+      - 手动旋转是 90° 的整数倍，自动纠偏是小角度 ⇒ **两者都要**
+        （先转手动、再纠偏；两者都是平面旋转，交换顺序结果一致，
+          但顺序固定下来才好验证）；
+      - A4 画布归一由调用方在其后完成（600 DPI 不裁切那条护栏在 _a4_canvas 里）。
+
+    ★ **纠偏角为 0（没测出来 / 低于施加阈值）时一个像素都不动** ——
+      `deskew_image` 对 |angle| < 1e-9 原样返回，本函数也不会额外做
+      convert/重采样 ⇒ "曝光 off + 直页" 的产物与改造前逐字节相同这条护栏不被破。
+
+    deskew_angle: 扫描时测出来的纠偏角（度，PIL 角度语义，可直接施加）。
+    deskew_threshold: 施加阈值（度）；None ⇒ 用配置里的 deskew_apply_threshold。
     """
     exposed = _apply_exposure(img, exposure)
     if exposed is not img:
@@ -266,6 +499,18 @@ def _expose_and_rotate(img: Image.Image, rotation: int, exposure) -> Image.Image
         rotated = img.rotate(rotation, expand=True)
         img.close()
         img = rotated
+    angle = deskew_angle_to_apply(deskew_angle, deskew_threshold)
+    if angle:
+        if img.mode == "P":
+            # 调色板图的 fillcolor 是**调色板索引**，255 不一定是白 ⇒ 先转 RGB
+            rgb = img.convert("RGB")
+            img.close()
+            img = rgb
+        # 不 expand（画布尺寸不变），四角填白（fillcolor=255）
+        skewed = skew_detect.deskew_image(img, angle)
+        if skewed is not img:
+            img.close()
+            img = skewed
     return img
 
 
@@ -365,27 +610,31 @@ def _extract_pdf_image(cache_file: str, rotation: int = 0) -> Image.Image:
         return src.rotate(rotation, expand=True) if rotation else src.copy()
 
 
-def _open_page_image(cache_file: str, rotation: int = 0, exposure=None) -> Image.Image:
+def _open_page_image(cache_file: str, rotation: int = 0, exposure=None,
+                     deskew_angle: float = 0.0,
+                     deskew_threshold=None) -> Image.Image:
     """
-    打开一页缓存图片（必要时应用曝光与旋转）。返回**新**图像，调用方负责 close()。
+    打开一页缓存图片（必要时应用曝光、旋转与自动纠偏）。返回**新**图像，调用方负责 close()。
 
-    处理顺序固定为 **曝光 → 旋转**；A4 画布归一由调用方在其后完成。
+    处理顺序固定为 **曝光 → 旋转 → 纠偏**；A4 画布归一由调用方在其后完成。
     """
     try:
         img = _read_cache_image(cache_file)
     except UnidentifiedImageError:
         # 不是图片字节 → 当作 PDF 缓存页处理
         img = _extract_pdf_image(cache_file, 0)
-    return _expose_and_rotate(img, rotation, exposure)
+    return _expose_and_rotate(img, rotation, exposure, deskew_angle,
+                               deskew_threshold)
 
 
-def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int, int, list]:
+def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None,
+               deskew_angles=None, deskew_threshold=None) -> tuple[int, int, list]:
     """
     合成 PDF（单页/多页同一份代码）。返回 (成功页数, 失败页数, 失败页下标列表)。
 
     两阶段：
       阶段一（逐页，内存里同时只有一页）：
-        缓存页 → 曝光 → 旋转 → A4 画布归一 → 写成单页 PDF 临时文件
+        缓存页 → 曝光 → 旋转 → 纠偏 → A4 画布归一 → 写成单页 PDF 临时文件
       阶段二（逐页 append，不再载入图片像素）：
         PdfWriter.append(临时文件) → 写出最终 PDF
         ⚠ 阶段二会把整份 PDF 读进内存 ⇒ 峰值 ≈ 2.1 × 产物 PDF 体积，
@@ -400,6 +649,9 @@ def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int
     if PdfWriter is None:
         raise RuntimeError("缺少 pypdf 依赖，无法合成 PDF（请 pip install pypdf）")
 
+    if deskew_threshold is None:
+        deskew_threshold = load_deskew_settings()["deskew_apply_threshold"]
+
     tmp_dir = tempfile.mkdtemp(prefix="hp_scan_pdf_")
     tmp_files = []
     failed = 0
@@ -408,7 +660,12 @@ def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int
         for idx, (cache_file, rotation) in enumerate(pages, 1):
             tmp_pdf = os.path.join(tmp_dir, f"page_{idx:04d}.pdf")
             try:
-                img = _open_page_image(cache_file, rotation, exposure)
+                angle = 0.0
+                if deskew_angles and idx - 1 < len(deskew_angles):
+                    angle = deskew_angles[idx - 1]
+                img = _open_page_image(cache_file, rotation, exposure,
+                                       deskew_angle=angle,
+                                       deskew_threshold=deskew_threshold)
                 canvas = _a4_canvas(img, dpi)
                 if canvas is not img:
                     img.close()
@@ -517,8 +774,13 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
          "brightness": int, "contrast": int, "gamma": float,
          "shadows": int, "highlights": int,
          "channel_gains": (r, g, b)}
-    曝光在 **旋转之前、A4 画布归一之前** 应用（顺序固定：曝光 → 旋转 → A4 归一）。
+    曝光在 **旋转之前、纠偏之前、A4 画布归一之前** 应用
+    （顺序固定：曝光 → 旋转 → 纠偏 → A4 归一）。
     exposure=None 或 mode="off" ⇒ 行为与改造前完全一致（向后兼容）。
+
+    自动纠偏：纠偏角取自该 job 的页元数据（page_meta.deskew_angle，
+    扫描时测出来的）；`deskew_enabled=False` 或角度低于施加阈值 ⇒ 不纠偏，
+    产物与改造前逐字节相同。
 
     一律用 with 打开图片：显式管理文件句柄，不依赖 Pillow 内部
     「读取后自动关句柄」的实现细节（该细节随版本变化）。
@@ -527,15 +789,25 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
     if not final.lower().endswith(f".{ext}"):
         final = f"{final.rsplit('.', 1)[0]}.{ext}"
 
+    settings = load_deskew_settings()
+    deskew_angle = 0.0
+    if settings["deskew_enabled"] and job_id:
+        angles = resolve_deskew_angles(job_id, [(cache_path, rotation)])
+        deskew_angle = angles[0] if angles else 0.0
+    deskew_threshold = settings["deskew_apply_threshold"]
+
     if ext == "pdf":
         # PDF 走本地合成，和多页 PDF 同一份代码 → 页面尺寸必然一致
-        ok, _failed, _failed_idx = _write_pdf([(cache_path, rotation)], final,
-                                              exposure=exposure)
+        ok, _failed, _failed_idx = _write_pdf(
+            [(cache_path, rotation)], final, exposure=exposure,
+            deskew_angles=[deskew_angle], deskew_threshold=deskew_threshold)
         if not ok:
             raise RuntimeError(f"PDF 生成失败（缓存页无法转换为图片）: {cache_path}")
     else:
         img = _read_cache_image(cache_path)
-        img = _expose_and_rotate(img, rotation, exposure)
+        img = _expose_and_rotate(img, rotation, exposure,
+                                  deskew_angle=deskew_angle,
+                                  deskew_threshold=deskew_threshold)
         try:
             _write_image(img, final, ext)
         finally:
@@ -586,6 +858,10 @@ def save_pages(job_id: str, ext: str, output_path: str,
     confirm:    体积预检的确认回调（收到提示文案，返回 False 表示放弃保存）。
                 None ⇒ 只记 warning 并继续（提示进返回值的 .warnings）。
 
+    自动纠偏（批次 4）：逐页纠偏角取自页元数据（page_meta.deskew_angle），
+    顺序为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**；
+    deskew_enabled=False 或角度低于 deskew_apply_threshold ⇒ 该页不纠偏。
+
     返回 **SaveResult**（list 子类）：
       - 迭代 / len / [0] 与普通 list 完全一致（现有调用方不受影响）
       - `.failed_pages`   失败页数
@@ -602,13 +878,28 @@ def save_pages(job_id: str, ext: str, output_path: str,
     saved_page_count = 0
     exposure_active = _exposure_params(exposure) is not None
 
+    # ── 自动纠偏（批次 4）────────────────────────────────────────────
+    # 纠偏角来自页元数据（扫描时测出来的），逐页解析：
+    #   ① 缓存路径精确匹配 ② 文件名里的页号 ③ page_specs 下标 + 1
+    # deskew_enabled=False ⇒ 一页都不纠偏（只检测不纠偏的总开关）。
+    settings = load_deskew_settings()
+    deskew_threshold = settings["deskew_apply_threshold"]
+    if settings["deskew_enabled"]:
+        deskew_angles = resolve_deskew_angles(job_id, page_specs)
+    else:
+        deskew_angles = [0.0] * len(page_specs or [])
+
     for gi, group_indices in enumerate(groups, 1):
         if ext == "pdf":
             pages = [page_specs[page_idx] for page_idx in group_indices]
+            group_angles = [deskew_angles[page_idx] if page_idx < len(deskew_angles)
+                            else 0.0 for page_idx in group_indices]
             pdf_path = build_output_name(base, ext, group_count, gi, 1)
             # 体积预检：在开始合并**之前**提示（不静默截断）
             _precheck_pdf_volume(pages, confirm, warnings)
-            ok, failed, failed_idx = _write_pdf(pages, pdf_path, exposure=exposure)
+            ok, failed, failed_idx = _write_pdf(pages, pdf_path, exposure=exposure,
+                                                deskew_angles=group_angles,
+                                                deskew_threshold=deskew_threshold)
             failed_pages += failed
             # failed_idx 是组内下标 ⇒ 映射回 page_specs 的全局下标
             skipped_pages.extend(group_indices[i] for i in failed_idx)
@@ -620,18 +911,22 @@ def save_pages(job_id: str, ext: str, output_path: str,
         else:
             for seq, page_idx in enumerate(group_indices, 1):
                 cache_file, rotation = page_specs[page_idx]
+                angle = deskew_angles[page_idx] if page_idx < len(deskew_angles) else 0.0
+                apply_angle = deskew_angle_to_apply(angle, deskew_threshold)
                 try:
                     fpath = build_output_name(base, ext, group_count, gi, seq)
                     if (ext in ("jpg", "jpeg") and not rotation
-                            and not exposure_active
+                            and not exposure_active and not apply_angle
                             and _is_intact_jpeg(cache_file)):
-                        # 无曝光且无旋转 ⇒ 直接复制原始字节（快路径，逐字节一致）
+                        # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径，逐字节一致）
                         shutil.copy2(cache_file, fpath)
                     else:
-                        # 快路径的前置条件不满足（曝光/旋转，或缓存页不是完整 JPEG）
+                        # 快路径的前置条件不满足（曝光/旋转/纠偏，或缓存页不是完整 JPEG）
                         # ⇒ 走解码路径：能解码就正常落盘，解不开就由下面的
                         #    except 计入 failed_pages —— **绝不谎报成功**（N2）。
-                        img = _open_page_image(cache_file, rotation, exposure)
+                        img = _open_page_image(cache_file, rotation, exposure,
+                                               deskew_angle=angle,
+                                               deskew_threshold=deskew_threshold)
                         try:
                             _write_image(img, fpath, ext)
                         finally:
