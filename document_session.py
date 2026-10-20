@@ -16,11 +16,11 @@
      把会话页当孤儿删掉，而且多一次文件复制（1GB 文档 ⇒ 复制 1GB）。
 2) **保护而非搬运**：会话引用了哪些 job，就保护哪些 job 目录，
    使其不被 eviction / cleanup_stale 清掉 ⇒ 跨天续扫时页路径不悬空。
-   ★ `cache_manager.protect_dir` / `unprotect_dir` 由 **B4-2** 落地，
-     与本模块是**并行任务** ⇒ 这里用 `getattr(cache_manager, ..., None)`
-     做**存在性检查**：有才调，没有就记一条 debug 日志跳过。
-     **不因此 import 失败**，**也不在这里改 cache_manager.py**；
-     B4-2 落地后这段代码自动生效，无需改动。
+   ★ `cache_manager.protect_dir` / `unprotect_dir` **早已落地**
+     （cache_manager.py:305 / :326）⇒ 这里**直接调用**。
+     早年的"函数不存在就静默跳过"写法已删除：那个函数一直都在，
+     留着只会在保护真的失效时悄悄吞掉问题（终审 M-4）。
+     保护失败只记 error 日志，不抛给调用方。
 3) **读失败不清空**：JSON 解析失败 ⇒ 记 error 日志 + 返回 None，
    **原文件保留**（另存一份 `.corrupt-<时间戳>` 备份），与 history_manager /
    page_meta 的既有约定一致。绝不"用空会话覆盖原文件"。
@@ -662,32 +662,28 @@ def _protect_jobs(job_ids) -> None:
     """
     保护这些 job 的缓存目录（不被 eviction / cleanup_stale 清掉）。
 
-    ★ `cache_manager.protect_dir` 由 B4-2 落地，与本模块是并行任务
-      ⇒ 用 getattr 做**存在性检查**：没有就不调用（记 debug 日志跳过），
-      **不因此 import 失败**。B4-2 落地后这段代码自动生效。
+    ★ `cache_manager.protect_dir` **早已落地**（cache_manager.py:305）
+      ⇒ 这里**直接调用**：早年的"函数不存在就静默跳过"是死分支，
+      函数一直都在，留着只会在保护真的失效时悄悄吞掉问题。
+    ★ 保护失败只记 error 日志，**不抛给调用方**（调用方是会话落盘主路径）。
     """
-    fn = getattr(cache_manager, "protect_dir", None)
-    if fn is None:
-        logger.debug("cache_manager.protect_dir 尚未落地，跳过缓存目录保护: %s",
-                     list(job_ids))
-        return
     for job_id in job_ids:
         try:
-            fn(job_id)
+            cache_manager.protect_dir(job_id)
         except Exception as e:
             logger.error("缓存目录保护失败: %s（%s）", job_id, e)
 
 
 def _unprotect_jobs(job_ids) -> None:
-    """解除这些 job 的缓存目录保护（会话结束 / 被删除时）"""
-    fn = getattr(cache_manager, "unprotect_dir", None)
-    if fn is None:
-        logger.debug("cache_manager.unprotect_dir 尚未落地，跳过解除保护: %s",
-                     list(job_ids))
-        return
+    """
+    解除这些 job 的缓存目录保护（会话结束 / 被删除时）。
+
+    ★ `cache_manager.unprotect_dir` **早已落地**（cache_manager.py:326）
+      ⇒ 直接调用（同上：存在性检查是死分支，已删）。
+    """
     for job_id in job_ids:
         try:
-            fn(job_id)
+            cache_manager.unprotect_dir(job_id)
         except Exception as e:
             logger.error("缓存目录解除保护失败: %s（%s）", job_id, e)
 

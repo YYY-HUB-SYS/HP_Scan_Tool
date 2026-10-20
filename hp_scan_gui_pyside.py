@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -43,28 +44,75 @@ from scan_coordinator import (
 from escl_engine import auto_crop, ScanCancelled
 
 # ────────── 全局异常日志 ──────────
+def _resolve_log_file() -> str | None:
+    """
+    挑一个**一定能写**的日志文件路径（导入期调用 ⇒ 绝不能抛异常）。
+
+    首选 `%USERPROFILE%\\Desktop\\hp_scan_debug.log`
+    —— 刻意**不**放真实 AppData：那是用户数据目录，日志不该混进去。
+
+    ★ **容错**（终审 M-6）：Desktop 目录不存在时以前会在这里
+      `FileNotFoundError` ⇒ **整个 GUI 起不来**（Desktop 被 OneDrive 重定向 /
+      中文系统叫「桌面」/ 域策略改名都会踩到）。现在按顺序退：
+        ① %USERPROFILE%\\Desktop\\hp_scan_debug.log（首选，目录不存在就跳过）
+        ② %USERPROFILE%\\hp_scan_debug.log（退回用户主目录）
+        ③ %TEMP%\\hp_scan_debug.log（再退回临时目录）
+      三处都写不了 ⇒ 返回 None（只留控制台日志）。
+    ★ **不凭空创建 Desktop 目录**：那不是用户真正的桌面，
+      建个空目录只会让"桌面"看起来是空的。
+    """
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Desktop", "hp_scan_debug.log"),
+        os.path.join(home, "hp_scan_debug.log"),
+        os.path.join(tempfile.gettempdir(), "hp_scan_debug.log"),
+    ]
+    for path in candidates:
+        directory = os.path.dirname(path)
+        try:
+            if directory and not os.path.isdir(directory):
+                continue                       # 目录不存在 ⇒ 不建，换下一个
+            if directory and not os.access(directory, os.W_OK):
+                continue                       # 不可写 ⇒ 换下一个
+        except OSError:
+            continue
+        return path
+    return None
+
+
 def setup_exception_logging():
     """设置全局异常日志，捕获未处理异常写入文件"""
     import traceback
-    log_file = os.path.join(os.path.expanduser("~"), "Desktop", "hp_scan_debug.log")
+    log_file = _resolve_log_file()
 
     def excepthook(exc_type, exc_value, exc_tb):
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"\n{'='*50}\n")
-            f.write(f"[{datetime.now()}] Unhandled Exception:\n")
-            f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
-            f.write(f"{'='*50}\n")
+        if log_file:
+            try:
+                with open(log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*50}\n")
+                    f.write(f"[{datetime.now()}] Unhandled Exception:\n")
+                    f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
+                    f.write(f"{'='*50}\n")
+            except OSError:
+                pass                             # 日志写不进去也不能让程序崩
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = excepthook
 
-    # 同时配置logging写入文件
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        encoding="utf-8",
-    )
+    # 同时配置logging写入文件（路径不可用就只留控制台，绝不在导入期抛异常）
+    try:
+        if log_file:
+            logging.basicConfig(
+                filename=log_file,
+                level=logging.DEBUG,
+                format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                encoding="utf-8",
+            )
+        else:
+            logging.basicConfig(level=logging.DEBUG)
+    except (OSError, ValueError) as e:
+        logging.basicConfig(level=logging.DEBUG)
+        print("日志文件不可用，仅输出到控制台: %s" % e, file=sys.stderr)
 
 setup_exception_logging()
 logger = logging.getLogger(__name__)

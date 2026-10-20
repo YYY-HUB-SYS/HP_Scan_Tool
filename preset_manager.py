@@ -10,6 +10,7 @@
      并且**禁止**用空列表覆盖原文件（否则用户预设永久丢失）。
 """
 
+import copy
 import json
 import logging
 import os
@@ -30,7 +31,9 @@ logger = logging.getLogger(__name__)
 #   "builtin": bool  (True=内置不可删除)
 # }
 
-_BUILTIN_PRESETS = [
+# ★ 内置预设的**唯一真源**：模块私有，任何调用方都拿不到它的本体。
+#   （对外出口 `builtin_presets()` 与旧名 `_BUILTIN_PRESETS` 都只给**深拷贝**）
+_BUILTIN_PRESET_TEMPLATE = (
     {
         "name": "文字增强",
         "mode": "manual",
@@ -63,7 +66,29 @@ _BUILTIN_PRESETS = [
         "channel_gains": [0.95, 1.0, 1.1],  # 降红增蓝，去黄
         "builtin": True,
     },
-]
+)
+
+
+def builtin_presets() -> list[dict]:
+    """
+    内置预设的**深拷贝**列表（公开的"只读内置预设"出口）。
+
+    ★ 必须深拷贝到**嵌套层级**（``channel_gains`` 是 list）：
+      调用方就地改一下就污染模块级内置预设 —— 终审实测
+      ``brightness`` 被改成 15 → 999，之后所有扫描都用错曝光参数。
+    ★ 本模块**不 import 任何 Qt**（CLI 也要能用）⇒ 只用返回值。
+    """
+    return copy.deepcopy(list(_BUILTIN_PRESET_TEMPLATE))
+
+
+def __getattr__(name):
+    """
+    模块级 ``__getattr__``（PEP 562）：旧名 ``_BUILTIN_PRESETS`` 现在**每次访问
+    都返回一份深拷贝**，调用方再怎么就地改也污染不到内置预设本体。
+    """
+    if name == "_BUILTIN_PRESETS":
+        return builtin_presets()
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 
 def _presets_path() -> str:
@@ -144,10 +169,19 @@ def _read_user_presets() -> tuple[list[dict], bool]:
 
 
 def load_presets() -> list[dict]:
-    """加载全部预设（内置 + 用户自定义）"""
-    presets = list(_BUILTIN_PRESETS)
+    """
+    加载全部预设（内置 + 用户自定义）。
+
+    ★ 内置预设以**深拷贝**返回（见 builtin_presets）：调用方就地修改
+      不会污染模块级内置预设（终审实测 brightness 15 → 999）。
+    ★ 用户预设来自 `_read_user_presets()` —— 每次调用都是**新解析**的
+      对象，本来就不共享；这里照样复制一份，让"返回结果"与"文件内容"
+      之间没有别名关系。
+    """
+    presets = builtin_presets()
     user, _ = _read_user_presets()
     for p in user:
+        p = copy.deepcopy(p)
         p["builtin"] = False
         presets.append(p)
     return presets
@@ -234,7 +268,16 @@ def export_preset(name: str, output_path: str) -> bool:
 def import_preset(file_path: str) -> str | None:
     """
     从 JSON 文件导入预设。
-    返回导入的预设名称，失败返回 None。
+
+    返回值（**调用方只能靠它判断成败**）：
+      - 成功：返回导入的预设名称（str，非空）
+      - 失败：返回 None —— 文件读不了 / 顶层格式不对 / "preset" 不是对象 /
+        缺必要字段 / 字段类型不对 / **写盘失败**
+
+    ★ 失败一律"返回 None + 日志"，**不抛异常**：本函数会被 GUI 的槽调用，
+      PySide6 ≥ 6.5 对槽内未捕获异常会 qFatal ⇒ 进程 abort。
+    ★ 本模块**不 import 任何 Qt**（CLI 也要能用）⇒ 只能用返回值/异常表达成败，
+      这里选返回值（既有调用约定与测试都是"None 表示失败"）。
     """
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -248,11 +291,31 @@ def import_preset(file_path: str) -> str | None:
         return None
 
     preset = data["preset"]
+    # ★ 类型校验：以前这里直接 preset.keys() ⇒ "preset" 是字符串时抛
+    #   AttributeError（未捕获 ⇒ Qt 槽里 qFatal ⇒ 进程崩），而且调用方
+    #   无从知道导入到底成没成。
+    if not isinstance(preset, dict):
+        logger.error("预设导入失败：preset 字段必须是对象，实际是 %s",
+                     type(preset).__name__)
+        return None
+
     required_keys = {"name", "mode"}
     if not required_keys.issubset(preset.keys()):
         logger.debug("预设文件缺少必要字段")
         return None
 
     name = preset["name"]
-    save_user_preset(preset)
+    mode = preset["mode"]
+    if not isinstance(name, str) or not name.strip():
+        logger.error("预设导入失败：name 必须是非空字符串，实际是 %r", name)
+        return None
+    if not isinstance(mode, str) or not mode.strip():
+        logger.error("预设导入失败：mode 必须是非空字符串，实际是 %r", mode)
+        return None
+
+    # ★ 必须接住写盘结果：写失败时**不能**照样返回预设名
+    #   （以前返回值被丢弃 ⇒ 用户点了"导入"却以为成功了）。
+    if not save_user_preset(preset):
+        logger.error("预设导入失败：写入预设文件失败（%s）", name)
+        return None
     return name

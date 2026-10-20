@@ -18,8 +18,18 @@
   4) 孤儿清理：缓存 job 目录已不存在的元数据条目会被删除（prune_orphans），
      一次性覆盖"扫描失败/取消、缓存被 eviction、程序异常退出"等所有
      "缓存没了但元数据还在"的路径，避免 page_meta.json 条目单调增长。
+     ⇒ 与 cache_manager 的 job 生命周期一致：**job 目录被删 ⇒ 元数据也删**；
+       还在缓存目录里的 job（还在用）**绝不**被当成孤儿删掉。
+  5) 进程内容器**有界**（不引后台线程、不引定时器 ⇒ CLI 也能用）：
+     - _WRITE_LOCKS：只在**写事务进行中**保留条目，用完立刻回收
+       （回收时"还有人在用/在等"的锁绝不会被删 —— 删了就会两把锁交错
+        读-改-写 ⇒ 丢更新）；
+     - _CORRUPT_BACKED_UP：FIFO 淘汰，上限 64 条
+       （"同一份损坏内容只备份一次"的去重语义不变）。
+     ⇒ 长跑进程（扫几千次 / 换缓存根 / 反复遇到损坏文件）不会只涨内存。
 """
 
+import collections
 import contextlib
 import json
 import logging
@@ -34,23 +44,47 @@ import config_io
 
 logger = logging.getLogger(__name__)
 
-# 进程内写事务锁：按元数据文件路径分桶，跨 PageMetaStore 实例共享
-_WRITE_LOCKS: dict[str, threading.Lock] = {}
+# 进程内写事务锁：按元数据文件路径分桶，跨 PageMetaStore 实例共享。
+# ★ 每个条目是 [lock, 在用计数]：
+#   - 计数 > 0 ⇒ 有人正在用（或正在排队等）这把锁 ⇒ **绝不能**回收；
+#   - 计数归零 ⇒ 没人再用了 ⇒ 立刻删掉 ⇒ 换缓存根 / 换临时目录不会
+#     在这张表里永久堆积锁对象（终审 F-13：以前只增不减）。
+_WRITE_LOCKS: dict[str, list] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
 
 # 已备份过的损坏文件（路径 + mtime + size），避免反复读取刷出一堆备份
-_CORRUPT_BACKED_UP = set()
+# ★ 上限 + FIFO 淘汰：这个集合以前只增不减（每次"损坏内容变了"就多一个 key），
+#   长跑进程会一直涨（终审 F-13）。
+_CORRUPT_BACKED_UP: "collections.OrderedDict[tuple, None]" = collections.OrderedDict()
+_CORRUPT_BACKED_UP_MAX = 64
 
 
-def _write_lock(path: str) -> threading.Lock:
-    """取某个元数据文件的进程内写锁（首次调用时创建）"""
+@contextlib.contextmanager
+def _write_lock(path: str):
+    """
+    取某个元数据文件的进程内写锁（首次调用时创建，**用完即回收**）。
+
+    ★ 做成上下文管理器（而不是"返回锁对象"）：只有这样才能在释放之后
+      把"没人再用的锁"从表里删掉，同时保证"还有人在用 / 在等"的锁
+      不会被回收 —— 回收了就等于给下一个调用方发了一把**新**锁，
+      两把锁可以交错读-改-写 ⇒ 丢更新。
+    """
     key = os.path.normcase(os.path.abspath(path))
     with _WRITE_LOCKS_GUARD:
-        lock = _WRITE_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _WRITE_LOCKS[key] = lock
-        return lock
+        entry = _WRITE_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _WRITE_LOCKS[key] = entry
+        entry[1] += 1
+        lock = entry[0]
+    try:
+        with lock:
+            yield
+    finally:
+        with _WRITE_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] <= 0:
+                _WRITE_LOCKS.pop(key, None)
 
 
 def _is_inside(root: str, path: str) -> bool:
@@ -78,7 +112,11 @@ def _backup_corrupt(fpath: str):
     key = (fpath, st.st_mtime_ns, st.st_size)
     if key in _CORRUPT_BACKED_UP:
         return None
-    _CORRUPT_BACKED_UP.add(key)
+    # ★ 登记并**保持有界**：FIFO 淘汰最旧的（同一份损坏内容只备份一次的
+    #   去重语义不变，只是"很久以前"的损坏版本不再占位）。
+    _CORRUPT_BACKED_UP[key] = None
+    while len(_CORRUPT_BACKED_UP) > _CORRUPT_BACKED_UP_MAX:
+        _CORRUPT_BACKED_UP.popitem(last=False)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     backup = f"{fpath}.corrupt-{ts}"
     try:
