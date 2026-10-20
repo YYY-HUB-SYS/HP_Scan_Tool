@@ -32,11 +32,15 @@ def tmp_config_dir(tmp_path, monkeypatch):
     # monkeypatch 各模块的路径函数
     import cache_manager
     import history_manager
+    import preset_manager
 
     monkeypatch.setattr(cache_manager, "_cache_config_path",
                         lambda: str(config_dir / "cache_config.json"))
     monkeypatch.setattr(history_manager, "_history_file",
                         lambda: str(config_dir / "history.json"))
+    # 曝光预设默认落在 %APPDATA%\\HP_Scan_Tool\\presets.json，测试期重定向到临时目录
+    monkeypatch.setattr(preset_manager, "_presets_path",
+                        lambda: str(config_dir / "presets.json"))
 
     # 重置 cache_manager 的配置缓存和 history_manager 的路径缓存
     monkeypatch.setattr(cache_manager, "_config_cache", None)

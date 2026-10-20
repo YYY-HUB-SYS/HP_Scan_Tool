@@ -14,6 +14,7 @@ scan_config.json
 cache_config.json
 history.json
 profiles.json
+presets.json
 
 # 测试产物
 test_output/
