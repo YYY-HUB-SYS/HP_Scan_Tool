@@ -96,6 +96,53 @@ def _report_scan_error(exc: BaseException) -> None:
                                   file=sys.stderr)
 
 
+def _json_dumps(payload) -> str:
+    """
+    把 payload 序列化成 **纯 ASCII** 的 JSON 文本（`--format json` 的**唯一出口**）。
+
+    ★ 为什么必须纯 ASCII（终审复审 I-3 · Important）：
+      Windows 上 `sys.stdout` 用 **locale 编码**（本机 zh-CN ⇒ cp936/GBK）。
+      stdout 被**管道 / 重定向到文件**时，Python 按 locale 编码写字节
+      ⇒ 含中文的 JSON 落成 **GBK 字节** ⇒ 消费方按 UTF-8 读
+      （`json.loads(stdout_bytes)` / `jq` / `Get-Content -Encoding utf8`）
+      直接 UnicodeDecodeError —— 而 RFC 8259 规定 JSON 文本用 UTF-8。
+      实测（终审报告）：`cli.py history --format json` ⇒ 1775 字节 GBK，
+      `json.loads(stdout_bytes)` 在第 422 字节抛 UnicodeDecodeError。
+
+      `ensure_ascii=True`（json 模块的**默认值**）把非 ASCII 字符转成
+      `\\uXXXX` 转义 ⇒ 输出**纯 ASCII** ⇒ GBK / UTF-8 / Latin-1 下
+      **字节完全一致** ⇒ 任何代码页下都能 `json.loads` 成功。
+      （JSON 标准允许转义：`"\\u4f60\\u597d"` 与 `"你好"` 完全等价。）
+
+    ★ 为什么**不**去改 stdout 的编码（`sys.stdout.reconfigure(encoding="utf-8")`）：
+      那会改掉**所有**输出（含人类可读文案）的编码 —— 交互式控制台
+      （cp936）里中文会变成乱码，等于把「消费方解析失败」升级成
+      「用户眼前的界面坏了」。纯 ASCII 的方案两边都不误伤。
+
+    ★ 缩进固定 2：JSON 消费方不在乎缩进，人工排查时更易读。
+    """
+    return json.dumps(payload, ensure_ascii=True, indent=2)
+
+
+def _non_negative_int(value: str) -> int:
+    """
+    `--limit` 的 argparse 类型校验：只接受 **>= 0** 的整数。
+
+    负数必须**明确报错**而不是静默改语义：
+    `history_manager.list_records` 用 `records[-limit:]`
+    ⇒ `limit=-1` 时 `records[--1:]` 等于「除最旧一条外的全部」
+    ⇒ 这种输出没人能猜到 ⇒ 直接拒绝（argparse 退出码 2 + stderr 提示）。
+    """
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("条数必须是整数，收到 %r" % (value,))
+    if limit < 0:
+        raise argparse.ArgumentTypeError(
+            "条数不能为负数（收到 %d）；0 表示不显示任何记录" % limit)
+    return limit
+
+
 def _write_pdf_via_save_manager(data: bytes, fpath: str,
                                 device_name: str = "", device_ip: str = "") -> str:
     """
@@ -129,7 +176,7 @@ def _timestamped_name(prefix: str, ext: str) -> str:
 
     ★ 为什么 CLI 必须单独保证精度（复审 I1）：
       CLI 的产物名是**自己造的** —— `cli.py` 走的是 `escl_engine.execute_scan`，
-      **根本不经过协调器** ⇒ 协调器那次「秒→毫秒」的改动**覆盖不到这里**。
+      **根本不经过协调器** ⇒ 协调器那次「秒→微秒」的改动**覆盖不到这里**。
       之前 CLI 只到秒 ⇒ 同一秒内完成的两批 CLI 扫描算出**同一个文件名**
       ⇒ 后写的把先写的整个覆盖掉 ⇒ 先写的那批产物**静默消失**
       （用户看不到、也没有任何报错）。
@@ -290,7 +337,7 @@ def cmd_discover(args):
                 "color_modes": s.color_modes,
                 "formats": s.formats,
             })
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(_json_dumps(result))
     else:
         if not scanners:
             print("未发现任何扫描仪")
@@ -318,7 +365,7 @@ def cmd_status(args):
 
     if not escl_url:
         if fmt == "json":
-            print(json.dumps({"ip": ip, "status": "offline", "escl": False}))
+            print(_json_dumps({"ip": ip, "status": "offline", "escl": False}))
         else:
             print(f"{ip}: 离线或无 eSCL 服务")
         return 1
@@ -328,7 +375,7 @@ def cmd_status(args):
         if fmt == "json":
             status["ip"] = ip
             status["escl_url"] = escl_url
-            print(json.dumps(status, ensure_ascii=False, indent=2))
+            print(_json_dumps(status))
         else:
             print(f"{ip}: 在线")
             print(f"  eSCL: {escl_url}")
@@ -338,7 +385,7 @@ def cmd_status(args):
                 print(f"  状态: {status['state']}")
     except Exception as e:
         if fmt == "json":
-            print(json.dumps({"ip": ip, "escl_url": escl_url, "error": str(e)}))
+            print(_json_dumps({"ip": ip, "escl_url": escl_url, "error": str(e)}))
         else:
             print(f"{ip}: 状态查询失败 — {e}")
         return 1
@@ -351,10 +398,21 @@ def cmd_history(args):
     limit = args.limit
     fmt = args.format
 
-    records = history_manager.list_records(limit=limit)
+    # ★ `--limit` 的条数语义（终审复审：这是真 bug）：
+    #   - 负数 ⇒ **拒绝**（`records[--1:]` 是合法 Python，语义诡异
+    #     ⇒ 等于「除最旧一条外的全部」，没人能猜到 ⇒ 不允许静默）；
+    #   - 0 ⇒ **0 条**（不是「全部」！）：`history_manager.list_records` 用
+    #     `records[-limit:]`，`limit=0` 时 `records[-0:]` 等于**全量**
+    #     ⇒ 直接透传会把全部记录打出来 ⇒ 这里在 CLI 侧拦成空列表。
+    #     （`history_manager` 不在本次改动范围 ⇒ 修在调用方，更小更安全。）
+    if limit < 0:
+        print("错误: --limit 不能为负数（收到 %d）；0 表示不显示任何记录" % limit,
+              file=sys.stderr)
+        return 2
+    records = history_manager.list_records(limit=limit) if limit > 0 else []
 
     if fmt == "json":
-        print(json.dumps(records, ensure_ascii=False, indent=2))
+        print(_json_dumps(records))
     else:
         if not records:
             print("无扫描历史")
@@ -414,7 +472,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # history 子命令
     p_history = subparsers.add_parser("history", help="查看扫描历史")
-    p_history.add_argument("--limit", type=int, default=20, help="显示条数 (默认 20)")
+    p_history.add_argument("--limit", type=_non_negative_int, default=20,
+                            help="显示条数 (默认 20；0 表示不显示任何记录；"
+                                 "负数会被直接拒绝)")
     p_history.add_argument("--format", default="text", choices=["json", "text"],
                            help="输出格式 (默认 text)")
 
