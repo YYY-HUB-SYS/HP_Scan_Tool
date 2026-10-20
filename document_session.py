@@ -255,6 +255,35 @@ class DocumentSession:
         self.updated_at = time.time()
         return created
 
+    def remove_pages_from(self, job_id: str, page_no: int,
+                          drop_cache: bool = True) -> list:
+        """
+        丢弃某 job 内从 `page_no` 起的所有页 —— "从第 N 页重扫"用。
+
+        - 范围限定在**该 job 内**：会话里其它 job（先前批次）的页**不受影响**
+        - `drop_cache=True` 时同时删除对应的缓存页文件
+        - 被丢页的**页元数据不主动删**：缓存目录没了之后 `page_meta.prune_orphans`
+          会把它当孤儿清掉（既有机制，不在这里重复实现）
+        - 返回被移除的 `PageRef` 列表（保持原顺序）
+        """
+        jid = str(job_id)
+        cut = int(page_no)
+        dropped = [p for p in self.pages
+                   if p.job_id == jid and p.page_no >= cut]
+        if not dropped:
+            return []
+        self.pages = [p for p in self.pages
+                      if not (p.job_id == jid and p.page_no >= cut)]
+        self.updated_at = time.time()
+        if drop_cache:
+            for p in dropped:
+                try:
+                    if p.cache_path and os.path.isfile(p.cache_path):
+                        os.remove(p.cache_path)
+                except OSError as e:
+                    logger.debug("删除被丢弃的缓存页失败 [%s]: %s", p.cache_path, e)
+        return dropped
+
     def _next_page_no(self, job_id: str) -> int:
         """该 job 内下一个可用页号"""
         nos = [p.page_no for p in self.pages if p.job_id == job_id]

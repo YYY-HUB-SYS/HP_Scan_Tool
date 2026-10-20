@@ -479,3 +479,69 @@ class TestModuleConstraints:
     def test_path_traversal_session_id_rejected(self, store):
         with pytest.raises(ValueError):
             store.path_for("../evil")
+
+
+# ── 删页（"从第 N 页重扫"用）────────────────────────────────────────────
+
+
+class TestRemovePagesFrom:
+    """
+    `SessionStore.save()` 的合并**只进不退**（报告 §3.4 的已知不足），
+    所以"从第 N 页重扫"需要这个显式方法。
+
+    语义：范围限定在**指定 job 内** —— 会话里其它 job（先前批次）的页不受影响。
+    """
+
+    @staticmethod
+    def _mk_page(tmp_path, job_id, page_no):
+        p = tmp_path / "cache" / job_id / f"page_{page_no:03d}.jpg"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * (page_no * 10))
+        return str(p)
+
+    def test_removes_from_cut_within_that_job_only(self, tmp_path, store):
+        s = _make_session(mode="batch")
+        s.add_pages("jobA", [self._mk_page(tmp_path, "jobA", i)
+                             for i in (1, 2, 3)])
+        s.add_pages("jobB", [self._mk_page(tmp_path, "jobB", i)
+                             for i in (1, 2)])
+        assert s.total_pages == 5
+
+        dropped = s.remove_pages_from("jobA", 2)
+        assert [p.page_no for p in dropped] == [2, 3]
+        assert s.total_pages == 3
+        assert sorted(p.page_no for p in s.pages if p.job_id == "jobB") == [1, 2]
+        assert sorted(p.page_no for p in s.pages if p.job_id == "jobA") == [1]
+
+    def test_cut_beyond_last_page_removes_nothing(self, tmp_path, store):
+        s = _make_session(mode="batch")
+        s.add_pages("jobA", [self._mk_page(tmp_path, "jobA", 1)])
+        dropped = s.remove_pages_from("jobA", 99)
+        assert dropped == []
+        assert s.total_pages == 1
+
+    def test_drop_cache_removes_files_but_keeps_earlier_ones(self, tmp_path, store):
+        s = _make_session(mode="batch")
+        paths = [self._mk_page(tmp_path, "jobA", i) for i in (1, 2, 3)]
+        s.add_pages("jobA", paths)
+        s.remove_pages_from("jobA", 2)
+        assert os.path.isfile(paths[0]), "第 1 页必须保留"
+        assert not os.path.exists(paths[1]), "第 2 页的缓存文件必须删掉"
+        assert not os.path.exists(paths[2]), "第 3 页的缓存文件必须删掉"
+
+    def test_drop_cache_false_keeps_files(self, tmp_path, store):
+        s = _make_session(mode="batch")
+        paths = [self._mk_page(tmp_path, "jobA", i) for i in (1, 2)]
+        s.add_pages("jobA", paths)
+        s.remove_pages_from("jobA", 2, drop_cache=False)
+        assert os.path.isfile(paths[1]), "drop_cache=False 时不该删文件"
+
+    def test_survives_save_load_roundtrip(self, tmp_path, store):
+        s = _make_session(mode="batch")
+        s.add_pages("jobA", [self._mk_page(tmp_path, "jobA", i)
+                             for i in (1, 2, 3)])
+        s.remove_pages_from("jobA", 2)
+        store.save(s)
+        again = store.load(s.session_id)
+        assert again is not None
+        assert [p.page_no for p in again.pages] == [1]
