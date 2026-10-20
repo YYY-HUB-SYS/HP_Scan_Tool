@@ -18,6 +18,10 @@ AIGC:
 
 > 版本: v3.1 | 日期: 2026-07-16 | 作者: Marvis
 
+> ⚠️ **2026-10-21 文档一致性订正（本次）**：本文档正文写于 v3.1（2026-07-16，CustomTkinter 时代），仓库现为 **v4.0（PySide6）**。
+> 本次只做**文字订正**，不改章节结构；已按代码现状就地订正的是**可逐条核实的点**（函数/模块名、文件路径、依赖项、体积与行数等数字）。
+> 仍然描述 v3.1 实现、但本轮**未改写**的部分（§2.6 UI 规格、§7 UI 规范、§8 错误处理矩阵等）统一在正文里就地标注了 `⚠️ v3.1 遗留`，**以代码为准**。
+
 ---
 
 ## 目录
@@ -52,8 +56,8 @@ AIGC:
 |--------|-------------|---------------|
 | 免驱 | 需安装厂商数百MB驱动包 | eSCL 协议纯 HTTP/XML，零驱动 |
 | 零配置 | IP 地址难记、Web 界面操作繁琐 | mDNS 自动发现 + 历史记录秒加载 |
-| 现代 UI | HP Smart 臃肿、Web 界面卡顿 | CustomTkinter 本地原生窗口，深色/浅色双主题 |
-| 单文件便携 | 需要安装步骤和管理员权限 | 单文件 EXE 约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测），U 盘即走 |
+| 现代 UI | HP Smart 臃肿、Web 界面卡顿 | PySide6 本地原生窗口（v4.0 已从 CustomTkinter 迁移） |
+| 单文件便携 | 需要安装步骤和管理员权限 | 单文件 EXE 约 **62.8 MB**（2026-10-21 实测 `dist/HP_Scan_Tool.exe` = **65,866,395 字节**；旧数字 64,968,184 字节 / 约 62 MB 是 **2026-10-20 改造前基线**，现已过期），U 盘即走 |
 
 ### 1.3 目标用户画像
 
@@ -80,8 +84,8 @@ AIGC:
 
 ```
 ┌─────────────────────────────────────────────┐
-│                 hp_scan_gui.py               │
-│         (CustomTkinter UI 主程序)            │
+│             hp_scan_gui_pyside.py            │
+│         (PySide6 UI 主程序)                  │
 │   ┌─────────┐  ┌──────────┐  ┌───────────┐ │
 │   │ 发现管理 │  │ 参数面板  │  │ 扫描调度   │ │
 │   └────┬────┘  └──────────┘  └─────┬─────┘ │
@@ -92,6 +96,8 @@ AIGC:
     │(eSCL协议) │              │  (WIA兜底)   │
     └──────────┘              └─────────────┘
 ```
+
+> ⚠️ **v3.1 遗留**：本图是 v3.1 的模块视角。v4.0 实际新增了 `scan_coordinator`（扫描编排）/`cache_manager`（磁盘缓存）/`save_manager`（落盘）等中间层，GUI 不再直连引擎 —— 见 §3.2 当前文件结构。
 
 ### 2.2 打印机发现模块
 
@@ -148,8 +154,8 @@ AIGC:
 |------|---|
 | 优先级 | P0 |
 | 数据源 | `scan_config.json` 中 `saved_ips` 数组 |
-| 加载时机 | `_restore_presets()` — `__init__` 末尾同步调用 |
-| 探活策略 | `_probe_saved()` — 后台逐台调用 probe_escl，每台探通后 `after(0, _rebuild_cards)` 异步刷新 UI |
+| 加载时机 | ⚠️ **v3.1 遗留**：v3.1 写的是 `_restore_presets()` — `__init__` 末尾同步调用；v4.0 的 PySide6 GUI **已无该方法**（`saved_ips` 现在只用于"手动添加"时补写，见 `hp_scan_gui_pyside.py:2269-2272`） |
+| 探活策略 | ⚠️ **v3.1 遗留**：v3.1 写的是 `_probe_saved()` — 后台逐台调用 probe_escl，每台探通后 `after(0, _rebuild_cards)` 异步刷新 UI；v4.0 **已无该方法**，发现统一走 `ScanApp._auto_discover()` → `coordinator.discover_scanners_background(...)` → `_on_discover_finished()` → `_rebuild_cards()` |
 | 去重 | 按 `ip` 字段去重 |
 
 ### 2.3 能力查询模块
@@ -196,9 +202,11 @@ AIGC:
 | 属性 | 值 |
 |------|---|
 | 优先级 | P0 |
-| 实现函数 | `escl_engine.py::execute_scan()` → `scan_to_file()` |
+| 实现函数 | `escl_engine.py::execute_scan()`（返回 `(图片字节, 扩展名)`；**不落盘**） |
 | 超时 | 120 秒（可配置，GUI 中传 90 秒） |
 | 轮询间隔 | 0.5 秒 |
+
+> **2026-10-21 订正**：本节原写「`execute_scan()` → `scan_to_file()`」。`scan_to_file()` 已于 `50aeb59` 删除（死代码、零调用），`execute_scan()` 之后**不再有引擎层的落盘函数**——落盘已下沉到 `save_manager`（见 §2.4.3）。
 
 **完整交互序列**：
 
@@ -238,32 +246,36 @@ M232 系列 ApolloLedmServer 固件创建 ScanJob 后立刻删除 job 记录，�
 | 来源 (source) | Platen（平板）, Feeder（输稿器） | 直接传递 |
 | 双面 (duplex) | true/false | 仅 ADF 支持时可用 |
 
-#### 2.4.3 PDF 转码
+#### 2.4.3 PDF 合成
 
-当用户选择 PDF 格式但打印机返回 JPEG 数据时（部分机型不支持原生 PDF），引擎自动用 Pillow 将 JPEG 转为 PDF：
+**打印机永远只出图片，PDF 由本地合成**（`escl_engine.py:559` 的口径）：选 PDF 时请求层仍要 `image/jpeg`（`REQUEST_FORMAT["pdf"] = ("image/jpeg", "pdf")`），落盘层再用 Pillow 把图片合成为 PDF：
 
 ```
-execute_scan 返回 (jpeg_bytes, "jpg")
+execute_scan 返回 (jpeg_bytes, "jpg")        # 请求的是 jpg，落盘扩展名标为 pdf
     ↓
-scan_to_file 检测 output_format="pdf" && ext!="pdf"
+缓存落 page_001.jpg（扩展名撒谎由 save_manager 归一）
     ↓
-Image.open(BytesIO(data)).convert("RGB").save(pdf_path, "PDF")
+save_manager._write_pdf()  ← 逐页 Image.open + 合成 A4 画布 + 保存 PDF
     ↓
 返回 pdf_path
 ```
+
+> **2026-10-21 订正**：本节原写「引擎用 Pillow 把 JPEG 转为 PDF」，流程图里的 `scan_to_file 检测 output_format="pdf" && ext!="pdf"` 随 `scan_to_file()` 一起于 `50aeb59` 删除。现在**引擎层零 PDF 转换**，转换点唯一且在 `save_manager._write_pdf()`（`save_manager.py:630`）。
 
 #### 2.4.4 ADF 自动检测
 
 扫描前自动检查输稿器状态，无需用户手动切换来源：
 
 ```
-_start_scan → _do_scan
+_start_scan（GUI）→ ScanCoordinator 调度
     ├── if scanner.has_adf:
     │     get_scanner_status() → adf_loaded?
     │     ├── True  → source="Feeder", 状态栏提示"输稿器检测到纸张"
     │     └── False → source="Platen", 状态栏提示"输稿器为空"
-    └── scan_to_file(source=source_val)
+    └── execute_scan(source=source_val)
 ```
+
+> **2026-10-21 订正**：流程图首行原写 `_start_scan → _do_scan`；`_do_scan` 在 v4.0 **不存在**（PySide6 GUI 的 `_start_scan` 直接交给 `ScanCoordinator`）。
 
 #### 2.4.5 WIA 降级扫描
 
@@ -273,51 +285,63 @@ _start_scan → _do_scan
 | 触发条件 | eSCL 不可用（escl_url 为空）时点击扫描 |
 | 实现文件 | `wia_engine.py` |
 | 依赖 | pywin32 (win32com) |
-| 流程 | `list_wia_scanners()` → 取首个扫描仪 → `wia_scan_to_file()` |
+| 流程 | `list_wia_scanners()` → 取首个扫描仪 → `wia_scan()`（失败降级再 `try_wia_scan()`） |
+
+> **2026-10-21 订正**：本行原写 `wia_scan_to_file()`。该函数**在当前代码里不存在**（`wia_engine.py` 的 `__all__` 只有 `list_wia_scanners` / `wia_scan` / `try_wia_scan`），属文档描述了一个不存在的函数。
 
 ### 2.5 配置持久化模块
 
 #### 2.5.1 配置文件路径策略
 
 ```
+# scan_coordinator.py:202-220 / config_io.py:config_dir()
 def _app_dir():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)  # EXE 所在目录
-    return os.path.dirname(os.path.abspath(__file__))  # 脚本所在目录
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        appdata = os.path.expanduser("~")
+    path = os.path.join(appdata, "HP_Scan_Tool")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 ```
 
-**为什么不用 `__file__`**：PyInstaller 单文件模式下 `__file__` 指向 `%TEMP%\_MEIxxxxx\` 临时目录，每次重启被系统清理。EXE 所在目录是稳定持久位置。
+**为什么用 `%APPDATA%` 而不是 EXE 所在目录**：v3.1 曾把配置写在 EXE 同级目录（`sys.executable` 所在），v4.0 已统一改到 Windows 标准应用数据目录 `%APPDATA%\HP_Scan_Tool\`（与 `presets.json` / `history.json` / `profile` 同目录，避免 U 盘只读时写不进去）。
+
+> **2026-10-21 订正**：本节原写 `_app_dir()` 优先取 `os.path.dirname(sys.executable)`、并解释"为什么不用 `__file__`"。当前实现是 `scan_coordinator.py:202` 的 `%APPDATA%` 版本，**EXE 同级目录不再写配置**。
 
 #### 2.5.2 配置写入时机
 
 | 操作 | 写入内容 | 触发函数 |
 |------|---------|---------|
-| 主题切换 | `theme` | `_toggle_theme` → `save_config` |
 | 浏览选择目录 | `output_dir` | `_browse` → `save_config` |
 | 开始扫描 | `resolution`, `color_mode_ui`, `output_format`, `output_dir` | `_start_scan` → `save_config` |
-| 发现/刷新完成 | `saved_ips`, `nicknames` | `_do_discover` → `save_config` |
-| 重命名打印机 | `nicknames` | `set_custom_name` → `save_config` |
+| ⚠️ 主题切换 | ~~`theme`~~ | ~~`_toggle_theme` → `save_config`~~ —— **v3.1 遗留**：全仓 `*.py` 搜 `theme` **零命中**，v4.0 代码里既无主题切换入口也无 `theme` 配置键 |
+| 发现/刷新完成 | `saved_ips`, `nicknames` | ⚠️ **v3.1 遗留**：原写 `_do_discover` → `save_config`；`_do_discover` 在 v4.0 不存在（发现走 `_auto_discover()` → `ScanCoordinator`） |
+| 重命名打印机 | `nicknames` | ⚠️ **v3.1 遗留**：原写 `set_custom_name` → `save_config`；v4.0 是 `_on_rename_requested()` → `_show_rename_dialog()` |
 
 ### 2.6 UI 交互模块
+
+> ⚠️ **v3.1 遗留**：本节整体描述的是 **v3.1 的 CustomTkinter UI**（控件类名、尺寸、配色、交互均为 `ctk` 口径）。v4.0 已迁移到 **PySide6**（`hp_scan_gui_pyside.py`，主窗口 `ScanApp(QMainWindow)`、卡片 `ScannerCard(QFrame)`、对话框 `QDialog`），**窗口标题 `HP Scan Tool v4.0`、最小尺寸 900×620**。下列条目凡点名 `ctk.*` / `CTk*` 的，一律以代码为准。
 
 #### 2.6.1 窗口规格
 
 | 属性 | 值 |
 |------|---|
-| 默认尺寸 | 840×620 px |
-| 最小尺寸 | 720×500 px |
-| 标题 | "惠普集成扫描工具" |
+| 默认尺寸 | ⚠️ v3.1 写 840×620 px（v4.0 实际：`setMinimumSize(900, 620)`，宽度随 `resize(width, height)` 自适应） |
+| 最小尺寸 | ⚠️ v3.1 写 720×500 px（v4.0 实际：`hp_scan_gui_pyside.py:1086` → 900×620） |
+| 标题 | "惠普集成扫描工具"（v4.0 实际：`HP Scan Tool v4.0`） |
 | 布局 | 顶栏 + 左栏(扫描仪列表) + 右栏(操作面板) + 底部进度条 |
 
 #### 2.6.2 主题系统
 
+> ⚠️ **v3.1 遗留（整节失效）**：全仓 `*.py` 搜 `theme` **零命中**，`ctk.set_appearance_mode()` 在 v4.0 不存在，配置里也没有 `theme` 键。v4.0 是**单主题**（`resources/styles/app.qss` + `hp_scan_gui_pyside.py:89 COLORS`）。
+
 | 属性 | 值 |
 |------|---|
-| 默认主题 | 上次使用的主题（配置持久化） |
-| 切换控件 | 顶栏右侧 SegmentedButton [light | dark] |
-| 联动范围 | 全局 `ctk.set_appearance_mode()`，所有 CTk 控件自动适配 |
+| 默认主题 | ⚠️ v3.1：上次使用的主题（配置持久化）—— **v4.0 无主题切换** |
+| 切换控件 | ⚠️ v3.1：顶栏右侧 SegmentedButton [light / dark] —— **v4.0 无此控件** |
+| 联动范围 | ⚠️ v3.1：全局 `ctk.set_appearance_mode()`，所有 CTk 控件自动适配 —— **v4.0 无此调用** |
 | 配色约束 | 标签全部高对比度（深色底+白字），按钮 text_color 手动适配双主题 |
 
 #### 2.6.3 扫描仪卡片
@@ -369,48 +393,51 @@ CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 | 层级 | 技术 | 版本要求 | 用途 |
 |------|------|---------|------|
 | 语言 | Python | ≥ 3.10 | — |
-| GUI | CustomTkinter | 6.0.0 | 现代扁平 UI 框架 |
+| GUI | PySide6 | ≥ 6.5 | 现代扁平 UI 框架（v4.0；v3.1 用的是 CustomTkinter 6.0.0，已弃用） |
 | 网络发现 | python-zeroconf | ≥ 0.39 | mDNS/DNS-SD 服务发现 |
+| WSD 发现 | wsdiscovery | ≥ 2.0 | WS-Discovery（UDP 3702 发现 / 5357 元数据） |
 | HTTP 客户端 | requests | ≥ 2.28 | eSCL REST API 调用 |
+| HTTP 底层 | urllib3 | ≥ 1.26 | requests 的传输层依赖 |
 | XML 解析 | xml.etree.ElementTree | 内置 | eSCL XML 解析 |
-| 图像处理 | Pillow (PIL) | ≥ 9.0 | JPEG→PDF 转码 |
-| WIA 扫描 | pywin32 | ≥ 305 | Windows WIA COM 接口 |
+| 图像处理 | Pillow (PIL) | ≥ 9.0 | 多页 PDF 合成 / A4 归一 / 曝光后处理 |
+| PDF 读写 | pypdf | ≥ 6.0 | 多页 PDF 拆页与合并 |
+| WIA 扫描 | pywin32 | ≥ 306 | Windows WIA COM 接口 |
 | 打包 | PyInstaller | ≥ 6.0 | 单文件 EXE 打包 |
+
+> **2026-10-21 订正**：`requirements.txt` 实有 **8** 条依赖，本表原为 7 条且 `GUI` 一行写的是已弃用的 CustomTkinter。已按 `requirements.txt` 逐条对齐（补 `wsdiscovery` / `urllib3` / `pypdf`，`pywin32` 下限对齐 `>=306`）。
 
 ### 3.2 文件结构
 
 ```
 HP_Scan_Tool/
-├── hp_scan_gui.py          # GUI 主程序（752 行）
-│   ├── class ScanApp(ctk.CTk)     # 主窗口
-│   │   ├── 发现: _restore_presets / _auto_discover / _do_discover / _probe_saved
-│   │   ├── 选择: select_scanner
-│   │   ├── 扫描: _start_scan / _do_scan / _wia_scan / _scan_done
-│   │   ├── 能力: _query_caps / _check_status
-│   │   └── 配置: load_config / save_config / _browse / set_custom_name
-│   └── class ScannerCard(ctk.CTkFrame)  # 扫描仪卡片
-│
-├── escl_engine.py          # eSCL 协议引擎（452 行）
-│   ├── ScannerInfo / ScanJob       # 数据结构
-│   ├── discover_scanners()         # mDNS 发现
-│   ├── probe_escl()                # eSCL 探测
-│   ├── fetch_capabilities()        # 能力查询
-│   ├── get_scanner_status()        # 状态查询
-│   ├── execute_scan()              # 扫描执行（核心）
-│   └── scan_to_file()              # 扫描+保存
-│
-├── wia_engine.py           # WIA 扫描引擎（169 行）
-│   ├── list_wia_scanners()
-│   ├── wia_scan_to_file()
-│   └── try_wia_scan()
-│
+├── hp_scan_gui_pyside.py   # GUI 主程序（PySide6）
+├── escl_engine.py          # eSCL/AirScan 协议引擎
+├── wia_engine.py           # WIA 降级引擎（本地 USB 降级）
+├── wsd_engine.py           # WS-Discovery 引擎（UDP 3702 发现 / 5357 元数据）
+├── listen_engine.py        # 监听模式（等待面板触发）
+├── scan_coordinator.py     # 扫描编排器（业务逻辑层）
+├── save_manager.py         # 落盘（多页 PDF 合成 / A4 归一 / 曝光）
+├── cache_manager.py        # 磁盘缓存管理
+├── document_session.py     # 扫描会话模型（多页 / 分组 / 续扫）
+├── doc_merge.py            # 双面 / 批次合并纯函数
+├── exposure.py             # 曝光后处理（auto / manual）
+├── skew_detect.py          # 倾斜角检测引擎（纯 PIL）
+├── page_meta.py            # 每页元数据（页码 / 尺寸 / 来源）
+├── preset_manager.py       # 曝光 / 扫描预设（内置 4 个 + 用户自定义）
+├── profile_manager.py      # 按设备保存扫描参数
+├── history_manager.py      # 扫描历史日志
+├── config_io.py            # 配置 I/O 共享层（原子写 + 跨进程锁）
+├── cli.py                  # CLI 命令行入口
 ├── build_exe.py            # PyInstaller 打包脚本
+├── tools/verify_scan.py    # 真机扫描验证脚本（产出 report.json）
 ├── requirements.txt        # pip 依赖声明
 ├── run.bat                 # 开发环境启动脚本
 ├── PRD.md                  # 本文件
 └── dist/
-    └── HP_Scan_Tool.exe    # 最终交付物（约 62 MB：2026-10-20 改造前基线实测 64,968,184 字节；仓库 `dist/` 现存为 2026-07-28 的 63,452,740 字节旧包；此后新增 pypdf 与曝光/会话模块，体积待重测）
+    └── HP_Scan_Tool.exe    # 最终交付物（2026-10-21 实测 65,866,395 字节 ≈ 62.8 MB；旧数字 64,968,184 字节 / 约 62 MB 是 2026-10-20 改造前基线）
 ```
+
+> **2026-10-21 订正**：本节原是 v3.1 的 6 项文件清单（含 `hp_scan_gui.py` 这个**已改名**的文件、`scan_to_file()` 这个**已删除**的函数、`wia_scan_to_file()` 这个**从不存在**的函数），并带易过期的行数（752 / 452 / 169）。现按 `git ls-files` 的**当前根模块清单**重列，格式与 `README.md`「项目结构」一致（模块名 + 职责，不写行数）。行数在本仓会随并行开发漂移，不再写进文档。
 
 ### 3.3 线程模型
 
@@ -428,21 +455,31 @@ HP_Scan_Tool/
 ### 3.4 打包配置
 
 ```python
-# build_exe.py 核心参数
+# build_exe.py 核心参数（与 build_exe.py:97-131 实际命令一致）
 "--onefile"              # 单文件 EXE
 "--windowed"             # 无控制台窗口
 "--name", "HP_Scan_Tool"
-"--add-data", "escl_engine.py;."   # 内嵌引擎
-"--add-data", "wia_engine.py;."    # 内嵌 WIA 引擎
-"--hidden-import", "requests"
-"--hidden-import", "zeroconf"
-"--hidden-import", "customtkinter"
-"--hidden-import", "PIL"
+"--add-data", "resources;resources"   # 内嵌资源（字体/图标/QSS）
+"--icon", "resources/icons/app.ico"    # EXE 图标
+"--version-file", ...    # 现场生成 version_info.txt（v4.0.0.0）
+# 项目内模块
+"--hidden-import", "escl_engine" / "wia_engine" / "wsd_engine" / "listen_engine"
+"--hidden-import", "scan_coordinator" / "save_manager" / "cache_manager"
+"--hidden-import", "history_manager" / "profile_manager"
+# 第三方依赖
+"--hidden-import", "requests" / "urllib3" / "zeroconf"
+"--hidden-import", "PIL" / "PIL.Image" / "xml.etree.ElementTree"
+# 排除：Pillow 的 TYPE_CHECKING 分支会顺带拖进 numpy（含 OpenBLAS 约 9 MB）
+"--exclude-module", "numpy"
 "--clean"
 "--noconfirm"
+# 入口脚本
+"hp_scan_gui_pyside.py"
 ```
 
-产物大小：~22 MB（含 Python 运行时 + 全部依赖 + 资源）
+> **2026-10-21 订正**：本节原写的 `--add-data escl_engine.py;.` / `--add-data wia_engine.py;.`（v3.1 靠 add-data 内嵌引擎，v4.0 改用 `--hidden-import`）与 `--hidden-import customtkinter`（已弃用依赖）均已不存在于 `build_exe.py`，"~22 MB" 也与实测不符。现按 `build_exe.py` 实际命令逐行对齐。
+
+产物大小：**约 62.8 MB**（2026-10-21 实测 `dist/HP_Scan_Tool.exe` = **65,866,395 字节**；含 Python 运行时 + 全部依赖 + 资源。旧文档写的 64,968,184 字节 / 约 62 MB 是 **2026-10-20 改造前基线**）
 
 ---
 
@@ -557,7 +594,7 @@ class ScannerInfo:
         return self.model or self.name
 ```
 
-### 5.2 ScanJob（保留，当前未用于轮询）
+### 5.2 ScanJob（⚠️ 当前代码里没有这个类）
 
 ```python
 @dataclass
@@ -567,9 +604,12 @@ class ScanJob:
     state: str = "Pending"
 ```
 
+> **2026-10-21 订正**：本节原标题写「ScanJob（保留，当前未用于轮询）」，但**当前 `escl_engine.py` 里根本没有 `ScanJob` 这个类**（`git grep -n 'class ScanJob' -- '*.py'` 零命中；只有 `ScanJobCancelled` 异常类）。轮询用的 job URI 由 `_create_scan_job()` 以 `(base, job_uri, ext)` 元组返回，不经过数据结构体。原文保留在此仅作 v3.1 历史记录。
+
 ### 5.3 格式映射表
 
 ```python
+# escl_engine.py:542-561
 FORMAT_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "png": "image/png",
@@ -581,10 +621,23 @@ MIME_EXT = {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/tiff": "tiff",
+    "image/bmp": "bmp",
     "application/pdf": "pdf",
     "application/octet-stream": "jpg",  # 未知 MIME 降级为 jpg
 }
+
+# 用户选择的输出格式 → (向打印机请求的 MIME, 落盘扩展名)
+REQUEST_FORMAT = {
+    "jpg":  ("image/jpeg", "jpg"),
+    "jpeg": ("image/jpeg", "jpg"),
+    "png":  ("image/png",  "png"),
+    "tiff": ("image/tiff", "tiff"),
+    "tif":  ("image/tiff", "tiff"),
+    "pdf":  ("image/jpeg", "pdf"),   # 请求图片，落盘时本地合成 PDF
+}
 ```
+
+> **2026-10-21 订正**：原文漏了 `MIME_EXT` 的 `"image/bmp": "bmp"` 一项，也**没有 `REQUEST_FORMAT`** —— 而 `REQUEST_FORMAT` 才是扫描请求真正用的表（`pdf` 请求的是 `image/jpeg`，PDF 由本地合成，见 §2.4.3）。`FORMAT_MIME` / `MIME_EXT` 已保留但不再用于请求层。
 
 ---
 
@@ -592,18 +645,25 @@ MIME_EXT = {
 
 ### 6.1 文件位置
 
-- **开发模式**：`HP_Scan_Tool/scan_config.json`（脚本同级目录）
-- **EXE 模式**：`HP_Scan_Tool.exe 所在目录/scan_config.json`
+- **统一位置**：`%APPDATA%\HP_Scan_Tool\scan_config.json`（开发模式与 EXE 模式**相同**）
+- 同目录还有：`presets.json`（`preset_manager._presets_path()`）、`history.json`（`history_manager`）、各设备档案（`profile_manager`）
+
+> **2026-10-21 订正**：本节原写「开发模式 = 脚本同级目录 / EXE 模式 = EXE 所在目录」。v4.0 已统一改到 Windows 标准应用数据目录 `%APPDATA%\HP_Scan_Tool\`（`scan_coordinator.py:202 _app_dir()` / `config_io.py:config_dir()`），**EXE 同级目录不再写配置**。
 
 ### 6.2 JSON Schema
 
 ```json
 {
-  "theme": "dark",
   "resolution": 300,
   "color_mode_ui": "彩色",
   "output_format": "jpg",
+  "source": "平板",
+  "duplex": false,
+  "direct_save": false,
   "output_dir": "D:\\Scans",
+  "extra_dirs": [],
+  "disabled_ips": [],
+  "selected_scanner_ip": "x.x.x.x",
   "saved_ips": [
     {"ip": "x.x.x.x", "model": "HP LaserJet MFP M232-M237"},
     {"ip": "x.x.x.x", "model": "HP LaserJet MFP M232-M237"}
@@ -611,23 +671,39 @@ MIME_EXT = {
   "nicknames": {
     "x.x.x.x": "财务室打印机",
     "x.x.x.x": "三楼 HP 7720"
-  }
+  },
+  "window_width": 1050,
+  "window_height": 720,
+  "window_x": 100,
+  "window_y": 100
 }
 ```
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `theme` | string | `"dark"` | 界面主题，`"dark"` 或 `"light"` |
 | `resolution` | int | `300` | 上次使用的扫描分辨率 |
 | `color_mode_ui` | string | `"彩色"` | 上次使用的颜色模式（UI 显示值） |
 | `output_format` | string | `"jpg"` | 上次使用的输出格式 |
-| `output_dir` | string | `~/Documents/HP_Scans` | 扫描文件保存目录 |
+| `source` | string | `"平板"` | 上次使用的来源（平板 / 输稿器） |
+| `duplex` | bool | `false` | 上次是否勾选双面 |
+| `direct_save` | bool | `false` | 上次是否启用"直存" |
+| `output_dir` | string | `~/Documents/HP_Scans` | 扫描文件保存目录（`scan_coordinator.DEFAULT_OUT_DIR`） |
+| `extra_dirs` | array | `[]` | 额外复制目录列表 |
+| `disabled_ips` | array | `[]` | 被用户停用的设备 IP |
+| `selected_scanner_ip` | string | — | 上次选中的设备 IP |
 | `saved_ips` | array | `[]` | 已发现的打印机 IP 和型号 |
 | `nicknames` | object | `{}` | 用户自定义名称，key=IP, value=名称 |
+| `window_width` / `window_height` / `window_x` / `window_y` | int | `1050` / `720` / — / — | 主窗口位置与尺寸（恢复用） |
+| ~~`theme`~~ | — | — | **v3.1 遗留**：全仓 `*.py` 搜 `theme` 零命中，v4.0 代码里既无主题开关也无此配置键 |
+
+> **2026-10-21 订正**：原文的 schema 缺 `source` / `duplex` / `direct_save` / `extra_dirs` / `disabled_ips` / `selected_scanner_ip` / `window_*` 共 9 个**代码里真实存在**的键，且多了一个**代码里不存在**的 `theme` 键。以上键集合按 HEAD 时点（`hp_scan_gui_pyside.py` 的 `cfg[...]` 写点与 `cfg.get(...)` 读点）逐条核对。
+> ⚠️ 另：在途的纠偏接入批次（尚未提交）还会新增 4 个纠偏相关键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`），落地后本表需再订正。
 
 ---
 
 ## 7. UI 规范
+
+> ⚠️ **v3.1 遗留**：本节整体描述 v3.1 的 CustomTkinter UI（`[light│dark]` 切换、`gray55`/`gray40`、`CTkToplevel`、`messagebox.*`）。v4.0 已迁移到 **PySide6**（`hp_scan_gui_pyside.py`）：**无主题切换**、卡片配色取自 `hp_scan_gui_pyside.py:89 COLORS`、对话框用 `QDialog`、提示用 `QMessageBox.*`。以下条目凡点名 `ctk.*` / `CTk*` / `messagebox.*` 的，一律**以代码为准**。
 
 ### 7.1 布局结构
 
@@ -652,12 +728,16 @@ MIME_EXT = {
 └─────────────────────────────────────────────────────┘
 ```
 
+> ⚠️ 顶栏的 `[light│dark]` 在 v4.0 **不存在**（无主题切换）。
+
 ### 7.2 卡片状态
 
 | 状态 | 边框颜色(light/dark) | 边框宽度 |
 |------|---------------------|---------|
 | 未选中 | `gray55` / `gray40` | 1px |
 | 选中 | `#3B8ED0` / `#1F6AA5` | 2px |
+
+> ⚠️ `gray55` / `gray40` 是 CustomTkinter 的颜色名，v4.0 实际取自 `hp_scan_gui_pyside.py:89 COLORS`（单主题）。
 
 ### 7.3 对话框
 
@@ -667,16 +747,18 @@ MIME_EXT = {
 | 打印机状态 | showinfo | 点击"预览状态" | State(Idle/Processing/Unknown) + ADF有纸(是/否) |
 | 扫描完成 | askyesno | 扫描成功 | "已保存: {路径}" + "打开所在文件夹？" |
 | 扫描失败 | showerror | 扫描异常 | 异常类型+消息+traceback + 排查提示 |
-| 手动添加 | CTkToplevel | 点击"手动添加" | IP输入框 + 探测按钮 + 结果反馈 |
-| 重命名 | CTkToplevel | 右键卡片 | 名称输入框 + 确认按钮 |
+| 手动添加 | ~~CTkToplevel~~ → `QDialog` | 点击"手动添加" | IP输入框 + 探测按钮 + 结果反馈 |
+| 重命名 | ~~CTkToplevel~~ → `QDialog` | 右键卡片 | 名称输入框 + 确认按钮 |
+
+> **2026-10-21 订正**：原表两行点名 `CTkToplevel` —— 该类**在当前代码里不存在**（v4.0 用 `QDialog`，见 `hp_scan_gui_pyside.py:1698` / `:2200`）。`showinfo` / `askyesno` / `showerror` 同理，v4.0 是 `QMessageBox.information` / `question` / `critical`。
 
 ### 7.4 通知方式
 
 | 优先级 | 方式 | 场景 |
 |--------|------|------|
 | 信息 | 状态栏文字更新 | 发现完成、选中切换、ADF 自动切换 |
-| 警告 | messagebox.showwarning | 未选打印机就点扫描/查询 |
-| 错误 | messagebox.showerror | 扫描失败 |
+| 警告 | ~~messagebox.showwarning~~ → `QMessageBox.warning` | 未选打印机就点扫描/查询 |
+| 错误 | ~~messagebox.showerror~~ → `QMessageBox.critical` | 扫描失败 |
 | 进度 | 底部不确定进度条 | 搜索中、扫描中 |
 
 ---
@@ -685,12 +767,16 @@ MIME_EXT = {
 
 ### 8.1 eSCL 引擎错误
 
+> ⚠️ **v3.1 遗留 + 2026-10-21 订正**：原表把异常类型写成裸 `RuntimeError` / `TimeoutError`。v4.0 引擎层改用**专用异常类**（都在 `escl_engine.py`，`ScanDeviceError` / `ScanCancelled` 均为 `RuntimeError` 子类）：`ScanDeviceError`（设备/协议/超时）、`ScanCancelled` 与 `ScanJobCancelled`（用户取消）。下表已按 HEAD 的实际 `raise` 点对齐。
+
 | 异常类型 | 触发条件 | 处理方式 | UI 表现 |
 |---------|---------|---------|--------|
-| `RuntimeError: 未配置 eSCL URL` | escl_url 为空时调用 execute_scan | 抛出 | messagebox: "该打印机未探测到 eSCL，将尝试 WIA" |
-| `RuntimeError: 创建扫描任务失败 HTTP {code}` | POST ScanJobs 返回非 2xx | 抛出 + 附响应体前 300 字符 | showerror: traceback |
-| `RuntimeError: 无法获取 ScanJob URI` | 201 但无 Location 且响应体无 JobUri | 抛出 | showerror: traceback |
-| `TimeoutError: 扫描超时（{t}s）` | NextDocument 轮询超时 | 抛出 | showerror: 含排查提示 |
+| `ScanDeviceError: 未配置 eSCL URL` | escl_url 为空时调用 execute_scan | 抛出 | messagebox: "该打印机未探测到 eSCL，将尝试 WIA" |
+| `ScanDeviceError: 创建扫描任务失败 HTTP {code}: {body[:300]}` | POST ScanJobs 返回非 2xx | 抛出 + 附响应体前 300 字符 | showerror: traceback |
+| `ScanDeviceError: 无法获取 ScanJob URI` | 201 但无 Location 且响应体无 JobUri | 抛出 | showerror: traceback |
+| `ScanDeviceError: 扫描数据已过期（HTTP 410），请放纸后重试` | NextDocument 返回 410 | 抛出 | showerror |
+| `ScanDeviceError: {SCAN_TIMEOUT_MESSAGE}` | NextDocument 轮询超时 | 抛出 | showerror: 含排查提示 |
+| `ScanCancelled` / `ScanJobCancelled` | 用户取消扫描（含 409 退避期间取消） | 抛出（语义=取消，不是失败） | 静默收尾，不弹错误框 |
 | `requests.RequestException` | 网络超时/连接拒绝 | 轮询中静默忽略 | 继续下一轮 |
 | `Exception` (fetch_capabilities) | XML 解析失败 | `pass` 吞掉 | 返回原 ScannerInfo 对象 |
 
@@ -698,9 +784,9 @@ MIME_EXT = {
 
 | 异常类型 | 处理方式 |
 |---------|---------|
-| 扫描线程内任何异常 | `traceback.format_exc()` → `_scan_done(False, tb)` |
+| 扫描线程内任何异常 | ⚠️ **v3.1 遗留**：原写 `traceback.format_exc()` → `_scan_done(False, tb)`；`_scan_done` 在 v4.0 **已不存在**（异常经 `ScanCoordinator` 的信号回主线程） |
 | WIA 扫描失败 | 返回 None → showerror |
-| 配置文件读写异常 | `try/except pass`，不影响程序运行 |
+| 配置文件读写异常 | `try/except pass`，不影响程序运行（v4.0 改为 `config_io` 原子写 + 跨进程锁，失败记 error 日志） |
 | 目录创建异常 | showerror: "无法创建目录" |
 
 ### 8.3 用户排查提示
@@ -755,21 +841,21 @@ cd <PROJECT_DIR>
 python build_exe.py
 ```
 
-产物：`dist\HP_Scan_Tool.exe`（~22 MB）
+产物：`dist\HP_Scan_Tool.exe`（**约 62.8 MB** —— 2026-10-21 实测 **65,866,395 字节**；旧文档写的 "~22 MB" / "约 62 MB / 64,968,184 字节"分别是 **v3.1 打包时代**与 **2026-10-20 改造前基线**，均已过期）
 
 ### 10.2 开发运行
 
 ```bash
 cd <PROJECT_DIR>
 pip install -r requirements.txt
-python hp_scan_gui.py
+python hp_scan_gui_pyside.py
 ```
 
 或双击 `run.bat`
 
 ### 10.3 分发方式
 
-单文件便携 EXE，无需安装、无需管理员权限。拷贝到任意目录即可运行。配置文件在 EXE 同级目录自动生成。
+单文件便携 EXE，无需安装、无需管理员权限。拷贝到任意目录即可运行。配置文件在 **`%APPDATA%\HP_Scan_Tool\`** 自动生成（v4.0；v3.1 写在 EXE 同级目录）。
 
 ### 10.4 首次使用流程
 
@@ -852,8 +938,8 @@ python hp_scan_gui.py
 | 3 | WIA 仅 USB | 网络扫描仪 WIA 不可用 | P2 | Windows WIA 栈限制 |
 | 4 | ~~M232 ScannerCapabilities 走 HTTPS 301~~ | ~~自签名证书导致能力查询失败~~ | ~~P2~~ | ✅ 已修复 (Bug #11)：全部请求加 verify=False |
 | 5 | 不支持扫描预览 | 扫描前无法预览 | P3 | 需要 eSCL Preview 端点 |
-| 6 | 无扫描历史记录 | 扫描完成后无日志 | P3 | 可在后续版本加入 |
-| 7 | 不支持多页 PDF | ADF 扫描仍导出单页 | P2 | M232 不支持原生 PDF |
+| 6 | ~~无扫描历史记录~~ | ~~扫描完成后无日志~~ | ~~P3~~ | ✅ 已实现：`history_manager.py`（`history.json`，GUI 与 CLI 都在用） |
+| 7 | ~~不支持多页 PDF~~ | ~~ADF 扫描仍导出单页~~ | ~~P2~~ | ✅ 已实现：`save_manager.save_pages()` / `_write_pdf()` 本地合成多页 PDF（不再依赖打印机直出 PDF） |
 
 ---
 
@@ -871,11 +957,11 @@ python hp_scan_gui.py
 | 手动添加 | 输入 x.x.x.x → 探测 | eSCL 探通，追加到列表 |
 | 手动添加无效IP | 输入 1.2.3.4 → 探测 | 提示"不支持 eSCL" |
 | 重命名 | 右键 232dwc-2 → 输入"财务室" → 确认 | 卡片名称变为"财务室"，重启保留 |
-| 主题切换 | light→dark→light | 全局控件联动，无低对比度 |
+| ⚠️ 主题切换 | ~~light→dark→light~~ | ~~全局控件联动，无低对比度~~ —— **v3.1 遗留**：v4.0 无主题切换（见 §2.6.2） |
 | 目录选择 | 浏览 → 选 D:\test → 退出重启 | 保存目录仍为 D:\test |
 | 分辨率切换 | 选 600DPI → 扫描 | 生成高分辨率图片 |
-| PDF 格式 | 选 PDF → M232 扫描 | 自动 JPEG→PDF 转码 |
-| 扫描失败 | 断开网线 → 扫描 | 弹窗显示 TimeoutError + 排查指引 |
+| PDF 格式 | 选 PDF → M232 扫描 | 本地合成为 PDF（`save_manager._write_pdf()`；不再由引擎转码，见 §2.4.3） |
+| 扫描失败 | 断开网线 → 扫描 | 弹窗显示 `ScanDeviceError` + 排查指引 |
 
 ### 13.2 边界测试
 
@@ -883,7 +969,7 @@ python hp_scan_gui.py
 |------|------|
 | 无网络 | 启动不崩溃，列表为空，状态栏"未发现打印机" |
 | 配置文件损坏 | 静默降级为默认配置 |
-| EXE 移动位置 | 配置丢失（合理行为，重新搜索即可） |
+| EXE 移动位置 | ⚠️ v3.1 写"配置丢失"—— **v4.0 已改**：配置在 `%APPDATA%\HP_Scan_Tool\`，移动 EXE **不丢配置** |
 | 长打印机名称 | wraplength=260 自动换行 |
 
 ---
@@ -892,13 +978,13 @@ python hp_scan_gui.py
 
 | 优先级 | 功能 | 说明 |
 |--------|------|------|
-| P1 | 扫描历史记录 | 列表展示最近扫描，支持一键打开 |
-| P1 | 多页 PDF 合成 | ADF 多页扫描 → 合并为单 PDF |
+| P1 | ~~扫描历史记录~~ | ✅ 已实现（`history_manager.py`）—— 列表展示最近扫描，支持一键打开 |
+| P1 | ~~多页 PDF 合成~~ | ✅ 已实现（`save_manager._write_pdf()`）—— ADF 多页扫描 → 本地合并为单 PDF |
 | P2 | 扫描预览 | 低分辨率预览 → 确认 → 正式扫描 |
 | P2 | ~~WSD 协议支持~~ | ✅ 已实现（wsd_engine.py，UDP 3702 发现）—— 扩展兼容老旧打印机 |
 | P2 | 扫描区域裁剪 | 手动指定扫描区域 |
 | P3 | 批量扫描 | 多台打印机并发 |
-| P3 | 命令行模式 | 支持 `HP_Scan_Tool.exe --scan --ip=x --output=file.jpg` |
+| P3 | ~~命令行模式~~ | ✅ 已实现（`cli.py`，子命令 `scan` / `discover` / `history`；⚠️ 形态是 `python cli.py scan --ip ...`，不是 `HP_Scan_Tool.exe --scan`） |
 | P3 | macOS 支持 | 跨平台移植（需替换 WIA 为 ICA） |
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
