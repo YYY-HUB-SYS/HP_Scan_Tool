@@ -5,6 +5,7 @@ ScanCoordinator 单元测试 — HP Scan Tool v4.0
 
 import os
 import threading
+import time
 
 import pytest
 from unittest import mock
@@ -34,10 +35,24 @@ def cache_root(tmp_path, monkeypatch):
     root = str(tmp_path / "cache")
     os.makedirs(root, exist_ok=True)
     monkeypatch.setattr(scan_coordinator.cache_manager, "_default_cache_root", lambda: root)
+    # 同时隔离配置文件路径：否则用户真实的 cache_config.json 里若配了
+    # 自定义 cache_root，_cache_root() 会绕过 _default_cache_root 写到真实目录
+    monkeypatch.setattr(scan_coordinator.cache_manager, "_cache_config_path",
+                        lambda: os.path.join(root, "cache_config.json"))
     monkeypatch.setattr(scan_coordinator.cache_manager, "_config_cache", None)
     monkeypatch.setattr(scan_coordinator.cache_manager, "_config_cache_time", 0)
     monkeypatch.setattr(scan_coordinator.cache_manager, "_active_jobs", set())
     return root
+
+
+@pytest.fixture
+def qt_app():
+    """Qt 事件循环（跨线程信号靠它投递到主线程）"""
+    from PySide6.QtCore import QCoreApplication
+    app = QCoreApplication.instance()
+    if app is None:
+        app = QCoreApplication([])
+    yield app
 
 
 def _params(tmp_path, **kw):
@@ -87,7 +102,19 @@ class TestResolveSource:
                         return_value={"state": "Idle", "adf_loaded": False}):
             assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
 
-    def test_status_failure_keeps_requested_source(self, coordinator, scanner):
+    def test_probe_failure_keeps_requested_source(self, coordinator, scanner):
+        """探测失败时必须保留用户请求的来源，不能静默改成平板。
+
+        生产真实形态：get_scanner_status 把异常吞掉、返回
+        state=="Unknown"、adf_loaded=False，从不抛异常。
+        """
+        scanner.has_adf = True
+        with mock.patch("scan_coordinator.get_scanner_status",
+                        return_value={"state": "Unknown", "adf_loaded": False}):
+            assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
+
+    def test_probe_exception_keeps_requested_source(self, coordinator, scanner):
+        """防御性：即便 get_scanner_status 真的抛异常，来源也不得被改掉"""
         scanner.has_adf = True
         with mock.patch("scan_coordinator.get_scanner_status",
                         side_effect=RuntimeError("boom")):
@@ -145,9 +172,21 @@ class TestRunScanSync:
             with pytest.raises(ScanCancelled):
                 coordinator.run_scan_sync(scanner, _params(tmp_path))
 
+    def test_multipage_empty_raises_cancelled(self, coordinator, scanner, tmp_path, cache_root):
+        """Feeder 分支被取消（引擎返回空页）时也抛 ScanCancelled，与单页一致。
+
+        否则 GUI 会收到"完成但 0 页"和"取消"两种信号。
+        """
+        scanner.has_adf = True
+        with mock.patch("scan_coordinator.get_scanner_status",
+                        return_value={"state": "Idle", "adf_loaded": True}), \
+             mock.patch("scan_coordinator.execute_multipage_scan", return_value=[]):
+            with pytest.raises(ScanCancelled):
+                coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"))
+
 
 class TestSignals:
-    def test_failed_signal_emitted(self, coordinator, scanner, tmp_path):
+    def test_failed_signal_emitted(self, coordinator, scanner, tmp_path, cache_root):
         received = []
         coordinator.scan_failed.connect(lambda jid, err: received.append((jid, err)))
         task = scan_coordinator._ScanTask(coordinator, scanner,
@@ -176,6 +215,31 @@ class TestSignals:
         with mock.patch("scan_coordinator.execute_scan", return_value=(None, "jpg")):
             task.run()
         assert received == ["job_z"]
+
+
+class TestStartScan:
+    def test_start_scan_emits_finished(self, coordinator, scanner, tmp_path,
+                                       cache_root, qt_app):
+        """start_scan → 线程池 → 信号 finished，链路端到端可用"""
+        received = []
+        failed = []
+        coordinator.scan_finished.connect(lambda jid, res: received.append((jid, res)))
+        coordinator.scan_failed.connect(lambda jid, err: failed.append((jid, err)))
+        with mock.patch("scan_coordinator.execute_scan",
+                        return_value=(b"\xff\xd8fake", "jpg")):
+            job_id = coordinator.start_scan(scanner, _params(tmp_path))
+            assert job_id
+            # 等线程池里的任务跑完。跨线程信号是队列投递到主线程的，
+            # 必须转事件循环才会送达（GUI 侧本来就有事件循环）。
+            deadline = time.time() + 5
+            while time.time() < deadline and not received:
+                qt_app.processEvents()
+                time.sleep(0.02)
+        assert not failed, f"扫描失败: {failed}"
+        assert received, "start_scan 未发出 scan_finished"
+        assert received[0][0] == job_id
+        assert received[0][1].page_count == 1
+        coordinator.shutdown()
 
 
 class TestCancelAndShutdown:

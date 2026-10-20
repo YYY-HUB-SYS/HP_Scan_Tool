@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 from PIL import Image
@@ -307,6 +307,14 @@ class ScanCoordinator(QObject):
         - "Feeder"：用户选了输稿器 → 探测到有纸才用 Feeder，否则回退 Platen
         - "Auto"：探测决定，有纸用 Feeder 否则 Platen
         设备没有 ADF 能力或没有 eSCL 地址时，任何请求都落到 Platen。
+
+        探测失败时**保留用户请求的来源**。get_scanner_status 会把
+        RequestException / ParseError 全部吞掉、返回 state=="Unknown"，
+        从不抛异常，所以"探测失败"只能靠 state 判定（下面还有一层
+        except 是防御性的）。若此时把 Feeder 静默改成 Platen，用户选了
+        输稿器却扫了平板且界面无任何提示——改造前这种情形是会失败报错的。
+        保留来源后，扫描本身会去暴露问题（输稿器没纸时扫描失败），
+        与改造前行为一致。
         """
         has_adf = getattr(scanner, "has_adf", False)
         if requested == "Platen":
@@ -315,14 +323,24 @@ class ScanCoordinator(QObject):
             return "Platen", False
         if not has_adf or not getattr(scanner, "escl_url", ""):
             return "Platen", False
+
         try:
             st = get_scanner_status(scanner.escl_url, timeout=5.0)
-            loaded = bool(st.get("adf_loaded"))
         except Exception as e:
-            logger.debug("ADF 状态检测失败，保持原来源: %s", e)
+            # 防御性：当前实现不抛异常，但接口契约上仍可能
+            logger.debug("ADF 状态探测异常，保持原来源: %s", e)
+            st = None
+
+        if st is None or st.get("state") == "Unknown":
+            # 探测失败：无法判断输稿器状态，保留用户请求的来源
             if requested == "Feeder":
                 return "Feeder", False
             return "Platen", False
+
+        loaded = bool(st.get("adf_loaded"))
+        if requested == "Feeder":
+            return ("Feeder", True) if loaded else ("Platen", False)
+        # requested == "Auto"
         return ("Feeder", True) if loaded else ("Platen", False)
 
     def run_scan_sync(self, scanner, params: dict, cancel_event=None,
@@ -357,6 +375,10 @@ class ScanCoordinator(QObject):
                 timeout=300.0, progress_callback=_progress,
                 cancel_event=cancel_event,
             )
+            if not pages:
+                # 取消时引擎会返回空页。与单页分支保持一致，抛 ScanCancelled，
+                # 让"取消"只由 scan_cancelled 信号表达，不出现"完成但 0 页"。
+                raise ScanCancelled(job_id)
             for i, (data, page_ext) in enumerate(pages, 1):
                 ext = page_ext
                 path = cache_manager.write_page(job_id, i, data, page_ext)
