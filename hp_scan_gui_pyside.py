@@ -20,6 +20,7 @@ from PIL import Image
 import cache_manager
 import history_manager
 import profile_manager
+import save_manager
 from scan_coordinator import (
     ScanCoordinator, ScannerInfo, save_config, load_config,
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
@@ -692,79 +693,6 @@ class LoadingDialog(QDialog):
         self.progress.setValue(value)
 
 
-# ────────── 扫描工作线程（QThread + Signal，彻底解决跨线程问题）─────
-class ScanWorker(QThread):
-    """扫描工作线程：纯 QThread，通过 Signal 与主线程通信"""
-    finished_signal = Signal(object)  # (data_bytes, ext) | None=失败
-    error_signal = Signal(str)
-    progress_signal = Signal(str)
-
-    def __init__(self, scanner, resolution, color_mode, output_format,
-                 source, duplex, cancel_event):
-        super().__init__()
-        self.scanner = scanner
-        self.resolution = resolution
-        self.color_mode = color_mode
-        self.output_format = output_format
-        self.source = source
-        self.duplex = duplex
-        self.cancel_event = cancel_event
-
-    def run(self):
-        try:
-            from escl_engine import execute_scan
-            data, ext = execute_scan(
-                scanner=self.scanner, resolution=self.resolution,
-                color_mode=self.color_mode, output_format=self.output_format,
-                source=self.source, duplex=self.duplex,
-                cancel_event=self.cancel_event,
-            )
-            if data and not self.cancel_event.is_set():
-                self.finished_signal.emit((data, ext))
-            else:
-                self.finished_signal.emit(None)
-        except Exception as e:
-            self.error_signal.emit(str(e))
-        finally:
-            self.finished_signal.emit(None)
-
-
-class MultiPageScanWorker(QThread):
-    """多页扫描工作线程"""
-    finished_signal = Signal(object)  # [(data, ext), ...] or []
-    error_signal = Signal(str)
-    progress_signal = Signal(str, int)  # (msg, page_num)
-
-    def __init__(self, scanner, resolution, color_mode, output_format,
-                 source, duplex, cancel_event):
-        super().__init__()
-        self.scanner = scanner
-        self.resolution = resolution
-        self.color_mode = color_mode
-        self.output_format = output_format
-        self.source = source
-        self.duplex = duplex
-        self.cancel_event = cancel_event
-
-    def run(self):
-        try:
-            from escl_engine import execute_multipage_scan
-            pages = execute_multipage_scan(
-                scanner=self.scanner, resolution=self.resolution,
-                color_mode=self.color_mode, output_format=self.output_format,
-                source=self.source, duplex=self.duplex,
-                cancel_event=self.cancel_event,
-                progress_callback=lambda n, _: self.progress_signal.emit(
-                    f"已扫描 {n} 页", n),
-            )
-            if self.cancel_event.is_set():
-                self.finished_signal.emit([])
-            else:
-                self.finished_signal.emit(pages if pages else [])
-        except Exception as e:
-            self.error_signal.emit(str(e))
-
-
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow):
     """主窗口（UI 优化版）"""
@@ -777,6 +705,11 @@ class ScanApp(QMainWindow):
 
         # 业务逻辑层（快速）
         self.coordinator = ScanCoordinator()
+        self.coordinator.scan_progress.connect(self._on_scan_progress)
+        self.coordinator.scan_finished.connect(self._on_scan_finished)
+        self.coordinator.scan_failed.connect(self._on_scan_failed)
+        self.coordinator.scan_cancelled.connect(self._on_scan_cancelled)
+        self._current_job_id = None
         self.coordinator.load_config()
         self.cfg = self.coordinator.cfg
 
@@ -1507,7 +1440,7 @@ class ScanApp(QMainWindow):
 
     # ────────── 扫描 ──────────
     def _start_scan(self):
-        """开始扫描（自动检测 ADF 状态）"""
+        """开始扫描（来源决策与执行下沉到协调器）"""
         if not self.selected:
             QMessageBox.warning(self, "提示", "请先选择一台打印机")
             return
@@ -1523,14 +1456,14 @@ class ScanApp(QMainWindow):
 
         self._save_profile()
 
-        scanner = self.selected
-        source_text = self.source_combo.currentText()
-        if source_text == "ADF":
-            source_val = "Feeder"
-        elif source_text == "自动":
-            source_val = "Auto"
-        else:
-            source_val = "Platen"
+        params = {
+            "resolution": self.resolution_val,
+            "color_mode_ui": self.color_mode_val,
+            "output_format": self.output_format_val,
+            "source": self.source_combo.currentText(),
+            "duplex": self.duplex_val,
+            "output_dir": out_dir,
+        }
 
         self.scan_btn.setText("扫描中...")
         self.scan_btn.setEnabled(False)
@@ -1538,277 +1471,46 @@ class ScanApp(QMainWindow):
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
 
-        # 取消标志
-        self._scan_cancel_event = threading.Event()
-
-        # 添加取消按钮
         self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
         self.cancel_scan_btn.clicked.connect(self._cancel_scan)
         self.status_bar.addPermanentWidget(self.cancel_scan_btn)
 
-        # 决定来源
-        actual_source, use_adf = self._detect_adf_source(scanner, source_val)
-        if use_adf:
-            self.status_bar.showMessage("ADF扫描：输稿器自动进纸，请稍候...")
-            self._start_multipage_worker(scanner, out_dir, actual_source)
-        else:
-            self.status_bar.showMessage("平板扫描进行中，约5-10秒完成...")
-            self._start_single_worker(scanner, out_dir, actual_source)
-
-    def _start_single_worker(self, scanner, out_dir, source_val):
-        """启动单页扫描 QThread"""
-        self._worker = ScanWorker(
-            scanner, self.resolution_val,
-            COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
-            self.output_format_val, source_val, self.duplex_val,
-            self._scan_cancel_event,
-        )
-
-        def _on_result(result):
-            self._worker = None
-            if result is None or not result[0]:
-                self.status_bar.showMessage("扫描取消或失败")
-                self._reset_scan_ui()
-                return
-            data, ext = result
-            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            cache_manager.register_job(job_id)
-            cache_path = cache_manager.write_page(job_id, 1, data, ext)
-            del data
-            self._apply_post_scan_fixups(cache_path)
-            output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-            self._reset_scan_ui()
-            self._show_preview(cache_path, ext, output_path, job_id, scanner)
-
-        self._worker.finished_signal.connect(_on_result)
-        self._worker.error_signal.connect(lambda e: self._scan_error(f"扫描失败: {e}"))
-        self._worker.start()
-
-    def _start_multipage_worker(self, scanner, out_dir, source_val):
-        """启动多页扫描 QThread"""
-        self._worker = MultiPageScanWorker(
-            scanner, self.resolution_val,
-            COLOR_MODE_MAP.get(self.color_mode_val, "RGB24"),
-            self.output_format_val, source_val, self.duplex_val,
-            self._scan_cancel_event,
-        )
-
-        def _on_result(pages):
-            self._worker = None
-            if not pages:
-                self.status_bar.showMessage("扫描取消或失败")
-                self._reset_scan_ui()
-                return
-            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            cache_manager.register_job(job_id)
-            ext = pages[0][1] if pages else self.output_format_val
-            for i, (data, ext) in enumerate(pages, 1):
-                cache_path = cache_manager.write_page(job_id, i, data, ext)
-                del data
-                self._apply_post_scan_fixups(cache_path)
-            output_path = os.path.join(out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-            self._reset_scan_ui()
-            self._show_multi_preview(job_id, ext, output_path, len(pages), scanner)
-
-        self._worker.finished_signal.connect(_on_result)
-        self._worker.error_signal.connect(lambda e: self._scan_error(f"扫描失败: {e}"))
-        self._worker.start()
-
-    def _detect_adf_source(self, scanner, user_source):
-        """根据用户选择决定扫描来源"""
-        if user_source == "Feeder" and scanner.has_adf:
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("ADF 输稿器扫描"))
-            return "Feeder", True
-        if user_source == "Platen":
-            QTimer.singleShot(0, lambda: self.status_bar.showMessage("平板扫描"))
-            return "Platen", False
-        # 自动：1秒快速检测ADF是否有纸（仅通过ScannerStatus，无网络风险）
-        if scanner.has_adf and scanner.escl_url:
-            try:
-                import requests
-                r = requests.get(
-                    f"{scanner.escl_url.rstrip('/')}/ScannerStatus",
-                    timeout=1, verify=False,
-                )
-                if r.status_code == 200 and "ScannerAdfLoaded" in r.text:
-                    QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 检测到ADF有纸"))
-                    return "Feeder", True
-            except Exception:
-                pass
-        QTimer.singleShot(0, lambda: self.status_bar.showMessage("自动 → 平板扫描"))
-        return "Platen", False
+        self._current_job_id = self.coordinator.start_scan(self.selected, params)
 
     def _cancel_scan(self):
         """取消扫描"""
-        if hasattr(self, '_scan_cancel_event'):
-            self._scan_cancel_event.set()
-        # 停止QThread worker（如果还在运行）
-        if hasattr(self, '_worker') and self._worker and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(3000)
-            self._worker = None
+        job_id = getattr(self, "_current_job_id", None)
+        if job_id:
+            self.coordinator.cancel_scan(job_id)
         self.status_bar.showMessage("扫描已取消")
         self._reset_scan_ui()
 
-    def _apply_post_scan_fixups(self, cache_path):
-        """扫描后处理：A4 裁剪（居中，不超过原图）"""
-        try:
-            from escl_engine import crop_to_a4
-            with open(cache_path, "rb") as f:
-                raw = f.read()
-            img = Image.open(io.BytesIO(raw))
-            cropped = crop_to_a4(img, dpi=self.resolution_val)
-            if cropped.size != img.size:
-                buf = io.BytesIO()
-                cropped.convert("RGB").save(buf, format="JPEG")
-                with open(cache_path, "wb") as f:
-                    f.write(buf.getvalue())
-        except Exception:
-            pass
+    # ────────── 协调器信号槽 ──────────
 
-    def _safe_copy_file(self, src, dst, retries=3, delay=0.5):
-        """安全复制文件，带重试机制"""
-        for attempt in range(retries):
-            try:
-                shutil.copy2(src, dst)
-                return True
-            except (IOError, OSError) as e:
-                if attempt < retries - 1:
-                    time.sleep(delay)
-                else:
-                    raise
-        return False
+    def _on_scan_progress(self, job_id, message, page):
+        self.status_bar.showMessage(message)
 
-    def _direct_save(self, cache_path, ext, output_path, job_id, scanner=None):
-        """直接保存（跳过预览）"""
-        try:
-            img = Image.open(cache_path)
-            if ext == "pdf":
-                pdf_path = output_path if output_path.lower().endswith(".pdf") \
-                           else output_path.rsplit(".", 1)[0] + ".pdf"
-                save_as_a4_pdf(img, pdf_path)
-                saved = pdf_path
-            else:
-                final = output_path
-                if not final.lower().endswith(f".{ext}"):
-                    final = f"{final.rsplit('.', 1)[0]}.{ext}"
-                if ext in ("jpg", "jpeg"):
-                    img.convert("RGB").save(final, "JPEG", quality=95)
-                elif ext == "png":
-                    img.save(final, "PNG")
-                elif ext in ("tiff", "tif"):
-                    img.save(final, "TIFF")
-                saved = final
+    def _on_scan_finished(self, job_id, result):
+        self._reset_scan_ui()
+        if not result.cached_paths:
+            self.status_bar.showMessage("扫描未产生任何页面")
+            return
+        scanner = self.selected
+        if result.page_count > 1:
+            self._show_multi_preview(result.job_id, result.ext, result.output_path,
+                                    result.page_count, scanner)
+        else:
+            self._show_preview(result.cached_paths[0], result.ext, result.output_path,
+                              result.job_id, scanner)
 
-            # 复制到额外输出目录
-            for extra_dir in self.extra_dirs:
-                try:
-                    os.makedirs(extra_dir, exist_ok=True)
-                    extra_path = os.path.join(extra_dir, os.path.basename(saved))
-                    if extra_path != saved:
-                        self._safe_copy_file(saved, extra_path)
-                except Exception:
-                    pass
+    def _on_scan_failed(self, job_id, error):
+        self._reset_scan_ui()
+        QMessageBox.critical(self, "扫描错误", error)
+        self.status_bar.showMessage(f"扫描失败: {error[:50]}")
 
-            cache_manager.remove_job(job_id)
-
-            history_manager.append({
-                "device_name": scanner.model if scanner else "",
-                "device_ip": scanner.ip if scanner else "",
-                "page_count": 1,
-                "format": ext,
-                "file_path": saved,
-            })
-
-            self.status_bar.showMessage(f"已保存: {os.path.basename(saved)}")
-            self._reset_scan_ui()
-
-            try:
-                os.startfile(os.path.dirname(saved))
-            except Exception:
-                pass
-
-        except Exception as e:
-            self._scan_error(f"保存失败: {e}")
-
-    def _direct_save_multipage(self, job_id, ext, output_path, page_count, scanner=None):
-        """多页直接保存（跳过预览）"""
-        try:
-            base_path = output_path.rsplit(".", 1)[0]
-            saved_files = []
-
-            if ext == "pdf":
-                pdf_images = []
-                for i in range(1, page_count + 1):
-                    try:
-                        cache_path = os.path.join(
-                            cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
-                        if os.path.exists(cache_path):
-                            img = Image.open(cache_path)
-                            pdf_images.append(img.convert("RGB"))
-                    except Exception:
-                        pass
-                if pdf_images:
-                    pdf_path = f"{base_path}.pdf"
-                    pdf_images[0].save(pdf_path, "PDF", save_all=True,
-                                        append_images=pdf_images[1:])
-                    saved_files.append(pdf_path)
-            else:
-                for i in range(1, page_count + 1):
-                    try:
-                        cache_path = os.path.join(
-                            cache_manager._job_dir(job_id), f"page_{i:03d}.{ext}")
-                        if os.path.exists(cache_path):
-                            fpath = f"{base_path}_{i:03d}.{ext}"
-                            if ext in ("jpg", "jpeg"):
-                                shutil.copy2(cache_path, fpath)
-                            else:
-                                img = Image.open(cache_path)
-                                if ext == "png":
-                                    img.save(fpath, "PNG")
-                                elif ext in ("tiff", "tif"):
-                                    img.save(fpath, "TIFF")
-                                else:
-                                    if img.mode != "RGB":
-                                        img = img.convert("RGB")
-                                    img.save(fpath, "JPEG", quality=95)
-                            saved_files.append(fpath)
-                    except Exception:
-                        pass
-
-            # 复制到额外输出目录
-            for extra_dir in self.extra_dirs:
-                try:
-                    os.makedirs(extra_dir, exist_ok=True)
-                    for fpath in saved_files:
-                        extra_path = os.path.join(extra_dir, os.path.basename(fpath))
-                        if extra_path != fpath:
-                            shutil.copy2(fpath, extra_path)
-                except Exception:
-                    pass
-
-            cache_manager.remove_job(job_id)
-
-            if saved_files:
-                history_manager.append({
-                    "device_name": scanner.model if scanner else "",
-                    "device_ip": scanner.ip if scanner else "",
-                    "page_count": page_count,
-                    "format": ext,
-                    "file_path": saved_files[0],
-                    "file_count": len(saved_files),
-                })
-
-            self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
-            self._reset_scan_ui()
-
-            try:
-                os.startfile(os.path.dirname(saved_files[0]))
-            except Exception:
-                pass
-
-        except Exception as e:
-            self._scan_error(f"保存失败: {e}")
+    def _on_scan_cancelled(self, job_id):
+        self._reset_scan_ui()
+        self.status_bar.showMessage("扫描已取消")
 
     def _reset_scan_ui(self):
         """重置扫描 UI"""
@@ -1879,7 +1581,7 @@ class ScanApp(QMainWindow):
             use_adf = True
         elif source_text == "自动":
             source_val = "Auto"
-            use_adf = False  # 由 _detect_adf_source 判断
+            use_adf = False  # 监听模式不自动探测 ADF
         else:
             source_val = "Platen"
             use_adf = False
@@ -2256,6 +1958,10 @@ class ScanApp(QMainWindow):
         self.cfg["window_x"] = self.x()
         self.cfg["window_y"] = self.y()
         save_config(self.cfg)
+        try:
+            self.coordinator.shutdown()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ────────── 配置文件管理 ──────────
@@ -2441,56 +2147,17 @@ class PreviewDialog(QDialog):
 
     def _confirm(self):
         """保存"""
-        save_path = self.output_path
-        out_ext = self.ext
-
         try:
-            img = Image.open(self.cache_path)
-            if self._rotation:
-                img = img.rotate(self._rotation, expand=True)
-
-            if out_ext == "pdf":
-                pdf_path = save_path if save_path.lower().endswith(".pdf") \
-                           else save_path.rsplit(".", 1)[0] + ".pdf"
-                save_as_a4_pdf(img, pdf_path)
-                saved = pdf_path
-            else:
-                final = save_path
-                if not final.lower().endswith(f".{out_ext}"):
-                    final = f"{final.rsplit('.', 1)[0]}.{out_ext}"
-                if out_ext in ("jpg", "jpeg"):
-                    img.convert("RGB").save(final, "JPEG", quality=95)
-                elif out_ext == "png":
-                    img.save(final, "PNG")
-                elif out_ext in ("tiff", "tif"):
-                    img.save(final, "TIFF")
-                saved = final
-
-            for extra_dir in self.extra_dirs:
-                try:
-                    os.makedirs(extra_dir, exist_ok=True)
-                    extra_path = os.path.join(extra_dir, os.path.basename(saved))
-                    if extra_path != saved:
-                        shutil.copy2(saved, extra_path)
-                except Exception:
-                    pass
-
-            cache_manager.remove_job(self.job_id)
-
-            history_manager.append({
-                "device_name": self.device_name,
-                "device_ip": self.device_ip,
-                "page_count": 1,
-                "format": out_ext,
-                "file_path": saved,
-            })
-
+            saved = save_manager.save_single(
+                self.cache_path, self.ext, self.output_path,
+                rotation=self._rotation, extra_dirs=self.extra_dirs,
+                job_id=self.job_id, device_name=self.device_name,
+                device_ip=self.device_ip)
             self.accept()
             try:
                 os.startfile(os.path.dirname(saved))
             except Exception:
                 pass
-
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
 
@@ -2738,83 +2405,19 @@ class MultiPagePreviewDialog(QDialog):
     def _confirm(self):
         """保存全部"""
         try:
+            page_specs = [(self._cache_path(page_num), self._get_rotation(page_num))
+                          for page_num in self.pages]
             groups = self._build_groups()
-            saved_files = []
-
-            for group_indices in groups:
-                is_pdf = self.ext == "pdf"
-                base_path = self.output_path.rsplit(".", 1)[0]
-
-                if is_pdf:
-                    pdf_images = []
-                    for page_idx in group_indices:
-                        page_num = self.pages[page_idx]
-                        try:
-                            img = Image.open(self._cache_path(page_num))
-                            rotation = self._get_rotation(page_num)
-                            if rotation:
-                                img = img.rotate(rotation, expand=True)
-                            pdf_images.append(img.convert("RGB"))
-                        except Exception:
-                            pass
-                    if pdf_images:
-                        pdf_path = f"{base_path}.pdf"
-                        pdf_images[0].save(pdf_path, "PDF", save_all=True,
-                                            append_images=pdf_images[1:])
-                        saved_files.append(pdf_path)
-                else:
-                    for seq, page_idx in enumerate(group_indices, 1):
-                        page_num = self.pages[page_idx]
-                        try:
-                            cache_file = self._cache_path(page_num)
-                            rotation = self._get_rotation(page_num)
-                            fpath = f"{base_path}_{seq:03d}.{self.ext}"
-                            if self.ext in ("jpg", "jpeg") and not rotation:
-                                shutil.copy2(cache_file, fpath)
-                            else:
-                                img = Image.open(cache_file)
-                                if rotation:
-                                    img = img.rotate(rotation, expand=True)
-                                if self.ext == "png":
-                                    img.save(fpath, "PNG")
-                                elif self.ext in ("tiff", "tif"):
-                                    img.save(fpath, "TIFF")
-                                else:
-                                    if img.mode != "RGB":
-                                        img = img.convert("RGB")
-                                    img.save(fpath, "JPEG", quality=95)
-                            saved_files.append(fpath)
-                        except Exception:
-                            pass
-
-            for extra_dir in self.extra_dirs:
+            saved_files = save_manager.save_pages(
+                self.job_id, self.ext, self.output_path, page_specs, groups,
+                extra_dirs=self.extra_dirs, device_name=self.device_name,
+                device_ip=self.device_ip)
+            self.accept()
+            if saved_files:
                 try:
-                    os.makedirs(extra_dir, exist_ok=True)
-                    for fpath in saved_files:
-                        extra_path = os.path.join(extra_dir, os.path.basename(fpath))
-                        if extra_path != fpath:
-                            shutil.copy2(fpath, extra_path)
+                    os.startfile(os.path.dirname(saved_files[0]))
                 except Exception:
                     pass
-
-            cache_manager.remove_job(self.job_id)
-
-            if saved_files:
-                history_manager.append({
-                    "device_name": self.device_name,
-                    "device_ip": self.device_ip,
-                    "page_count": len(self.pages),
-                    "format": self.ext,
-                    "file_path": saved_files[0],
-                    "file_count": len(saved_files),
-                })
-
-            self.accept()
-            try:
-                os.startfile(os.path.dirname(saved_files[0]))
-            except Exception:
-                pass
-
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
 
