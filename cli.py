@@ -123,6 +123,21 @@ def _write_pdf_via_save_manager(data: bytes, fpath: str,
     return fpath
 
 
+def _timestamped_name(prefix: str, ext: str) -> str:
+    """
+    生成带**微秒**精度时间戳的输出文件名。
+
+    ★ 为什么 CLI 必须单独保证精度（复审 I1）：
+      CLI 的产物名是**自己造的** —— `cli.py` 走的是 `escl_engine.execute_scan`，
+      **根本不经过协调器** ⇒ 协调器那次「秒→毫秒」的改动**覆盖不到这里**。
+      之前 CLI 只到秒 ⇒ 同一秒内完成的两批 CLI 扫描算出**同一个文件名**
+      ⇒ 后写的把先写的整个覆盖掉 ⇒ 先写的那批产物**静默消失**
+      （用户看不到、也没有任何报错）。
+    ★ 命名格式与协调器保持一致（`%Y%m%d_%H%M%S_%f`），便于人工对照。
+    """
+    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+
+
 def cmd_scan(args):
     """执行扫描并保存文件"""
     ip = args.ip
@@ -187,8 +202,9 @@ def cmd_scan(args):
 
     # 保存文件
     os.makedirs(output, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"HP_CLI_{ts}.{ext}"
+    # ★ 微秒精度（复审 I1）：CLI 自己造名、不走协调器 ⇒ 精度必须在这里单独保证，
+    #   否则同一秒内完成的两批会算出同一个文件名 ⇒ 后写的覆盖先写的（产物静默消失）。
+    fname = _timestamped_name("HP_CLI", ext)
     fpath = os.path.join(output, fname)
     device_name = scanner.model or f"CLI-{ip}"
 
