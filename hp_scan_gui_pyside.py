@@ -78,7 +78,7 @@ logger.info(f"cwd={os.getcwd()}")
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize,
     QPropertyAnimation, QEasingCurve,
-    QRect, QObject, QMutexLocker,
+    QRect, QObject,
     QEventLoop,
 )
 from PySide6.QtGui import (
@@ -1590,6 +1590,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self.coordinator.skew_warning.connect(self._on_skew_warning)
         except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
             logger.debug("协调器没有 skew_warning 信号: %s", e)
+        # ★ 配置写入失败（协调器如实上报；GUI 侧此前**零接线**
+        #   ⇒ 用户改了分辨率 / 昵称 / 输出路径，界面显示已改，
+        #     实际**下次启动就丢了**，用户完全不知情）
+        try:
+            self.coordinator.config_save_failed.connect(self._on_config_save_failed)
+        except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
+            logger.debug("协调器没有 config_save_failed 信号: %s", e)
         _ensure_ui_dispatcher()
         self._current_job_id = None
         self.coordinator.load_config()
@@ -2561,6 +2568,29 @@ class ScanApp(QMainWindow, _UiPostMixin):
             QMessageBox.warning(self, "扫描提示", warning)
         except RuntimeError:
             logger.debug("来源提示时主窗口已销毁")
+
+    def _on_config_save_failed(self, context):
+        """
+        协调器报告「配置没落盘」（拿不到跨进程锁 / 写盘异常）。
+
+        ★ 不接的后果：用户改了分辨率 / 昵称 / 输出路径，界面显示已改，
+          实际**下次启动就丢了**，用户完全不知情 —— 典型的"以为生效了"。
+        ★ 提示必须写清两件事：
+          ① 本次修改**未生效**（不是"保存失败"这种含糊说法）；
+          ② 下一步怎么做（配置目录可能被同步盘 / 编辑器 / 杀毒软件占着）。
+        """
+        ctx = str(context) if context else "配置"
+        logger.error("配置未落盘（%s）", ctx)
+        try:
+            self.status_bar.showMessage(
+                f"⚠ {ctx}未保存（本次修改未生效），请关闭占用配置文件的程序后重试")
+            QMessageBox.warning(
+                self, "设置未保存",
+                f"{ctx}未保存，本次修改**未生效**。\n\n"
+                "常见原因：配置文件被其它程序占用（同步盘 / 编辑器 / 杀毒软件）。\n"
+                "请关闭占用它的程序后重新修改一次。")
+        except RuntimeError:
+            logger.debug("配置保存失败提示时主窗口已销毁")
 
     def _on_scan_finished(self, job_id, result):
         self._reset_scan_ui()
@@ -3686,14 +3716,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
         """
         把取消信号登记到协调器（让 `coordinator.cancel_scan(job_id)` 能停掉它）。
 
-        ★ 协调器目前只在 `start_scan` 内部登记它自己那条 eSCL 的 cancel_event，
-          没有对外的登记 API；WIA 路径是 GUI 自己起的线程 ⇒ 这里按协调器的
-          内部约定登记**同一个** event 对象（引擎收到的就是它）。
+        ★ 走**公开 API** `register_external_cancel`，不再直写协调器的私有
+          `_cancel_events` 字典 —— 跨模块私有耦合：协调器一改字段名就
+          **静默断掉**（取消失效，用户只看到"点取消没反应"）。
         ★ 登记失败不致命：GUI 自己持有 event，取消按钮会直接 set 它。
         """
         try:
-            with QMutexLocker(self.coordinator._cancel_mutex):
-                self.coordinator._cancel_events[job_id] = event
+            self.coordinator.register_external_cancel(job_id, event)
             return True
         except Exception as e:
             logger.debug("登记取消信号失败（改用 GUI 侧兜底）: %s", e)
@@ -3702,7 +3731,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
     def _clear_cancel_event(self, job_id):
         """注销协调器里的取消信号（与协调器 _ScanTask 的收尾一致）。"""
         try:
-            self.coordinator._clear_cancel_event(job_id)
+            self.coordinator.unregister_external_cancel(job_id)
         except Exception as e:
             logger.debug("注销取消信号失败: %s", e)
 
