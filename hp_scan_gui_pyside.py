@@ -323,10 +323,20 @@ def _write_image_atomic(img, path, ext):
     - 格式由**扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG），不再一律 JPEG
     - JPEG 固定 quality=95（与多页保存路径一致）
     - 中途异常不会毁掉已存在的目标文件（非原子覆盖的老问题）
+    ★ 临时文件名必须**同进程内唯一**：
+      原先用 `f"{path}.tmp-{os.getpid()}"`，而 `os.getpid()` **对所有线程相同**
+      ⇒ 两个线程同时原子写**同一个目标**时共用同一个临时文件 ⇒ 字节交错
+      ⇒ 目标变成**半截图片**；且 `finally` 里的清理会把**另一个线程正在写的**
+      临时文件删掉 ⇒ 对方 `os.replace` 抛 FileNotFoundError ⇒ 本次更新丢失。
+      ⇒ 改用 `tempfile.mkstemp`（同目录、原子占位、名字唯一），
+      与 `config_io.atomic_write_json` 同一套做法。
     """
     fmt = _ext_format(ext)
     out = _encode_for_format(img, fmt)
-    tmp = f"{path}.tmp-{os.getpid()}"
+    fd, tmp = tempfile.mkstemp(
+        dir=os.path.dirname(os.path.abspath(path)),
+        prefix=os.path.basename(path) + ".tmp-")
+    os.close(fd)
     try:
         if fmt == "JPEG":
             out.save(tmp, "JPEG", quality=95)
@@ -3358,6 +3368,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
         #   ⇒ 两个入口仍可能拿到同一个 output_path ⇒ 需 GUI 侧兜底改用 `{base}_1`
         out_path = _unique_output_path(
             session.output_path or self._default_session_output_path())
+        # ★ 产物路径回写到会话 ⇒ 磁盘上的会话记录里**有**产物路径
+        #   （否则会话落盘后完全指不到刚生成的文件，用户找不到）。
+        session.output_path = out_path
         extra_dirs = list(self.extra_dirs or [])
         session.ext = self.output_format_val or session.ext
         session.dpi = int(self.resolution_val or session.dpi)
@@ -3393,9 +3406,26 @@ class ScanApp(QMainWindow, _UiPostMixin):
         failed = int(getattr(saved_files, "failed_pages", 0) or 0)
         warnings = list(getattr(saved_files, "warnings", []) or [])
         total = session.total_pages if session is not None else len(saved_files)
+        # ★ 会话状态**没能写进磁盘**（save_manager 已回读验证过）。
+        #   此时缓存是 save_manager **特意保留**的 ⇒ 这里若再清缓存，
+        #   会话就指向死路径 ⇒ 那才是真正的幽灵会话；用户也失去重试机会。
+        status_write_failed = bool(
+            getattr(saved_files, "status_write_failed", False))
+        status_write_error = str(
+            getattr(saved_files, "status_write_error", "") or "")
         try:
             if session is not None:
-                if failed:
+                if status_write_failed:
+                    # 不清缓存、不丢弃会话 ⇒ 保持可重试，并如实告知用户
+                    logger.error("会话状态未落盘（%s）⇒ 保留会话与缓存，可重试",
+                                 status_write_error)
+                    try:
+                        self.status_bar.showMessage(
+                            f"⚠ 会话状态未能保存（{status_write_error or '写盘失败'}）"
+                            f"—— 文件已生成，但会话记录未更新，可稍后重试")
+                    except RuntimeError:
+                        logger.debug("会话状态失败提示时主窗口已销毁")
+                elif failed:
                     # 部分页失败 ⇒ 缓存保留、会话留在 paused（可重试）
                     self._set_session_state(session, "paused")
                 else:
@@ -3410,8 +3440,15 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self.status_bar.showMessage(f"会话已保存：{len(saved_files)} 个文件")
             # ★ 关窗等待期间不弹模态框（弹窗会卡住关闭流程）
             if not getattr(self, "_closing", False):
-                QMessageBox.information(
-                    self, "保存完成" if not failed else "保存部分失败", summary)
+                if status_write_failed:
+                    # 状态写失败 ⇒ **不能**说"保存完成"（用户会以为万事大吉）
+                    QMessageBox.warning(
+                        self, "会话状态未保存",
+                        f"文件已生成，但会话状态未能保存（{status_write_error or '写盘失败'}）。\n\n"
+                        "会话与缓存已保留，你可以稍后重新保存。")
+                else:
+                    QMessageBox.information(
+                        self, "保存完成" if not failed else "保存部分失败", summary)
         except RuntimeError:
             logger.debug("会话保存完成时主窗口已销毁")
         finally:
