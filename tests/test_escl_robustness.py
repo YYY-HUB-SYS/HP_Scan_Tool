@@ -179,10 +179,10 @@ class TestScanJobConflict:
     def test_service_unavailable_raises_actionable_message(self):
         """输稿器空载时打印机在创建任务阶段返回 503，错误信息必须可执行。
 
-        ★ 2026-10-21 契约变更：503 不再是"一次都不重试"的分支 ——
-        实测 503 有两个来源（输稿器空载 / 设备还在收尾上一个 ScanJob），
-        503 是**可重试**的瞬时状态 ⇒ 改为与 409 同一套有界退避
-        （2/4/8 秒，共 14 秒，等待可取消），重试用尽后才抛可执行错误。
+        ★ 2026-10-21 契约变更：503 的处置**按来源分流** ——
+        输稿器空载时"等多久都不会成功"（除非用户中途放纸，而 UI 不会提示）
+        ⇒ **不重试**，第一次就抛可执行错误（文案含放纸指引）。
+        （平板的 503 走有界退避重试，见 tests/test_escl_error_messages.py。）
         """
         s = _scanner()
         session = mock.MagicMock()
@@ -196,9 +196,10 @@ class TestScanJobConflict:
         assert "输稿器" in msg
         # 必须给出"放纸"这个可执行动作，不能只说设备名
         assert "纸张" in msg
-        # 503 走有界退避：重试次数有界、退避总时长有界
-        assert session.post.call_count == 4, "503 必须重试（1 次 + 3 次退避）"
-        assert [c.args[0] for c in sleeper.call_args_list] == [2, 4, 8]
+        assert "放纸后请重试" in msg, f"必须明确告诉用户放纸后重试: {msg}"
+        # 输稿器 503 **不重试**：只发一次请求，也不等待
+        assert session.post.call_count == 1, "输稿器 503 不得重试"
+        assert not sleeper.called, "输稿器 503 不得退避等待"
 
     def test_conflict_then_other_error_keeps_original_message(self):
         s = _scanner()

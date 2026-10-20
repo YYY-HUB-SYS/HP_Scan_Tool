@@ -7,10 +7,10 @@ eSCL 409 退避与格式契约回归测试 — HP Scan Tool v4.0
          ⇒ 重试成功概率≈0，只是把错误提示推迟 14 秒
        - time.sleep 不可取消 ⇒ 用户点取消后最多再等 14 秒
        修法：有界退避 + 明确告知 TTL + 分片可取消等待。
-       ★ 2026-10-21 契约变更：503 分支**不再**"一次都不重试" ——
-         实测 503 有两个来源（输稿器空载 / 设备还在收尾上一个 ScanJob，
-         后者间隔 8~10 秒后自愈）⇒ 503 改为与 409 同一套有界退避，
-         且错误文案按来源分流（平板不得把用户指向输稿器）。
+       ★ 2026-10-21 契约变更：503 的处置**按来源分流** —— 平板（设备还在
+         收尾上一个 job，会自愈）走有界退避重试；输稿器（空载等纸，等不出来）
+         **不重试**，第一次就抛"放纸后请重试"；错误文案同样按来源分流
+         （平板不得把用户指向输稿器）。
   m-6（Minor）：--format bmp 静默降级
        修法：CLI 去掉 bmp（显式报错）；协议层对不支持的格式显式抛错。
 """
@@ -128,30 +128,31 @@ class TestConflictMessageTellsTtl:
 
 class TestServiceUnavailableIsRetried:
     """
-    ★ 2026-10-21 契约变更（503 不再是"一次都不重试"的分支）。
+    ★ 2026-10-21 契约变更（503 的处置**按来源分流**）。
 
-    实测 503 有两个来源：
-      ① 输稿器空载（Feeder）—— 设备在等纸；
-      ② 设备还没从上一个 ScanJob 收尾（**Platen 也会收到**）—— 实测
-         间隔 8~10 秒后不再复现 ⇒ 503 是**可重试**的瞬时状态。
+    实测 503 有两个来源，成因不同 ⇒ 处置也必须不同：
+      ① 设备还没从上一个 ScanJob 收尾（**Platen 也会收到**）—— 实测
+         间隔 8~10 秒后不再复现 ⇒ **等一会儿真的会成功** ⇒ 有界退避重试
+         （2/4/8 秒，共 14 秒，等待可取消），重试用尽才抛可读错误；
+      ② 输稿器空载（Feeder）—— 设备在等纸 ⇒ **等多久都不会成功**
+         ⇒ **不重试**，第一次就抛"放纸后请重试"。
 
-    ⇒ 503 改为与 409 同一套**有界退避**（2/4/8 秒，共 14 秒，等待可取消），
-      最终仍失败才抛可读错误；文案按来源分流（平板不得指向输稿器）。
+    文案同样按来源分流（平板不得指向输稿器）。
     """
 
     def test_503_is_retried_with_bounded_backoff(self):
-        """503 ⇒ 有界退避重试；重试用尽后抛可读错误"""
+        """平板 503 ⇒ 有界退避重试；重试用尽后抛可读错误"""
         session = mock.MagicMock()
         session.post.return_value = _Resp(503, "")
 
         with mock.patch("escl_engine.time.sleep") as sleeper:
             with pytest.raises(RuntimeError) as exc:
-                _create(session)
+                _create(session, source="Platen")
 
         msg = str(exc.value)
         assert "503" in msg
-        assert session.post.call_count > 1, "503 必须重试"
-        assert session.post.call_count <= 4, "503 重试次数必须有界"
+        assert session.post.call_count == 4, "平板 503 必须重试（1 次 + 3 次退避）"
+        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0, 8.0]
         total = sum(c.args[0] for c in sleeper.call_args_list)
         assert 0 < total <= 15.0, f"503 退避总时长必须有界: {total}s"
 
@@ -166,17 +167,20 @@ class TestServiceUnavailableIsRetried:
         msg = str(exc.value)
         assert "输稿器" not in msg, f"平板 503 文案不得指向输稿器: {msg}"
 
-    def test_feeder_503_message_keeps_paper_hint(self):
-        """输稿器 503 ⇒ 保留「确认已放纸」的意思"""
+    def test_feeder_503_is_not_retried_and_keeps_paper_hint(self):
+        """输稿器 503 ⇒ 不重试（第一次就抛），且文案保留「放纸」指引"""
         session = mock.MagicMock()
         session.post.return_value = _Resp(503, "")
-        with mock.patch("escl_engine.time.sleep"):
+        with mock.patch("escl_engine.time.sleep") as sleeper:
             with pytest.raises(RuntimeError) as exc:
                 _create(session, source="Feeder")
 
         msg = str(exc.value)
         assert "输稿器" in msg
         assert "纸" in msg
+        assert "放纸后请重试" in msg, f"必须明确告诉用户放纸后重试: {msg}"
+        assert session.post.call_count == 1, "输稿器 503 不得重试"
+        assert not sleeper.called, "输稿器 503 不得退避等待"
 
     def test_409_and_503_stay_separate(self):
         """409 与 503 的文案不得互相污染"""
@@ -184,7 +188,7 @@ class TestServiceUnavailableIsRetried:
         session.post.return_value = _Resp(503, "")
         with mock.patch("escl_engine.time.sleep"):
             with pytest.raises(RuntimeError) as exc:
-                _create(session)
+                _create(session, source="Platen")
         msg = str(exc.value)
         assert "409" not in msg
         assert "15-20 分钟" not in msg

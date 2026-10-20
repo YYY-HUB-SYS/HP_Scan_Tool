@@ -6,8 +6,9 @@ eSCL 错误文案 / 退避 / 传输层失败契约回归测试 — HP Scan Tool 
   P3-a（503 文案 + 退避）
     - 503 的文案必须**按来源**区分：平板(Platen)不能说"去输稿器放纸"
       （本次请求的 InputSource 决定原因，指错方向 = 用户白跑一趟）；
-    - 503 必须有**有界**退避重试（与 409 同一套写法：有限次数 + 有限退避 +
-      等待可被用户取消），最终仍失败才抛可读错误。
+    - 503 的退避**按来源分流**（2026-10-21 主控拍板）：
+      平板/未知 ⇒ 有界退避重试（503 来自"设备还在收尾上一个 job"，会自愈）；
+      输稿器 ⇒ **不重试**（503 来自"空载等纸"，等不出来 ⇒ 白等）。
 
   P3-b（传输层失败的中文指引）
     - requests 的原始异常（urllib3 英文长串）不得原样冒泡给 GUI；
@@ -86,6 +87,7 @@ class TestServiceUnavailableMessageIsSourceAware:
         assert "503" in msg
         assert "输稿器" in msg, f"输稿器 503 必须提到输稿器: {msg}"
         assert "纸" in msg, f"输稿器 503 必须保留放纸指引: {msg}"
+        assert "放纸后请重试" in msg, f"必须明确告诉用户放纸后重试: {msg}"
 
     def test_503_message_does_not_leak_conflict_wording(self):
         """503 与 409 是两种状态，文案不得互相污染。"""
@@ -104,23 +106,72 @@ class TestServiceUnavailableMessageIsSourceAware:
 
 
 class TestServiceUnavailableRetries:
-    def test_503_is_retried_and_backoff_is_bounded(self):
-        """503 必须重试，且次数与退避时长都有界。"""
+    """
+    503 的退避**按来源分流**（2026-10-21 主控拍板）：
+
+    - Platen / 来源未知：503 来自"设备还在收尾上一个 ScanJob"（实测 8~10 秒
+      后自愈）⇒ **重试**（有界：最多 3 次、2/4/8 秒、共 14 秒、等待可取消）；
+    - Feeder：503 来自"输稿器空载、设备在等纸"⇒ **不重试**，立刻报错。
+
+    断言必须能**区分**"重试了"与"没重试" ⇒ 一律断言 `session.post.call_count`
+    与 `sleeper.called`，不只看最终结果。
+    """
+
+    def test_platen_503_is_retried_with_bounded_backoff(self):
+        """平板 503 ⇒ 会重试，且次数与退避时长都有界。"""
         session = mock.MagicMock()
         session.post.return_value = _Resp(503, "")
         with mock.patch("escl_engine.time.sleep") as sleeper:
             with pytest.raises(ScanDeviceError):
-                _create(session)
+                _create(session, source="Platen")
 
         posts = session.post.call_count
         total_wait = sum(c.args[0] for c in sleeper.call_args_list)
-        assert posts > 1, f"503 必须至少重试一次（实际 {posts} 次）"
-        assert posts <= 4, f"503 重试次数必须有界（实际 {posts} 次）"
+        assert posts == 4, f"平板 503 必须重试（1 次 + 3 次退避），实际 {posts} 次"
+        assert sleeper.called, "平板 503 必须有退避等待"
+        assert [c.args[0] for c in sleeper.call_args_list] == [2.0, 4.0, 8.0], \
+            "退避入参必须逐个锁定"
         assert 0 < total_wait <= 15.0, \
             f"503 退避总时长必须有界（实际 {total_wait}s）"
 
+    def test_feeder_503_is_not_retried(self):
+        """输稿器 503 ⇒ **第一次就抛**，不重试、不等待。
+
+        输稿器空载时等多久都不会成功（除非用户中途放纸，而 UI 不会提示）
+        ⇒ 退避是白等 ⇒ 必须立刻报错。
+        """
+        session = mock.MagicMock()
+        session.post.return_value = _Resp(503, "")
+        with mock.patch("escl_engine.time.sleep") as sleeper:
+            with pytest.raises(ScanDeviceError) as exc:
+                _create(session, source="Feeder")
+
+        assert session.post.call_count == 1, \
+            f"输稿器 503 不得重试（实际 {session.post.call_count} 次）"
+        assert not sleeper.called, "输稿器 503 不得退避等待"
+        assert "503" in str(exc.value)
+
+    def test_platen_and_feeder_retry_behaviour_differs(self):
+        """成对断言：同样的 503，平板重试、输稿器不重试（行为**可区分**）。"""
+        platen = mock.MagicMock()
+        platen.post.return_value = _Resp(503, "")
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(ScanDeviceError):
+                _create(platen, source="Platen")
+
+        feeder = mock.MagicMock()
+        feeder.post.return_value = _Resp(503, "")
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(ScanDeviceError):
+                _create(feeder, source="Feeder")
+
+        assert platen.post.call_count == 4
+        assert feeder.post.call_count == 1
+        assert platen.post.call_count != feeder.post.call_count, \
+            "平板与输稿器的 503 处置必须不同"
+
     def test_503_retry_succeeds_when_device_becomes_ready(self):
-        """设备收尾完成后重试应当成功（这正是 503 退避的目的）。"""
+        """设备收尾完成后重试应当成功（这正是平板退避的目的）。"""
         session = mock.MagicMock()
         session.post.side_effect = [
             _Resp(503, ""),
@@ -128,7 +179,7 @@ class TestServiceUnavailableRetries:
             _Resp(201, "", {"Location": "http://1.2.3.4:80/eSCL/ScanJobs/7"}),
         ]
         with mock.patch("escl_engine.time.sleep"):
-            _base, job_uri, ext = _create(session)
+            _base, job_uri, ext = _create(session, source="Platen")
 
         assert job_uri.endswith("/7")
         assert ext
@@ -145,7 +196,7 @@ class TestServiceUnavailableRetries:
 
         with mock.patch("escl_engine.time.sleep", side_effect=fake_sleep):
             with pytest.raises(escl_engine.ScanJobCancelled):
-                _create(session, cancel_event=ev)
+                _create(session, source="Platen", cancel_event=ev)
 
         assert session.post.call_count == 1, "取消后不应再重试"
 
