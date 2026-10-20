@@ -1806,7 +1806,7 @@ class ScanApp(QMainWindow):
     def _wia_scan(self):
         """WIA USB 扫描"""
         try:
-            from wia_engine import list_wia_scanners, try_wia_scan
+            from wia_engine import list_wia_scanners, wia_scan
         except ImportError:
             QMessageBox.warning(self, "提示", "WIA 引擎不可用（仅 Windows 支持）")
             return
@@ -1826,7 +1826,7 @@ class ScanApp(QMainWindow):
         layout.addWidget(QLabel("选择 USB 扫描仪:"))
         combo = QComboBox()
         for s in wia_scanners:
-            combo.addItem(s.get("name", s.get("device_id", "未知")))
+            combo.addItem(s.get("name", s.get("id", "未知")))
         layout.addWidget(combo)
 
         btn_layout = QHBoxLayout()
@@ -1852,9 +1852,11 @@ class ScanApp(QMainWindow):
 
             def _wia_thread():
                 try:
-                    data, ext = try_wia_scan(
-                        device_id=device.get("device_id"),
+                    data, ext = wia_scan(
+                        device_id=device.get("id"),
                         resolution=self.resolution_val,
+                        color_mode=1,
+                        output_format=self.output_format_val,
                     )
                     if data:
                         job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

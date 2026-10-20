@@ -219,6 +219,43 @@ class TestRunScanSync:
             with pytest.raises(ScanCancelled):
                 coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"))
 
+    def test_failed_scan_unregisters_job(self, coordinator, scanner, tmp_path, cache_root):
+        """扫描失败后 job 必须从 cache_manager._active_jobs 注销。
+
+        register_job 把 job 放进 _active_jobs 以保护它不被 eviction 清理。
+        任何一次扫描失败（异常退出）若不注销，那个 job 就永久留在集合里，
+        它的缓存目录永远不会被清理 ⇒ 缓存只增不减 ⇒ 缓存上限形同虚设。
+        """
+        seen = {}
+
+        def fake_scan(**kwargs):
+            # 扫描过程中 job 必须处于注册状态（受 eviction 保护）
+            seen["registered_during_scan"] = (
+                "job_fail" in scan_coordinator.cache_manager._active_jobs)
+            raise RuntimeError("扫描超时")
+
+        with mock.patch("scan_coordinator.execute_scan", side_effect=fake_scan):
+            with pytest.raises(RuntimeError):
+                coordinator.run_scan_sync(scanner, _params(tmp_path), job_id="job_fail")
+
+        assert seen["registered_during_scan"] is True
+        assert "job_fail" not in scan_coordinator.cache_manager._active_jobs
+
+    def test_cancelled_scan_unregisters_job(self, coordinator, scanner, tmp_path, cache_root):
+        """取消路径（引擎返回空页 → ScanCancelled）同样必须注销 job。"""
+        with mock.patch("scan_coordinator.execute_scan", return_value=(None, "jpg")):
+            with pytest.raises(ScanCancelled):
+                coordinator.run_scan_sync(scanner, _params(tmp_path), job_id="job_cancel")
+        assert "job_cancel" not in scan_coordinator.cache_manager._active_jobs
+
+    def test_successful_scan_unregisters_job(self, coordinator, scanner, tmp_path, cache_root):
+        """成功路径同样注销：注销后该 job 的缓存目录可被 eviction 回收。"""
+        with mock.patch("scan_coordinator.execute_scan",
+                        return_value=(b"\xff\xd8fake", "jpg")):
+            result = coordinator.run_scan_sync(scanner, _params(tmp_path), job_id="job_ok")
+        assert result.job_id == "job_ok"
+        assert "job_ok" not in scan_coordinator.cache_manager._active_jobs
+
 
 class TestSignals:
     def test_failed_signal_emitted(self, coordinator, scanner, tmp_path, cache_root):

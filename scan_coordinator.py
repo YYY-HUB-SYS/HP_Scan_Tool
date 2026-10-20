@@ -343,49 +343,57 @@ class ScanCoordinator(QObject):
             job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         cache_manager.register_job(job_id)
 
-        cached_paths = []
-        ext = output_format
+        # try/finally 保证 job 一定被注销：注册过的 job 受 eviction 保护，
+        # 扫描失败（异常退出）时若不注销，它的缓存目录永远不会被清理，
+        # 缓存只增不减，上限机制形同虚设。
+        # 保存成功后 save_manager 会调 remove_job（内部同样 discard），
+        # discard 对不存在的 key 无副作用，重复注销是幂等安全的。
+        try:
+            cached_paths = []
+            ext = output_format
 
-        if source == "Feeder":
-            def _progress(n, _total):
-                self.scan_progress.emit(job_id, f"已扫描 {n} 页", n)
+            if source == "Feeder":
+                def _progress(n, _total):
+                    self.scan_progress.emit(job_id, f"已扫描 {n} 页", n)
 
-            pages = execute_multipage_scan(
-                scanner=scanner, resolution=resolution, color_mode=color_mode,
-                output_format=output_format, source=source, duplex=duplex,
-                timeout=300.0, progress_callback=_progress,
-                cancel_event=cancel_event,
-            )
-            if not pages:
-                # 取消时引擎会返回空页。与单页分支保持一致，抛 ScanCancelled，
-                # 让"取消"只由 scan_cancelled 信号表达，不出现"完成但 0 页"。
-                raise ScanCancelled(job_id)
-            for i, (data, page_ext) in enumerate(pages, 1):
-                ext = page_ext
-                path = cache_manager.write_page(job_id, i, data, page_ext)
+                pages = execute_multipage_scan(
+                    scanner=scanner, resolution=resolution, color_mode=color_mode,
+                    output_format=output_format, source=source, duplex=duplex,
+                    timeout=300.0, progress_callback=_progress,
+                    cancel_event=cancel_event,
+                )
+                if not pages:
+                    # 取消时引擎会返回空页。与单页分支保持一致，抛 ScanCancelled，
+                    # 让"取消"只由 scan_cancelled 信号表达，不出现"完成但 0 页"。
+                    raise ScanCancelled(job_id)
+                for i, (data, page_ext) in enumerate(pages, 1):
+                    ext = page_ext
+                    path = cache_manager.write_page(job_id, i, data, page_ext)
+                    cached_paths.append(path)
+                    self._apply_a4_crop(path, resolution)
+            else:
+                data, ext = execute_scan(
+                    scanner=scanner, resolution=resolution, color_mode=color_mode,
+                    output_format=output_format, source=source, duplex=duplex,
+                    timeout=90.0, cancel_event=cancel_event,
+                )
+                if not data:
+                    raise ScanCancelled(job_id)
+                path = cache_manager.write_page(job_id, 1, data, ext)
                 cached_paths.append(path)
                 self._apply_a4_crop(path, resolution)
-        else:
-            data, ext = execute_scan(
-                scanner=scanner, resolution=resolution, color_mode=color_mode,
-                output_format=output_format, source=source, duplex=duplex,
-                timeout=90.0, cancel_event=cancel_event,
+
+            output_path = os.path.join(
+                output_dir,
+                f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+
+            return ScanResult(
+                job_id=job_id, ext=ext, page_count=len(cached_paths),
+                cached_paths=cached_paths, output_path=output_path,
+                source=source, adf_detected=adf_detected,
             )
-            if not data:
-                raise ScanCancelled(job_id)
-            path = cache_manager.write_page(job_id, 1, data, ext)
-            cached_paths.append(path)
-            self._apply_a4_crop(path, resolution)
-
-        output_path = os.path.join(
-            output_dir,
-            f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
-
-        return ScanResult(
-            job_id=job_id, ext=ext, page_count=len(cached_paths),
-            cached_paths=cached_paths, output_path=output_path,
-            source=source, adf_detected=adf_detected,
-        )
+        finally:
+            cache_manager.unregister_job(job_id)
 
     def start_scan(self, scanner, params: dict) -> str:
         """异步启动扫描，立即返回 job_id。结果通过信号通知。"""

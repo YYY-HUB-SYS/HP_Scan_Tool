@@ -61,8 +61,12 @@ def listen_for_scan(
             progress_callback("正在创建监听任务...")
 
         # 创建扫描任务
+        # ADF 必须显式放大 MaxScanPages，否则 _build_scan_job_xml 只写
+        # <scan:MaxScanPages>1</scan:MaxScanPages>，打印机只吐 1 页
+        max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex
+            session, scanner, resolution, color_mode, output_format, source, duplex,
+            max_pages=max_pages
         )
 
         if progress_callback:
@@ -147,8 +151,12 @@ def listen_for_multipage_scan(
             progress_callback("正在创建监听任务...", 0)
 
         # 创建扫描任务
+        # ADF 必须显式放大 MaxScanPages，否则 _build_scan_job_xml 只写
+        # <scan:MaxScanPages>1</scan:MaxScanPages>，打印机只吐 1 页
+        max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex
+            session, scanner, resolution, color_mode, output_format, source, duplex,
+            max_pages=max_pages
         )
 
         if progress_callback:
