@@ -5,9 +5,15 @@ cli.py 单元测试 — HP Scan Tool v4.0
 不产生真实网络流量。--format json 时 stdout 必须是纯 JSON。
 """
 
+import io
+import os
+
 import pytest
+from PIL import Image
+from pypdf import PdfReader
 
 import cli
+import history_manager
 
 
 # ── scan 子命令 ───────────────────────────────────────────
@@ -244,3 +250,104 @@ class TestDiscoverCommand:
         # 整段 stdout 可被直接解析
         data = _json.loads(cap.out)
         assert len(data) == 1 and data[0]["ip"] == "1.2.3.4"
+
+
+# ── scan 命令体（落盘护栏）────────────────────────────────
+
+
+class TestCmdScanSave:
+    """
+    cmd_scan 的落盘路径护栏。
+
+    回归缺陷（批次 2 引入）：PDF 改成「打印机只出图片、PDF 本地合成」之后，
+    CLI 没同步 —— 直接把打印机返回的 JPEG 字节写进 .pdf，
+    产出打不开的损坏文件（CLI 打印「已保存」、退出码 0、无任何告警）。
+    审计早已记录 cmd_scan 零测试覆盖，这正是该回归能溜进来的原因。
+    """
+
+    @staticmethod
+    def _jpeg_bytes(w=120, h=160):
+        """造一段真实 JPEG 字节（模拟打印机返回的图片数据）。"""
+        buf = io.BytesIO()
+        Image.new("RGB", (w, h), "white").save(buf, "JPEG")
+        return buf.getvalue()
+
+    @staticmethod
+    def _args(*argv):
+        return cli._build_parser().parse_args(list(argv))
+
+    @staticmethod
+    def _stub_scan(monkeypatch, data, ext):
+        """打桩网络层：execute_scan 返回指定字节与 ext（模拟打印机行为）。"""
+        monkeypatch.setattr(cli, "probe_escl",
+                            lambda ip, **kw: "http://192.168.1.2/eSCL")
+        monkeypatch.setattr(cli, "fetch_capabilities", lambda s, **kw: s)
+        monkeypatch.setattr(cli, "execute_scan", lambda **kw: (data, ext))
+
+    def test_pdf_output_is_real_pdf(self, monkeypatch, tmp_path, tmp_config_dir):
+        """选 PDF：产出必须能被 pypdf 打开，且真的是 PDF 字节（不是 JPEG 套 .pdf）。"""
+        data = self._jpeg_bytes()
+        self._stub_scan(monkeypatch, data, "pdf")
+        out = tmp_path / "out"
+
+        rc = cli.cmd_scan(self._args("scan", "--ip", "192.168.1.2",
+                                     "--format", "pdf", "--output", str(out)))
+        assert rc == 0
+
+        pdfs = list(out.glob("*.pdf"))
+        assert len(pdfs) == 1, f"应产出 1 个 PDF，实际：{pdfs}"
+        raw = pdfs[0].read_bytes()
+        assert raw[:5] == b"%PDF-", "落盘产物必须是真正的 PDF 字节"
+        assert raw[:3] != b"\xff\xd8", "不能是 JPEG 字节套着 .pdf 扩展名"
+
+        reader = PdfReader(str(pdfs[0]))
+        assert len(reader.pages) >= 1
+
+    def test_jpg_written_verbatim(self, monkeypatch, tmp_path, tmp_config_dir):
+        """非 PDF：字节原样写入、扩展名正确（行为与改造前完全一致）。"""
+        data = self._jpeg_bytes()
+        self._stub_scan(monkeypatch, data, "jpg")
+        out = tmp_path / "out"
+
+        rc = cli.cmd_scan(self._args("scan", "--ip", "192.168.1.2",
+                                     "--format", "jpg", "--output", str(out)))
+        assert rc == 0
+
+        jpgs = list(out.glob("*.jpg"))
+        assert len(jpgs) == 1, f"应产出 1 个 JPG，实际：{jpgs}"
+        assert jpgs[0].read_bytes() == data, "非 PDF 必须原样写字节"
+
+    def test_pdf_scan_records_history_once(self, monkeypatch, tmp_path, tmp_config_dir):
+        """PDF 路径的历史只记一条：save_manager 已代记，CLI 不重复记。"""
+        self._stub_scan(monkeypatch, self._jpeg_bytes(), "pdf")
+        out = tmp_path / "out"
+
+        rc = cli.cmd_scan(self._args("scan", "--ip", "192.168.1.2",
+                                     "--format", "pdf", "--output", str(out)))
+        assert rc == 0
+
+        records = history_manager.list_records(limit=10)
+        assert len(records) == 1, f"一次扫描只应记一条历史，实际 {len(records)} 条"
+        assert records[0]["format"] == "pdf"
+
+    def test_no_temp_files_left_behind(self, monkeypatch, tmp_path, tmp_config_dir):
+        """临时缓存页与 PDF 合成的中间产物都必须清理干净。"""
+        created = []
+
+        def fake_mkdtemp(prefix=None, dir=None):
+            d = tmp_path / f"tmp_{len(created)}"
+            d.mkdir()
+            created.append(str(d))
+            return str(d)
+
+        # cli 与 save_manager 都用 tempfile.mkdtemp，一并接管
+        monkeypatch.setattr(cli.tempfile, "mkdtemp", fake_mkdtemp)
+        self._stub_scan(monkeypatch, self._jpeg_bytes(), "pdf")
+        out = tmp_path / "out"
+
+        rc = cli.cmd_scan(self._args("scan", "--ip", "192.168.1.2",
+                                     "--format", "pdf", "--output", str(out)))
+        assert rc == 0
+        assert created, "应至少创建过一个临时目录"
+        leftover = [p for p in created if os.path.exists(p)]
+        assert leftover == [], f"临时目录未清理：{leftover}"

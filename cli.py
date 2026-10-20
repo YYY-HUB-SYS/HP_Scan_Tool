@@ -7,7 +7,9 @@ CLI 命令行模式 — argparse 子命令入口
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime
 
 # 确保能导入同目录模块
@@ -19,6 +21,34 @@ from escl_engine import (
 )
 from wsd_engine import discover_all_scanners
 import history_manager
+import save_manager
+
+
+def _write_pdf_via_save_manager(data: bytes, fpath: str,
+                                device_name: str = "", device_ip: str = "") -> str:
+    """
+    把扫描到的**图片字节**合成为 PDF 并落盘，返回落盘路径。
+
+    打印机只出图片、PDF 由本地合成（见 escl_engine.REQUEST_FORMAT）——
+    所以 CLI 不能把打印机返回的字节直接写进 .pdf，那会产出「打不开的损坏文件」
+    （历史回归：CLI 打印「已保存」、退出码 0、无任何告警）。
+
+    合成复用 save_manager 的合成器（save_single → _write_pdf → A4 画布），
+    与 GUI 走同一份代码，两边的 PDF 规格不会漂移。
+
+    CLI 手里只有内存里的字节、没有缓存页文件，故先落一个临时缓存页交给
+    save_manager 处理；临时目录用完即删（不留中间产物）。
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="hp_scan_cli_")
+    try:
+        cache_file = os.path.join(tmp_dir, "page_001.jpg")
+        with open(cache_file, "wb") as f:
+            f.write(data)
+        save_manager.save_single(cache_file, "pdf", fpath,
+                                 device_name=device_name, device_ip=device_ip)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return fpath
 
 
 def cmd_scan(args):
@@ -66,25 +96,55 @@ def cmd_scan(args):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"HP_CLI_{ts}.{ext}"
     fpath = os.path.join(output, fname)
+    device_name = scanner.model or f"CLI-{ip}"
 
-    with open(fpath, "wb") as f:
-        f.write(data)
+    # PDF 特殊处理：打印机只出图片（见 escl_engine.REQUEST_FORMAT），PDF 必须本地合成。
+    # 直接把返回字节写进 .pdf 会产出「打不开的损坏文件」——合成走 save_manager
+    # （与 GUI 同一份合成器），历史也由它一并记账。
+    # 非 PDF（jpg/png/tiff）字节原样写入，行为与改造前完全一致。
+    history_recorded = False
+    if ext == "pdf" and data[:5] != b"%PDF-":
+        try:
+            _write_pdf_via_save_manager(data, fpath,
+                                        device_name=device_name, device_ip=ip)
+        except Exception as e:
+            print(f"错误: PDF 合成失败 — {e}", file=sys.stderr)
+            return 1
+        history_recorded = True
+    else:
+        with open(fpath, "wb") as f:
+            f.write(data)
+
+    # 落盘校验：PDF 必须是真正的 PDF 字节（%PDF-）。
+    # 绝不允许「打印已保存 + 退出码 0」却留下一个打不开的文件。
+    if ext == "pdf":
+        with open(fpath, "rb") as f:
+            magic = f.read(5)
+        if magic != b"%PDF-":
+            try:
+                os.remove(fpath)
+            except OSError:
+                pass
+            print(f"错误: 生成的 PDF 非法（文件头 {magic!r}），已删除 {fpath}",
+                  file=sys.stderr)
+            return 1
 
     print(f"已保存: {fpath}")
 
-    # 记录历史
-    history_manager.append({
-        "device_name": scanner.model or f"CLI-{ip}",
-        "device_ip": ip,
-        "page_count": 1,
-        "format": ext,
-        "file_path": fpath,
-        "source": "cli",
-        "resolution": resolution,
-        "color_mode": color_mode,
-        "output_format": fmt,
-        "scan_source": source,
-    })
+    # 记录历史（PDF 路径已由 save_manager 记过一条，不重复记）
+    if not history_recorded:
+        history_manager.append({
+            "device_name": device_name,
+            "device_ip": ip,
+            "page_count": 1,
+            "format": ext,
+            "file_path": fpath,
+            "source": "cli",
+            "resolution": resolution,
+            "color_mode": color_mode,
+            "output_format": fmt,
+            "scan_source": source,
+        })
 
     return 0
 
