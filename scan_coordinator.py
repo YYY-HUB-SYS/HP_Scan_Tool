@@ -24,6 +24,7 @@ from escl_engine import (
     probe_escl, fetch_capabilities,
     probe_scanner_status, execute_scan, execute_multipage_scan,
     ScannerInfo,
+    ScanCancelled as EngineScanCancelled,
 )
 from wsd_engine import discover_all_scanners
 
@@ -141,8 +142,20 @@ def fetch_capabilities_tracked(scanner, timeout: float = 3.0):
     return result
 
 
-class ScanCancelled(Exception):
-    """扫描被用户取消"""
+class ScanCancelled(EngineScanCancelled):
+    """扫描被用户取消（协调器侧抛出的那一个）。
+
+    ★ **必须继承引擎侧的 `escl_engine.ScanCancelled`**：
+    eSCL / 监听 / WIA 三条引擎路径抛的都是**引擎那个类**
+    （`wia_engine` 明确 `from escl_engine import ScanCancelled`），
+    而这里原来自己定义了一个**互不相关**的 `class ScanCancelled(Exception)`
+    ⇒ 引擎抛的取消会越过 `except ScanCancelled` 直落 `except Exception`
+    ⇒ **用户点取消却被报成"扫描失败"**（发 `scan_failed` 而不是 `scan_cancelled`）。
+
+    现在本类是引擎那个类的**子类**，因此捕获**基类**即可同时接住：
+      ① 引擎抛的 `escl_engine.ScanCancelled`（及其子类 `ScanJobCancelled`）
+      ② 协调器自己抛的本类
+    """
 
     def __init__(self, job_id: str = ""):
         super().__init__(f"扫描已取消: {job_id}")
@@ -756,7 +769,11 @@ class _ScanTask(QRunnable):
                 coord.scan_cancelled.emit(job_id)
             else:
                 coord.scan_finished.emit(job_id, result)
-        except ScanCancelled:
+        except EngineScanCancelled:
+            # ★ 捕获**基类**（`escl_engine.ScanCancelled`），不是本模块的子类 ——
+            #   引擎三条路径（eSCL / 监听 / WIA）抛的都是基类或其子类
+            #   （`ScanJobCancelled`）；本模块自己的 `ScanCancelled` 是基类的子类。
+            #   只捕获子类会漏掉引擎抛的那一半 ⇒ 取消被报成"扫描失败"。
             coord.scan_cancelled.emit(job_id)
         except Exception as e:
             logger.error("扫描失败 [%s]: %s", job_id, e, exc_info=True)
