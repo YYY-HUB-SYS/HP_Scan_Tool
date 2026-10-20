@@ -341,7 +341,7 @@ class TestCmdScanSave:
             return str(d)
 
         # cli 与 save_manager 都用 tempfile.mkdtemp，一并接管
-        monkeypatch.setattr(cli.tempfile, "mkdtemp", fake_mkdtemp)
+        monkeypatch.setattr("tempfile.mkdtemp", fake_mkdtemp)
         self._stub_scan(monkeypatch, self._jpeg_bytes(), "pdf")
         out = tmp_path / "out"
 
