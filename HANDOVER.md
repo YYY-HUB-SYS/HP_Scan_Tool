@@ -25,6 +25,17 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 
 **2026-10-20 起曝光/预设已并回本项目**（放弃独立 DocFix 软件，基础曝光/滤镜在本项目内闭环）：`exposure.py` / `preset_manager.py` 已入库，`ExposurePanel` 已接入两个预览对话框，曝光已接进落盘链路（`save_manager.py`），预设持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。直方图未实现、未纳入范围；扶正（自动纠偏）引擎**已完成并已接入扫描流水线**（`c6037a4`）：每页写入缓存后调 `skew_detect.estimate_skew` 测倾斜角并写入 `page_meta.deskew_angle`，落盘时按阈值施加纠偏。`skew_detect` 被 `scan_coordinator.py` / `save_manager.py` **静态 import** ⇒ PyInstaller 依赖分析实测 `skew_detect` FOUND ⇒ **随 EXE 交付**。⚠️ 但 **GUI 里没有纠偏开关**（`deskew_enabled` 等 4 个键只有默认值，界面不可改）。
 
+**2026-10-21 批次 4 新增（文档会话类功能，均已在 HEAD 内）**：以 `document_session.py`（会话账本）+ `doc_merge.py`（页序算法）+ GUI 会话接线为准，四项用户可见能力：
+
+| 能力 | 落点 | 一句话行为 |
+|------|------|-----------|
+| 手动双面扫描 | `document_session.py`（`side` / `SIDES`）+ `doc_merge.interleave_duplex` + `hp_scan_gui_pyside.py` 的 `_pending_side_by_job` / `_session_batch_finished` | 两趟单面（正面一趟、翻面背面一趟）⇒ 交错合并成一份文档；**只支持输稿器（ADF）** |
+| 断点续扫 | `resume_from_page` / `DocumentSession.resume_scanning` / GUI「从第 N 页重扫」 | 保留前 N-1 页、丢弃第 N 页及之后；前提是设备仍可用、页还在缓存里 |
+| 大批量合并成单个 PDF | `save_manager.save_session`（B4-5）+ `doc_merge.merge_batches` / `interleave_duplex` | 多批扫描合并成一个 PDF（页序规则见 §4.4） |
+| 自动纠偏 + 倾斜强提醒 | `skew_detect.estimate_skew` + `hp_scan_gui_pyside.SkewWarningDialog` | 每页测倾斜角；连续超阈值弹**可中断 / 可续扫 / 可强制保存**的强提醒；落盘按阈值施加纠偏 |
+
+⚠️ 这四项**只走 GUI**（CLI 无对应子命令）；⚠️ 界面里**仍然没有纠偏开关**（`deskew_enabled` 等 4 个键只有默认值）—— 与上一段的结论一致，未变。
+
 ---
 
 ## 2. 文件结构
@@ -43,6 +54,8 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 ├── cli.py                  # CLI 命令行入口 — scan/discover/status/history 子命令
 ├── save_manager.py         # 保存落盘层 — 曝光施加/分组命名/写历史/清缓存
 ├── page_meta.py            # 页元数据模型 — 页序号/角度/分组等会话级元数据
+├── document_session.py     # 文档会话 — 双面/续扫的会话账本 + 状态机 + 会话文件存储
+├── doc_merge.py            # 页序合并算法 — 双面交错 / 批次拼接（纯函数，零 IO 零 Qt）
 ├── config_io.py            # 配置读写 helper — 原子写 + 跨进程锁
 ├── exposure.py             # 曝光引擎 — off/auto/manual（2026-10-20 并回本项目，在用）
 ├── preset_manager.py       # 曝光预设管理 — 内置 4 个 + 用户自定义（2026-10-20 并回本项目，在用）
@@ -58,22 +71,12 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 │   │   └── icon_64.png
 │   └── styles/
 │       └── app.qss
-├── tests/                  # pytest 测试（15 个文件：conftest.py + 14 个 test_*.py）
+├── tests/                  # pytest 测试（2026-10-21 05:55 实测 65 个 .py：conftest.py + 62 个 test_*.py + 2 个测试辅助模块）
 │   ├── conftest.py
-│   ├── test_cache_manager.py
-│   ├── test_cli.py
-│   ├── test_config_concurrency.py
-│   ├── test_escl_robustness.py
-│   ├── test_exposure.py
-│   ├── test_exposure_integration.py
-│   ├── test_gui_consistency.py
-│   ├── test_history_manager.py
-│   ├── test_listen_engine.py
-│   ├── test_page_meta.py
-│   ├── test_preset_manager.py
-│   ├── test_save_manager.py
-│   ├── test_scan_coordinator.py
-│   └── test_skew_detect.py
+│   ├── cli_subprocess_probe.py   # CLI 子进程测试用探针（辅助模块，非测试）
+│   ├── skew_fixtures.py          # 倾斜检测测试用夹具（辅助模块，非测试）
+│   └── test_*.py                 # 62 个测试模块（缓存 / 历史 / CLI / eSCL / 曝光 / 预设 / 倾斜检测 /
+│                                 #   文档会话 / 双面合并 / GUI 一致性 / 协调器 / 落盘 …）
 ├── docs/                     # 项目文档
 │   ├── SPEC-v3.3.md              # v3.3 规格文档（User Stories + 技术方案）
 │   ├── tickets.md                # 实施票据 T1-T10（含依赖图）
@@ -226,6 +229,28 @@ preset_manager.py (在用)
 | 备份到 _docfix_reserve/ | 完整文件 + 切除代码段参考文档 —— **该目录已在 `8aaa4f1` 移出仓库，现不存在** |
 
 **回流说明（2026-10-20）**：放弃独立 DocFix 软件，基础曝光/滤镜并回本项目。依据 `docs/adr/0008-exposure-enhancement.md` + `docs/design/2026-10-20_新功能调研与方案_双面_续扫_纠偏_曝光_v1.0.md` §0 需求 F。曝光/预设代码入库（`267a360`），接入预览 GUI 与落盘链路（`8bde8dc`）。
+
+### 4.4 文档会话功能（2026-10-21 批次 4）
+
+GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）** / **加入现有文档（续扫）**（`hp_scan_gui_pyside.py:1945-1954`）。后两种走**会话**（`document_session.py`）；单面走既有预览/直存流程、不用会话。
+
+| 功能 | 怎么用 | 限制 / 前提 | 代码落点 |
+|------|--------|------------|----------|
+| 手动双面扫描 | 选「双面（手动）」→ 扫正面 → 整叠纸**翻面**放回输稿器 → 再点「扫描」扫背面 → 合并预览确认页序 → 落盘 | **只支持输稿器（ADF）**（平板没有背面）；双面 = **两趟单面**（下发给引擎的是 `"duplex": False`，合并由本地算法做）；扫描仪自带的「双面扫描」复选框与本功能无关 | `hp_scan_gui_pyside.py` 的 `_pending_side_by_job` / `_session_batch_finished` / `_ensure_session`；`document_session.py` 的 `PageRef.side`（`SIDES = ("single","front","back")`）；`doc_merge.interleave_duplex` |
+| 断点续扫 | 扫描被打断时，在强提醒里点「中断并从第 N 页重扫」⇒ 保留前 N-1 页、丢弃第 N 页及之后，重扫接着往下走 | 前提：**设备仍可用** + **已扫的页还在缓存里**（缓存过期线 = `cache_config.json` 的 `stale_hours`，默认 24 小时；`cleanup_stale` 在 `ScanApp.__init__` 里跑，**早于**启动时的会话保护重登记 ⇒ 隔天续扫可能已丢页）；丢弃范围**只限该批次**，其它批次的页不受影响；**单面模式没有会话** ⇒ 该按钮只中止这次扫描，已扫页留在缓存里、不进会话 | `hp_scan_gui_pyside.resume_from_page` / `ScanApp._resume_from_page` / `_absorb_cancelled_pages`；`document_session.DocumentSession.remove_pages_from` / `resume_scanning` |
+| 大批量合并成单个 PDF | 「加入现有文档（续扫）」一批批扫 → 点「结束并保存」→ 合并预览确认页序 → 落盘 | 输出 PDF ⇒ 合成**一个** PDF；jpg/png/tiff ⇒ 每页一个文件（页号跨批次连续）；预计合成内存峰值 > 1.5GB 会先问「仍要继续吗」（不静默截断）；**部分页失败时保留缓存**以便重试 | `save_manager.save_session`（B4-5）；页序规则见下表 |
+| 自动纠偏 + 倾斜强提醒 | 每页进缓存后自动测倾斜角；连续超阈值弹强提醒 ⇒ 「继续扫描（自动纠偏）」/「中断并从第 N 页重扫」/「强制保存（不纠偏）」 | 默认阈值：强提醒 3.0°、连续 3 页；施加阈值 0.5°；检出下限 0.75°（`skew_detect._MIN_EFFECTIVE_ANGLE`）、检测范围 ±8°；空白页/墨迹过少不判角度；「强制保存」的页原样保存不纠偏；⚠️ **界面里没有纠偏开关**（4 个键只有默认值） | `skew_detect.estimate_skew` / `deskew_image`；`scan_coordinator.ScanCoordinator._note_skew`（发 `skew_warning` 信号）；`hp_scan_gui_pyside.SkewWarningDialog`（`CHOICE_RESUME` / `CHOICE_CONTINUE` / `CHOICE_FORCE`）；`save_manager._session_page_specs` + `deskew_angle_to_apply` |
+
+**页序规则（`doc_merge`；GUI 预览与落盘走同一套调用）**：
+
+| 场景 | 规则 | 出处 |
+|------|------|------|
+| 双面 | **先反转、再交错、多余的接末尾**：背面默认整叠翻面 ⇒ 先 `reversed(back)`，再 F1/B末、F2/B末-1… 交错；两边页数不等时，多出的那几页按原序接在末尾。界面可取消勾选「背面顺序反转」 | `doc_merge.interleave_duplex`（`reverse_back=True` 为默认）；会话字段 `DocumentSession.reverse_back` |
+| 批次 / 续扫 | **批序 + 批内原序**：按 job_id 分组（首次出现顺序），组内保持原序，再顺序拼接 | `doc_merge.merge_batches`；`save_manager._session_merged_pages` 与 `hp_scan_gui_pyside.session_merged_pages`（同一套规则） |
+
+**会话状态与缓存保护**：`scanning → awaiting_flip`（双面扫完正面）/ `paused`（续扫扫完一批）/ `completed`（落盘成功）/ `abandoned`（用户放弃）。会话文件在 `%APPDATA%\HP_Scan_Tool\sessions\`（`document_session.sessions_dir()`）。会话引用的 job 目录被**显式保护**（不被 eviction / `cleanup_stale` 自动清理），落盘成功或放弃后解除保护并清缓存 + 页元数据。⚠️ 保护集合是**进程内**的 ⇒ 重启后靠 `ScanApp._restore_open_sessions` 重新登记（启动时弹「有未完成的文档会话，是否继续？」）。
+
+> ⚠️ **这四项只走 GUI**：CLI 没有对应子命令（`cli.py` 仍是 scan / discover / status / history 四个），别按 GUI 能力去推断 CLI。
 
 ---
 
@@ -401,7 +426,13 @@ cd <PROJECT_DIR>
 pytest tests/ -v
 ```
 
-测试覆盖：缓存 / 历史 / CLI / 配置并发 / eSCL 健壮性 / 预设 / 曝光 / 曝光集成 / GUI 一致性 / 监听 / 页元数据 / 保存 / 协调器 / 倾斜检测 等，见 `tests/`（当前 15 个测试文件：`conftest.py` + 14 个 `test_*.py`）。
+测试覆盖：缓存 / 历史 / CLI / 配置并发 / eSCL 健壮性 / 预设 / 曝光 / 曝光集成 / GUI 一致性 / 监听 / 页元数据 / 保存 / 协调器 / 倾斜检测 / 文档会话 / 双面合并 等，见 `tests/`。
+
+**测试文件数（2026-10-21 05:55 工作区实测）**：`tests/` 下共 **65 个 `.py`** —— `conftest.py` 1 个 + `test_*.py` **62 个** + 测试辅助模块 2 个（`cli_subprocess_probe.py` / `skew_fixtures.py`，不是测试文件）。
+
+> 统计方式：按文件名对 `tests/` 下的 `.py` 归类计数（`Get-ChildItem tests -Filter *.py -File` 后按 `conftest.py` / `test_*.py` / 其余辅助模块三类归类）。
+> ⚠️ 此前文档写的「当前 15 个测试文件：`conftest.py` + 14 个 `test_*.py`」**已过期**。
+> ⚠️ 统计口径说明：统计时 `tests/` 仍有**未提交的新测试文件**在陆续加入 ⇒ 数字会继续涨，以实际目录为准；只数 HEAD 里的（`git ls-tree -r --name-only HEAD -- tests/`）为 **60 个 `.py`**（`conftest.py` 1 + `test_*.py` 57 + 辅助模块 2）。
 
 ---
 
@@ -429,10 +460,10 @@ pytest tests/ -v
 
 | 文档 | 状态 | 说明 |
 |------|------|------|
-| README.md | ⚠️ 部分过时 | 项目结构/配置文件/技术栈三块未含本轮新增模块（`save_manager` / `exposure` / `preset_manager` / `skew_detect` / `page_meta` / `config_io` / `presets.json` / `pypdf`），本轮未纳入范围 |
+| README.md | ✅ 已同步（2026-10-21） | 功能特性已补批次 4 四项（手动双面 / 断点续扫 / 大批量合并 / 自动纠偏 + 倾斜强提醒）；项目结构已补 `document_session.py` / `doc_merge.py`，配置文件已补 `sessions/` |
 | HANDOVER.md | ✅ 最新 | 本文档，反映 v4.0 PySide6 架构 |
 | CODEBUDDY.md | ⚠️ 部分过时 | `:112` 仍写"曝光/预设已剥离至 `_docfix_reserve/`、不得在新代码中引用"，与代码相反（2026-10-20 已并回本项目），**待该文件责任人订正** |
-| PRD.md | ⚠️ 部分过时 | 曝光/预设边界已订正；结构块与线程模型仍停留在 v3.1 CustomTkinter 时代 |
+| PRD.md | ⚠️ 部分过时 | 曝光/预设边界已订正；§2.4 已补批次 4 四项功能规格（2026-10-21）；结构块与线程模型仍停留在 v3.1 CustomTkinter 时代 |
 | CONTEXT.md | ⚠️ 部分过时 | 曝光/预设边界说明已订正；术语表正文尚未补 曝光/曝光预设 词条 |
 | docs/SPEC-v3.3.md | ⚠️ 部分过时 | 关于曝光增强/预设系统的 User Story 为 v3.3 历史记载（现已并回本项目） |
 | docs/tickets.md | ⚠️ 部分过时 | T2/T3 已于 2026-10-20 并回本项目并接线；T10 的 --exposure 未实现 |
