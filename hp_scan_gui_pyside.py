@@ -27,7 +27,7 @@ from scan_coordinator import (
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
     COLOR_MODE_MAP,
 )
-from escl_engine import auto_crop
+from escl_engine import auto_crop, ScanCancelled
 
 # ────────── 全局异常日志 ──────────
 def setup_exception_logging():
@@ -65,7 +65,7 @@ logger.info(f"cwd={os.getcwd()}")
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize,
     QPropertyAnimation, QEasingCurve,
-    QRect, QObject,
+    QRect, QObject, QMutexLocker,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
@@ -304,6 +304,45 @@ def _detect_crop_rect(img, threshold=240, padding=5):
         min(width, right + padding),
         min(height, bottom + padding),
     )
+
+
+def _rotated_size(size, rotation):
+    """
+    旋转后的图像尺寸（与 PIL `rotate(angle, expand=True)` 一致）。
+
+    90° / 270° ⇒ 宽高对调；180° / 0° ⇒ 不变。
+    """
+    w, h = int(size[0]), int(size[1])
+    if int(rotation or 0) % 180 == 90:
+        return (h, w)
+    return (w, h)
+
+
+def _rotate_rect(rect, rotation, size):
+    """
+    把裁边框从**原图坐标系**变换到**旋转后的坐标系**（F-2）。
+
+    PIL 的 `img.rotate(angle, expand=True)` 是**逆时针**旋转，像素映射为：
+      90° : (x, y) → (y, W-1-x)        画布变为 (H, W)
+      180°: (x, y) → (W-1-x, H-1-y)    画布不变
+      270°: (x, y) → (H-1-y, x)        画布变为 (H, W)
+
+    rect = (left, top, right, bottom)，right/bottom 为**开区间**；
+    size = 原图尺寸 (W, H)。
+    返回旋转后坐标系里的裁边框（宽高随 90/270 对调）。
+    """
+    if not rect:
+        return None
+    left, top, right, bottom = rect
+    w, h = int(size[0]), int(size[1])
+    angle = int(rotation or 0) % 360
+    if angle == 90:
+        return (top, w - right, bottom, w - left)
+    if angle == 180:
+        return (w - right, h - bottom, w - left, h - top)
+    if angle == 270:
+        return (h - bottom, left, h - top, right)
+    return (left, top, right, bottom)
 
 
 def _save_page_specs(job_id, ext, output_path, page_specs, groups, **kwargs):
@@ -1012,6 +1051,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.cards = []
         # 预览里设置的曝光参数 —— 直接保存模式沿用（跳过预览时没有别的来源）
         self._exposure_state = None
+        # WIA 路径的取消信号（GUI 兜底持有；正常已登记进协调器）
+        self._wia_cancel_event = None
 
         # 先构建界面（隐藏状态）
         self._setup_ui()
@@ -1365,25 +1406,49 @@ class ScanApp(QMainWindow, _UiPostMixin):
         parent_layout.addWidget(panel)
 
     # ────────── 事件处理 ──────────
+    def _save_cfg(self, cfg=None, what="设置") -> bool:
+        """
+        写配置并**如实报告**结果（V1-N-2）。
+
+        `scan_coordinator.save_config` 现在在拿不到跨进程锁 / 写失败时返回
+        **False**（本次没存上）⇒ GUI 绝不能无条件说"已保存"。
+        失败时在状态栏如实说明"未生效"，并记 error 日志。
+
+        返回是否真的落盘。
+        """
+        target = self.cfg if cfg is None else cfg
+        try:
+            ok = bool(save_config(target))
+        except Exception as e:
+            logger.error("保存配置失败: %s", e, exc_info=True)
+            ok = False
+        if not ok:
+            logger.error("配置未落盘（拿不到跨进程锁或写失败）: %s", what)
+            try:
+                self.status_bar.showMessage(f"{what}保存失败（设置未生效）")
+            except Exception:
+                pass
+        return ok
+
     def _on_resolution_changed(self, text):
         self.resolution_val = int(text)
         self.cfg["resolution"] = self.resolution_val
-        save_config(self.cfg)
+        self._save_cfg()
 
     def _on_color_mode_changed(self, text):
         self.color_mode_val = text
         self.cfg["color_mode_ui"] = self.color_mode_val
-        save_config(self.cfg)
+        self._save_cfg()
 
     def _on_format_changed(self, text):
         self.output_format_val = text
         self.cfg["output_format"] = self.output_format_val
-        save_config(self.cfg)
+        self._save_cfg()
 
     def _on_source_changed(self, text):
         self.source_val = text
         self.cfg["source"] = self.source_val
-        save_config(self.cfg)
+        self._save_cfg()
         self._update_duplex_visibility()
 
     def _create_styled_combo(self, items):
@@ -1446,12 +1511,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
     def _on_duplex_changed(self, state):
         self.duplex_val = bool(state)
         self.cfg["duplex"] = self.duplex_val
-        save_config(self.cfg)
+        self._save_cfg()
 
     def _on_direct_save_changed(self, state):
         self.direct_save_val = bool(state)
         self.cfg["direct_save"] = self.direct_save_val
-        save_config(self.cfg)
+        self._save_cfg()
 
     def _sync_direct_save_checkbox(self):
         """
@@ -1479,20 +1544,20 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self.output_dir = p
             self.dir_entry.setText(p)
             self.cfg["output_dir"] = p
-            save_config(self.cfg)
+            self._save_cfg()
 
     def _add_extra_dir(self):
         p = QFileDialog.getExistingDirectory(self, "选择额外输出目录")
         if p and p not in self.extra_dirs:
             self.extra_dirs.append(p)
             self.cfg["extra_dirs"] = self.extra_dirs
-            save_config(self.cfg)
+            self._save_cfg()
             self._refresh_extra_dirs()
 
     def _clear_extra_dirs(self):
         self.extra_dirs.clear()
         self.cfg["extra_dirs"] = self.extra_dirs
-        save_config(self.cfg)
+        self._save_cfg()
         self._refresh_extra_dirs()
 
     def _refresh_extra_dirs(self):
@@ -1595,7 +1660,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             else:
                 self.disabled_ips.discard(scanner.ip)
             self.cfg["disabled_ips"] = list(self.disabled_ips)
-            save_config(self.cfg)
+            self._save_cfg()
             self._rebuild_cards()
             self.status_bar.showMessage(f"{'停用' if disabled else '启用'}: {scanner.display_name}")
 
@@ -1620,7 +1685,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
             if self.selected.ip:
                 self.cfg["selected_scanner_ip"] = self.selected.ip
-                save_config(self.cfg)
+                self._save_cfg()
 
     def _on_rename_requested(self, idx: int):
         """重命名扫描仪"""
@@ -1656,11 +1721,30 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if dialog.exec() == QDialog.Accepted:
             new_name = name_input.text().strip()
             if new_name:
-                scanner.custom_name = new_name
-                # 保存到配置
-                self.coordinator.set_custom_name(scanner.ip, new_name)
-                self._rebuild_cards()
-                self.status_bar.showMessage(f"已重命名为: {new_name}")
+                self._apply_custom_name(scanner, new_name)
+
+    def _apply_custom_name(self, scanner, new_name) -> bool:
+        """
+        改名 + 写配置，并**如实报告**（V1-N-2）。返回是否真的落盘。
+
+        ★ `ScanCoordinator.set_custom_name` 内部把 `save_config` 的返回值吞掉了
+          ⇒ 这里自己写一次配置（同一份 cfg、同一把跨进程锁），拿得到真实结果。
+          （协调器侧建议让 set_custom_name 直接返回 bool，GUI 即可复用）
+        """
+        scanner.custom_name = new_name
+        nicknames = self.coordinator.cfg.get("nicknames", {})
+        nicknames[scanner.ip] = new_name
+        self.coordinator.cfg["nicknames"] = nicknames
+        ok = self._save_cfg(self.coordinator.cfg, "重命名")
+        self._rebuild_cards()
+        if ok:
+            self.status_bar.showMessage(f"已重命名为: {new_name}")
+            return True
+        self.status_bar.showMessage(f"重命名未保存（设置未生效）: {new_name}")
+        QMessageBox.warning(
+            self, "保存失败",
+            f"重命名未保存（拿不到文件锁或写入失败）：{new_name}")
+        return False
 
     def _on_move_up_requested(self, idx: int):
         """设备上移"""
@@ -1780,6 +1864,10 @@ class ScanApp(QMainWindow, _UiPostMixin):
         job_id = getattr(self, "_current_job_id", None)
         if job_id:
             self.coordinator.cancel_scan(job_id)
+        # WIA 路径兜底：协调器里没登记成功时，GUI 直接 set **同一个** event
+        event = getattr(self, "_wia_cancel_event", None)
+        if event is not None:
+            event.set()
         self.status_bar.showMessage("扫描已取消")
         self._reset_scan_ui()
 
@@ -1832,6 +1920,10 @@ class ScanApp(QMainWindow, _UiPostMixin):
         """
         「直接保存」模式：跳过预览，直接把缓存页落盘。
 
+        ★ 落盘在**后台线程**（16.17 / F-1）：几百页合并 PDF 要几十秒，
+          在主线程做会把 Qt 事件循环完全卡死（界面不刷新、不能取消）。
+          完成/失败都回主线程再提示 —— 与多页预览保存**同一套机制**
+          （`_run_in_background` + 模块级投递器）。
         save_manager 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
         设备名/IP 取自当前选中设备；未选中设备时留空，不报错。
 
@@ -1846,36 +1938,63 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # getattr：ScanApp 的最小替身（只借用方法）可能没有这个属性。
         exposure = getattr(self, "_exposure_state", None)
         total_pages = len(page_specs)
-        try:
-            saved_files = _save_page_specs(
+        # 完成标记（供调用方/测试等待；回调落地时置 True）
+        self._direct_save_finished = False
+
+        def _work():
+            return _save_page_specs(
                 result.job_id, result.ext, result.output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs or [], device_name=dev_name,
                 device_ip=dev_ip, exposure=exposure)
-        except Exception as e:
-            logger.error("直接保存失败: %s", e, exc_info=True)
-            QMessageBox.critical(self, "保存失败", f"直接保存失败: {e}")
+
+        # 投递器必须在主线程创建（跨线程 emit 的接收端必须活在主线程）
+        _ensure_ui_dispatcher()
+        _run_in_background(
+            _work,
+            lambda files: self._on_direct_save_done(
+                files, result, total_pages, exposure),
+            lambda err: self._on_direct_save_error(err, result),
+        )
+
+    def _on_direct_save_done(self, saved_files, result, total_pages, exposure):
+        """主线程：直接保存完成（成功/部分失败都走这里）。"""
+        try:
+            if not saved_files:
+                self.status_bar.showMessage("直接保存未产生文件")
+                _release_job_protection(result.job_id)
+                return
+            # 部分页保存失败：save_manager 现在把失败页数放进 SaveResult.failed_pages
+            # （此前只写日志 ⇒ 用户拿到少了页的文件却不知道）
+            failed_pages = int(getattr(saved_files, "failed_pages", 0) or 0)
+            warnings = list(getattr(saved_files, "warnings", []) or [])
+            summary = _format_save_summary(saved_files, total_pages, failed_pages,
+                                           warnings)
+            if exposure:
+                summary += f"\n（沿用曝光参数：{exposure.get('mode')}）"
+            if failed_pages > 0:
+                self.status_bar.showMessage(
+                    f"已保存 {len(saved_files)} 个文件，但有 {failed_pages} 页保存失败")
+            else:
+                self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
+            QMessageBox.information(
+                self, "保存完成" if not failed_pages else "保存部分失败", summary)
+        except RuntimeError:
+            # 主窗口已被销毁（用户提前关窗）—— 不用再提示
+            logger.debug("直接保存完成时主窗口已销毁")
+        finally:
+            self._direct_save_finished = True
+
+    def _on_direct_save_error(self, err, result):
+        """主线程：直接保存失败 —— 必须让用户看见，不能静默。"""
+        try:
+            logger.error("直接保存失败: %s", err, exc_info=True)
             self.status_bar.showMessage("直接保存失败")
+            QMessageBox.critical(self, "保存失败", f"直接保存失败: {err}")
+        except RuntimeError:
+            logger.debug("直接保存失败时主窗口已销毁")
+        finally:
             _release_job_protection(result.job_id)
-            return
-        if not saved_files:
-            self.status_bar.showMessage("直接保存未产生文件")
-            _release_job_protection(result.job_id)
-            return
-        # 部分页保存失败：save_manager 现在把失败页数放进 SaveResult.failed_pages
-        # （此前只写日志 ⇒ 用户拿到少了页的文件却不知道）
-        failed_pages = int(getattr(saved_files, "failed_pages", 0) or 0)
-        warnings = list(getattr(saved_files, "warnings", []) or [])
-        summary = _format_save_summary(saved_files, total_pages, failed_pages,
-                                       warnings)
-        if exposure:
-            summary += f"\n（沿用曝光参数：{exposure.get('mode')}）"
-        if failed_pages > 0:
-            self.status_bar.showMessage(
-                f"已保存 {len(saved_files)} 个文件，但有 {failed_pages} 页保存失败")
-        else:
-            self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
-        QMessageBox.information(
-            self, "保存完成" if not failed_pages else "保存部分失败", summary)
+            self._direct_save_finished = True
 
     def _release_job(self, job_id):
         """解除 job 的缓存保护（幂等）—— 见模块级 _release_job_protection。"""
@@ -2151,7 +2270,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             if not any(item.get("ip") == ip for item in saved_ips):
                 saved_ips.append({"ip": ip, "model": "手动添加"})
                 self.cfg["saved_ips"] = saved_ips
-                save_config(self.cfg)
+                self._save_cfg()
             # 恢复扫描仪
             self.coordinator.restore_saved_scanners()
             self._rebuild_cards()
@@ -2217,7 +2336,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
     def _wia_scan(self):
         """WIA USB 扫描"""
         try:
-            from wia_engine import list_wia_scanners, wia_scan
+            from wia_engine import list_wia_scanners
         except ImportError:
             QMessageBox.warning(self, "提示", "WIA 引擎不可用（仅 Windows 支持）")
             return
@@ -2259,42 +2378,116 @@ class ScanApp(QMainWindow, _UiPostMixin):
             dialog.accept()
 
             device = wia_scanners[idx]
-            self.status_bar.showMessage("正在通过 WIA 扫描...")
-            # 新的一次扫描 = 新文档 ⇒ 清掉残留曝光（I-6）
-            self._reset_exposure_state()
-
-            def _wia_thread():
-                job_id = None
-                try:
-                    data, ext = wia_scan(
-                        device_id=device.get("id"),
-                        resolution=self.resolution_val,
-                        color_mode=1,
-                        output_format=self.output_format_val,
-                    )
-                    if data:
-                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                        cache_manager.register_job(job_id)
-                        cache_path = cache_manager.write_page(job_id, 1, data, ext)
-                        del data
-                        out_dir = self.dir_entry.text() or self.output_dir
-                        output_path = os.path.join(
-                            out_dir,
-                            f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
-                        )
-                        self._post_ui(lambda: self._show_preview(
-                            cache_path, ext, output_path, job_id))
-                    else:
-                        self._post_ui(lambda: self.status_bar.showMessage("WIA 扫描失败"))
-                except Exception as e:
-                    self._post_ui(lambda: self._scan_error(f"WIA 错误: {e}"))
-                    # 预览没开起来 ⇒ 没人替我们注销 job（否则缓存目录永不被回收）
-                    self._release_job(job_id)
-
-            threading.Thread(target=_wia_thread, daemon=True).start()
+            self._start_wia_scan(device)
 
         scan_btn.clicked.connect(_do_wia_scan)
         dialog.exec()
+
+    def _start_wia_scan(self, device):
+        """
+        启动一次 WIA 扫描（独立成方法 ⇒ 可单独测试，不依赖设备选择对话框）。
+
+        ★ 取消能力（V3-F-4）：wia_engine 已支持 `cancel_event`（取消时抛
+          `ScanCancelled`），这里把**协调器登记的那个 event**透传给引擎，
+          并给出与 eSCL 路径一致的「取消扫描」入口
+          （取消按钮 → `coordinator.cancel_scan(job_id)`）。
+        ★ 取消后走 `scan_cancelled` 语义（**不是** `scan_failed`）。
+        """
+        try:
+            from wia_engine import wia_scan
+        except ImportError:
+            QMessageBox.warning(self, "提示", "WIA 引擎不可用（仅 Windows 支持）")
+            return
+
+        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cancel_event = threading.Event()
+        # 登记到协调器 ⇒ coordinator.cancel_scan(job_id) 停的是**同一个** event
+        self._register_cancel_event(job_id, cancel_event)
+        self._wia_cancel_event = cancel_event
+        self._current_job_id = job_id
+
+        self.status_bar.showMessage("正在通过 WIA 扫描...")
+        # 新的一次扫描 = 新文档 ⇒ 清掉残留曝光（I-6）
+        self._reset_exposure_state()
+
+        # 取消入口：与 eSCL 路径一致（状态栏上的「取消扫描」按钮）
+        self.scan_btn.setEnabled(False)
+        self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
+        self.cancel_scan_btn.clicked.connect(self._cancel_scan)
+        self.status_bar.addPermanentWidget(self.cancel_scan_btn)
+
+        def _wia_thread():
+            try:
+                data, ext = wia_scan(
+                    device_id=device.get("id"),
+                    resolution=self.resolution_val,
+                    color_mode=1,
+                    output_format=self.output_format_val,
+                    cancel_event=cancel_event,
+                )
+                if data:
+                    cache_manager.register_job(job_id)
+                    cache_path = cache_manager.write_page(job_id, 1, data, ext)
+                    del data
+                    out_dir = self.dir_entry.text() or self.output_dir
+                    output_path = os.path.join(
+                        out_dir,
+                        f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+                    )
+                    self._post_ui(lambda: self._show_preview(
+                        cache_path, ext, output_path, job_id))
+                else:
+                    self._post_ui(lambda: self._reset_scan_ui())
+                    self._post_ui(lambda: self.status_bar.showMessage("WIA 扫描失败"))
+            except ScanCancelled:
+                # ★ 用户取消 ⇒ **不是失败**（V3-F-4）：发 scan_cancelled，
+                #   绝不能发 scan_failed（否则用户看到"扫描失败"）。
+                self._post_ui(lambda: self._on_wia_cancelled(job_id))
+            except Exception as e:
+                self._post_ui(lambda: self._scan_error(f"WIA 错误: {e}"))
+                # 预览没开起来 ⇒ 没人替我们注销 job（否则缓存目录永不被回收）
+                self._release_job(job_id)
+            finally:
+                self._clear_cancel_event(job_id)
+                self._wia_cancel_event = None
+
+        threading.Thread(target=_wia_thread, daemon=True).start()
+
+    def _on_wia_cancelled(self, job_id):
+        """WIA 扫描被用户取消（取消 ≠ 失败）。"""
+        try:
+            self._reset_scan_ui()
+            self.status_bar.showMessage("扫描已取消")
+            # 发协调器的 scan_cancelled（与 eSCL 路径同一套信号语义）——
+            # ★ WIA 路径是 GUI 自己起的线程（协调器没有 WIA 路径）⇒ 这里补发，
+            #   保证上层收到的是"取消"而不是"失败"。
+            self.coordinator.scan_cancelled.emit(job_id)
+        except RuntimeError:
+            logger.debug("WIA 取消时主窗口已销毁")
+
+    def _register_cancel_event(self, job_id, event):
+        """
+        把取消信号登记到协调器（让 `coordinator.cancel_scan(job_id)` 能停掉它）。
+
+        ★ 协调器目前只在 `start_scan` 内部登记它自己那条 eSCL 的 cancel_event，
+          没有对外的登记 API；WIA 路径是 GUI 自己起的线程 ⇒ 这里按协调器的
+          内部约定登记**同一个** event 对象（引擎收到的就是它）。
+        ★ 登记失败不致命：GUI 自己持有 event，取消按钮会直接 set 它。
+        """
+        try:
+            with QMutexLocker(self.coordinator._cancel_mutex):
+                self.coordinator._cancel_events[job_id] = event
+            return True
+        except Exception as e:
+            logger.debug("登记取消信号失败（改用 GUI 侧兜底）: %s", e)
+            return False
+
+    def _clear_cancel_event(self, job_id):
+        """注销协调器里的取消信号（与协调器 _ScanTask 的收尾一致）。"""
+        try:
+            self.coordinator._clear_cancel_event(job_id)
+        except Exception as e:
+            logger.debug("注销取消信号失败: %s", e)
 
     # ────────── 缓存设置 ──────────
     def _show_cache_settings(self):
@@ -2350,14 +2543,34 @@ class ScanApp(QMainWindow, _UiPostMixin):
         layout.addLayout(btn_layout)
 
         def _save():
-            apply_cache_settings(config, limit_spin.value(), trigger_spin.value(),
-                                 cleanup_spin.value())
-            cache_manager.save_cache_config(config)
-            self.status_bar.showMessage("缓存设置已保存")
+            ok = self._apply_cache_settings(
+                config, limit_spin.value(), trigger_spin.value(),
+                cleanup_spin.value())
             dialog.accept()
+            return ok
 
         save_btn.clicked.connect(_save)
         dialog.exec()
+
+    def _apply_cache_settings(self, config, limit_mb, trigger_percent,
+                              cleanup_mb) -> bool:
+        """
+        写缓存设置并**如实报告**（V1-N-2）。返回是否真的落盘。
+
+        `cache_manager.save_cache_config` 在拿不到跨进程锁 / 写失败时返回
+        **False**（本次没存上）⇒ 绝不能无条件说"已保存"。
+        """
+        apply_cache_settings(config, limit_mb, trigger_percent, cleanup_mb)
+        ok = bool(cache_manager.save_cache_config(config))
+        if ok:
+            self.status_bar.showMessage("缓存设置已保存")
+            return True
+        logger.error("缓存设置未落盘（拿不到跨进程锁或写失败）")
+        self.status_bar.showMessage("缓存设置保存失败（设置未生效）")
+        QMessageBox.warning(
+            self, "保存失败",
+            "缓存设置保存失败（拿不到文件锁或写入失败），本次设置未生效。")
+        return False
 
     # ────────── 窗口关闭时保存设置 ──────────
     def closeEvent(self, event):
@@ -2366,7 +2579,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.cfg["window_height"] = self.height()
         self.cfg["window_x"] = self.x()
         self.cfg["window_y"] = self.y()
-        save_config(self.cfg)
+        self._save_cfg()
         try:
             self.coordinator.shutdown()
         except Exception:
@@ -2829,6 +3042,9 @@ class PreviewDialog(QDialog, _UiPostMixin):
         # 裁边结果文件（不覆盖缓存原件）；裁边框（左上右下，右/下为开区间）
         self._crop_path = None
         self._crop_rect = None
+        # 裁边框所属的**原图**尺寸：裁边是在原图坐标系里算的，
+        # 写 page_meta 时要按当前旋转把它变换到旋转后的坐标系（F-2）
+        self._crop_source_size = None
         # 递增 token：auto 重算完成后用它判断结果是否已过期
         self._exposure_token = 0
         self._initial_exposure = exposure
@@ -3022,6 +3238,10 @@ class PreviewDialog(QDialog, _UiPostMixin):
         ★ 不再覆盖缓存原件：结果写到 crop_ 前缀的新文件，原件保持只读
         ★ 格式按**原扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG quality=95），不再一律 JPEG
         ★ 写盘用临时文件 + os.replace（原子），中途失败不会毁掉已有文件
+        ★ **不再清零用户的旋转**（F-2）：旋转是用户明确做的操作，裁边不该
+          把它悄悄丢掉。裁边在**原图坐标系**里算（与预览里看到的是同一块
+          内容：旋转 90° 只会把宽高对调），裁边框写 page_meta 时再按当前
+          旋转变换到旋转后的坐标系。
         """
         cache = self.cache_path
         try:
@@ -3032,6 +3252,7 @@ class PreviewDialog(QDialog, _UiPostMixin):
                 raw = f.read()
             with Image.open(io.BytesIO(raw)) as src:
                 img = src.copy()
+            source_size = img.size          # 原图尺寸（裁边框的坐标系）
             cropped = None
             try:
                 cropped = auto_crop(img)
@@ -3052,7 +3273,8 @@ class PreviewDialog(QDialog, _UiPostMixin):
             self._crop_path = crop_path
             self._crop_rect = rect
             self._cropped = True
-            self._rotation = 0
+            self._crop_source_size = source_size
+            # ★ 旋转**保留**：用户转过的角度不会被裁边悄悄清零
             self._sync_page_meta()
             self._recompute_preview()
         except Exception as e:
@@ -3066,11 +3288,27 @@ class PreviewDialog(QDialog, _UiPostMixin):
         裁边改了图像尺寸、旋转改了朝向 ⇒ 元数据必须跟上，
         否则 page_meta 记的还是扫描时的原图尺寸，纠偏/续扫的回溯链就断了。
         （page_meta 只**调用**，不改它的实现）
+
+        ★ 记的是**最终产物**的几何（裁边 + 旋转之后）：
+          - width/height = 旋转后的尺寸（90/270 宽高对调）
+          - crop_rect   = 裁边框变换到**旋转后的坐标系**（F-2）
+            （裁边框本身是在原图坐标系里算出来的）
         """
         try:
             source = self._source_path()
             with Image.open(source) as im:
                 width, height = im.size
+            width, height = _rotated_size((width, height), self._rotation)
+            crop_rect = self._crop_rect
+            if crop_rect is not None:
+                src_size = self._crop_source_size
+                if not src_size:
+                    try:
+                        with Image.open(self.cache_path) as im:
+                            src_size = im.size
+                    except Exception:
+                        src_size = (width, height)
+                crop_rect = _rotate_rect(crop_rect, self._rotation, src_size)
             store = page_meta.PageMetaStore(cache_manager._cache_root())
             existing = {}
             try:
@@ -3083,7 +3321,7 @@ class PreviewDialog(QDialog, _UiPostMixin):
                 manual_rotation=int(self._rotation),
                 deskew_angle=float(existing.get("deskew_angle") or 0.0),
                 a4_normalized=bool(existing.get("a4_normalized", False)),
-                crop_rect=tuple(self._crop_rect) if self._crop_rect else None,
+                crop_rect=tuple(crop_rect) if crop_rect else None,
             ))
         except Exception as e:
             logger.debug("写页元数据失败 [%s]: %s", self.job_id, e)
@@ -3175,6 +3413,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         # 裁边结果：页号 → 文件路径（不覆盖缓存原件）
         self._crop_paths = {}
         self._crop_rects = {}
+        # 裁边框所属的**原图**尺寸：页号 → (W, H)（F-2 坐标变换用）
+        self._crop_source_sizes = {}
         # 保存中（后台线程落盘期间禁止重复提交）
         self._saving = False
         self._save_finished = False
@@ -3522,6 +3762,9 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         ★ 不再覆盖缓存原件：结果写到 crop_ 前缀的新文件，原件保持只读
         ★ 格式按**原扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG quality=95）
         ★ 写盘用临时文件 + os.replace（原子）
+        ★ **不再清掉该页的旋转**（F-2）：旋转是用户明确做的操作，裁边不该
+          把它悄悄丢掉。裁边在**原图坐标系**里算，裁边框写 page_meta 时
+          再按该页当前旋转变换到旋转后的坐标系。
         返回 True 表示确实裁了。
         """
         source = self._cache_path(page_num)
@@ -3529,6 +3772,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             raw = f.read()
         with Image.open(io.BytesIO(raw)) as src:
             img = src.copy()
+        source_size = img.size          # 原图尺寸（裁边框的坐标系）
         cropped = None
         try:
             cropped = auto_crop(img)
@@ -3547,30 +3791,46 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             img.close()
         self._crop_paths[page_num] = crop_path
         self._crop_rects[page_num] = rect
+        self._crop_source_sizes[page_num] = source_size
         self._cropped.add(page_num)
-        self._rotations.pop(page_num, None)
+        # ★ 旋转**保留**：用户转过的角度不会被裁边悄悄清零
         return True
 
     def _sync_page_meta(self, page_num):
         """
         把裁边/旋转后的几何信息写回 page_meta（原始件不动，元数据要跟上）。
         （page_meta 只**调用**，不改它的实现）
+
+        ★ 记的是**最终产物**的几何（裁边 + 旋转之后）：
+          - width/height = 旋转后的尺寸（90/270 宽高对调）
+          - crop_rect   = 裁边框变换到**旋转后的坐标系**（F-2）
         """
         try:
             source = self._source_path(page_num)
             with Image.open(source) as im:
                 width, height = im.size
+            rotation = self._get_rotation(page_num)
+            width, height = _rotated_size((width, height), rotation)
+            crop_rect = self._crop_rects.get(page_num)
+            if crop_rect is not None:
+                src_size = self._crop_source_sizes.get(page_num)
+                if not src_size:
+                    try:
+                        with Image.open(self._cache_path(page_num)) as im:
+                            src_size = im.size
+                    except Exception:
+                        src_size = (width, height)
+                crop_rect = _rotate_rect(crop_rect, rotation, src_size)
             store = page_meta.PageMetaStore(cache_manager._cache_root())
             existing = {}
             try:
                 existing = store.get_job(self.job_id).get(str(page_num), {}) or {}
             except Exception:
                 existing = {}
-            crop_rect = self._crop_rects.get(page_num)
             store.set_page(self.job_id, page_num, page_meta.PageMeta(
                 cache_path=self._cache_path(page_num),
                 width=int(width), height=int(height),
-                manual_rotation=int(self._get_rotation(page_num)),
+                manual_rotation=int(rotation),
                 deskew_angle=float(existing.get("deskew_angle") or 0.0),
                 a4_normalized=bool(existing.get("a4_normalized", False)),
                 crop_rect=tuple(crop_rect) if crop_rect else None,
@@ -3620,6 +3880,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             # 裁边件也一并删掉（它是这页的衍生物）
             crop_path = self._crop_paths.pop(page_num, None)
             self._crop_rects.pop(page_num, None)
+            self._crop_source_sizes.pop(page_num, None)
             if crop_path and os.path.exists(crop_path):
                 os.remove(crop_path)
         except Exception:
@@ -3647,7 +3908,10 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
 
         ★ 落盘挪到后台线程（F-5）：几百页合并要几十秒，在主线程做会把界面卡死。
           完成/失败都回主线程再提示（模块级投递器，不依赖本对话框的信号）。
-        ★ 用 save_manager.run_save_job（纯函数入口，无 Qt 依赖）
+        ★ 只剩 1 页（且只有 1 组）时走 GUI 的统一入口 `_save_page_specs`
+          （F-4）：单页单组**不加序号**（`{base}.{ext}`），与「单页任务」
+          /「直接保存」完全一致；多页仍走 save_manager.run_save_job
+          （纯函数入口 + PDF 体积预检回调，无 Qt 依赖）。
         ★ 裁过边的页用裁边件（原件保持只读）
         ★ 分组由 splits 决定，命名走 save_manager.build_output_name 的多组规则
         """
@@ -3665,6 +3929,24 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         if hasattr(self, "save_btn"):
             self.save_btn.setEnabled(False)
             self.save_btn.setText("保存中...")
+
+        # ★ 单页单组：走 GUI 的统一入口 `_save_page_specs`（F-4）
+        #   —— 命名与「单页任务」/「直接保存」一致：`{base}.{ext}`（不加序号）。
+        if len(page_specs) == 1 and len(groups) == 1:
+            def _work_single():
+                return _save_page_specs(
+                    self.job_id, self.ext, self.output_path, page_specs, groups,
+                    extra_dirs=self.extra_dirs, device_name=self.device_name,
+                    device_ip=self.device_ip, exposure=exposure)
+
+            # 投递器在主线程创建（跨线程 emit 的接收端必须活在主线程）
+            _ensure_ui_dispatcher()
+            _run_in_background(
+                _work_single,
+                lambda files: self._on_save_done(files),
+                lambda err: self._on_save_error(err),
+            )
+            return
 
         # SaveRequest 只装数据，不带 GUI 对象 ⇒ 可以安全跨线程传递
         request = save_manager.SaveRequest(

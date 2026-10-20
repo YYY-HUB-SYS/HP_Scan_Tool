@@ -87,6 +87,10 @@ class _StubApp:
 
     _on_scan_finished = gui.ScanApp._on_scan_finished
     _direct_save_result = gui.ScanApp._direct_save_result
+    # 直接保存已在后台线程落盘（16.17 / F-1）⇒ 完成/失败回主线程由这两个
+    # 方法接手（与多页预览的 _on_save_done / _on_save_error 同一套机制）
+    _on_direct_save_done = gui.ScanApp._on_direct_save_done
+    _on_direct_save_error = gui.ScanApp._on_direct_save_error
     _reset_exposure_state = gui.ScanApp._reset_exposure_state
 
     def __init__(self, direct_save=True, selected=None, extra_dirs=None,
@@ -98,6 +102,8 @@ class _StubApp:
         self.preview_calls = []
         self.status_bar = types.SimpleNamespace(showMessage=self.messages.append)
         self._exposure_state = exposure
+        # 直接保存的完成标记（后台落盘 + 主线程回调落地后置 True）
+        self._direct_save_finished = False
 
     def _reset_scan_ui(self):
         pass
@@ -165,7 +171,7 @@ def _scan_with_border(w=100, h=120, border=30):
 
 # ────────── I-1 直接保存的提示要报"实际产出文件数" ──────────
 
-def test_direct_save_reports_total_file_count(monkeypatch, tmp_path):
+def test_direct_save_reports_total_file_count(qapp, monkeypatch, tmp_path):
     """多页直接保存 ⇒ 提示里必须出现"共 N 个文件"，不能只报第 1 个路径"""
     fake = _FakeMessageBox()
     monkeypatch.setattr(gui, "QMessageBox", fake)
@@ -177,6 +183,8 @@ def test_direct_save_reports_total_file_count(monkeypatch, tmp_path):
 
     app = _StubApp(direct_save=True)
     app._on_scan_finished("job_slice3", _make_result(tmp_path, page_count=3))
+    # 落盘在后台线程 ⇒ 等完成回调回主线程再断言
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     assert fake.information_calls, "保存完必须有提示"
     text = fake.information_calls[0][1]
@@ -185,7 +193,7 @@ def test_direct_save_reports_total_file_count(monkeypatch, tmp_path):
         assert os.path.basename(f) in text, f"提示里没有 {f}"
 
 
-def test_direct_save_reports_failed_page_count(monkeypatch, tmp_path):
+def test_direct_save_reports_failed_page_count(qapp, monkeypatch, tmp_path):
     """部分页保存失败 ⇒ 提示里必须出现失败数（save_manager.failed_pages）"""
     fake = _FakeMessageBox()
     monkeypatch.setattr(gui, "QMessageBox", fake)
@@ -197,6 +205,7 @@ def test_direct_save_reports_failed_page_count(monkeypatch, tmp_path):
 
     app = _StubApp(direct_save=True)
     app._on_scan_finished("job_slice3", _make_result(tmp_path, page_count=3))
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     assert fake.information_calls
     text = fake.information_calls[0][1]
@@ -204,7 +213,7 @@ def test_direct_save_reports_failed_page_count(monkeypatch, tmp_path):
     assert "保存失败" in text
 
 
-def test_direct_save_failure_still_critical(monkeypatch, tmp_path):
+def test_direct_save_failure_still_critical(qapp, monkeypatch, tmp_path):
     """全部页都失败 ⇒ save_manager 抛异常 ⇒ 必须弹错误（不是静默）"""
     fake = _FakeMessageBox()
     monkeypatch.setattr(gui, "QMessageBox", fake)
@@ -216,6 +225,7 @@ def test_direct_save_failure_still_critical(monkeypatch, tmp_path):
 
     app = _StubApp(direct_save=True)
     app._on_scan_finished("job_slice3", _make_result(tmp_path, page_count=3))
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     assert fake.critical_calls, "保存失败必须弹错误提示"
     assert not fake.information_calls
@@ -239,6 +249,8 @@ def test_direct_and_preview_save_same_filename(qapp, tmp_path, isolated_cache,
         cached_paths=[str(cache)], output_path=str(output_path))
     app = _StubApp(direct_save=True)
     app._on_scan_finished("job_i2", result)
+    # 直接保存在后台线程落盘 ⇒ 等它结束再取文件名
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
     direct_files = sorted(p.name for p in tmp_path.glob("scan*.jpg"))
 
     # ② 预览保存
@@ -484,7 +496,7 @@ def test_delete_page_moves_split(qapp, tmp_path, isolated_cache, monkeypatch):
 
 # ────────── I-6 直接保存不许静默套用上一次的曝光 ──────────
 
-def test_new_scan_clears_stale_exposure(monkeypatch, tmp_path, no_popups):
+def test_new_scan_clears_stale_exposure(qapp, monkeypatch, tmp_path, no_popups):
     """
     新扫描开始 ⇒ 上一份文档的曝光被清掉 ⇒ 直接保存不会套用旧参数。
 
@@ -507,12 +519,13 @@ def test_new_scan_clears_stale_exposure(monkeypatch, tmp_path, no_popups):
     assert app._exposure_state is None
 
     app._on_scan_finished("job_i6", _make_result(tmp_path, page_count=1))
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
     assert calls, "直接保存没调落盘层"
     assert calls[0]["exposure"] is None, \
         f"直接保存套用了残留曝光: {calls[0]['exposure']}"
 
 
-def test_direct_save_still_applies_exposure_set_in_this_scan(monkeypatch,
+def test_direct_save_still_applies_exposure_set_in_this_scan(qapp, monkeypatch,
                                                               tmp_path, no_popups):
     """本次扫描内设置的曝光仍要生效（不能为了消残留把曝光功能改没了）"""
     calls = []
@@ -525,6 +538,7 @@ def test_direct_save_still_applies_exposure_set_in_this_scan(monkeypatch,
 
     app = _StubApp(direct_save=True, exposure={"mode": "manual", "brightness": 25})
     app._on_scan_finished("job_i6b", _make_result(tmp_path, page_count=1))
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
     assert calls[0]["exposure"]["brightness"] == 25
 
 

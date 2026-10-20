@@ -648,7 +648,7 @@ class TestMultiPagePreviewExposure:
 
 
 class TestDirectSaveExposure:
-    def test_direct_save_applies_exposure(self, tmp_path, tmp_config_dir,
+    def test_direct_save_applies_exposure(self, qapp, tmp_path, tmp_config_dir,
                                            monkeypatch, no_popups):
         """
         直接保存模式（跳过预览）也要应用曝光。
@@ -688,6 +688,11 @@ class TestDirectSaveExposure:
             _exposure_state={"mode": "manual", "brightness": 25},
             status_bar=_StubStatusBar(),
         )
+        # 直接保存的完成/失败回主线程由这两个方法接手（16.17 / F-1）
+        stub._on_direct_save_done = types.MethodType(
+            gui.ScanApp._on_direct_save_done, stub)
+        stub._on_direct_save_error = types.MethodType(
+            gui.ScanApp._on_direct_save_error, stub)
 
         result = types.SimpleNamespace(
             job_id="job_direct", ext="png",
@@ -695,12 +700,16 @@ class TestDirectSaveExposure:
             cached_paths=[str(src)])
 
         gui.ScanApp._direct_save_result(stub, result)
+        # 落盘在后台线程 ⇒ 等它落地（否则断言会跑在落盘之前）
+        assert _wait_for(lambda: getattr(stub, "_direct_save_finished", False),
+                         qapp=qapp), "直接保存没结束"
 
         assert "exposure" in captured, "直接保存没带曝光参数"
         assert captured["exposure"]["brightness"] == 25
         assert captured["exposure"]["mode"] == "manual"
 
-    def test_direct_save_without_exposure_is_unchanged(self, tmp_path, tmp_config_dir,
+    def test_direct_save_without_exposure_is_unchanged(self, qapp, tmp_path,
+                                                        tmp_config_dir,
                                                         monkeypatch, no_popups):
         """
         没设曝光时，直接保存的产物与不加曝光完全一致。
@@ -724,12 +733,19 @@ class TestDirectSaveExposure:
             _exposure_state=None,
             status_bar=_StubStatusBar(),
         )
+        stub._on_direct_save_done = types.MethodType(
+            gui.ScanApp._on_direct_save_done, stub)
+        stub._on_direct_save_error = types.MethodType(
+            gui.ScanApp._on_direct_save_error, stub)
+
         result = types.SimpleNamespace(
             job_id="job_direct_none", ext="png",
             output_path=str(tmp_path / "direct_none.png"),
             cached_paths=[str(src)])
 
         gui.ScanApp._direct_save_result(stub, result)
+        assert _wait_for(lambda: getattr(stub, "_direct_save_finished", False),
+                         qapp=qapp), "直接保存没结束"
         # 单页单组 ⇒ 不加序号（与预览保存同一条命名规则）
         out = tmp_path / "direct_none.png"
         assert out.exists(), f"直接保存没产出文件：{os.listdir(tmp_path)}"

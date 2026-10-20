@@ -15,6 +15,7 @@ GUI 一律用 offscreen 跑，不弹真实窗口。
 import io
 import os
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -84,6 +85,10 @@ class _StubApp:
 
     _on_scan_finished = gui.ScanApp._on_scan_finished
     _direct_save_result = gui.ScanApp._direct_save_result
+    # 直接保存已在后台线程落盘（16.17 / F-1）⇒ 完成/失败回主线程由这两个
+    # 方法接手（与多页预览的 _on_save_done / _on_save_error 同一套机制）
+    _on_direct_save_done = gui.ScanApp._on_direct_save_done
+    _on_direct_save_error = gui.ScanApp._on_direct_save_error
 
     def __init__(self, direct_save=False, selected=None, extra_dirs=None):
         self.direct_save_val = direct_save
@@ -92,6 +97,8 @@ class _StubApp:
         self.messages = []
         self.preview_calls = []
         self.status_bar = types.SimpleNamespace(showMessage=self.messages.append)
+        # 直接保存的完成标记（后台落盘 + 主线程回调落地后置 True）
+        self._direct_save_finished = False
 
     def _reset_scan_ui(self):
         pass
@@ -101,6 +108,18 @@ class _StubApp:
 
     def _show_multi_preview(self, *args, **kwargs):
         self.preview_calls.append(("multi", args, kwargs))
+
+
+def _wait_for(predicate, timeout=15.0, qapp=None):
+    """泵事件循环直到 predicate 为真（超时返回 False）"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        if qapp is not None:
+            qapp.processEvents()
+        time.sleep(0.01)
+    return predicate()
 
 
 def _make_result(tmp_path, page_count=3, ext="jpg"):
@@ -163,7 +182,8 @@ def test_gui_saved_limit_actually_drives_eviction(isolated_cache, monkeypatch):
 
 # ────────── I-6 「直接保存」必须真的生效 ──────────
 
-def test_direct_save_skips_preview_and_calls_save_pages(monkeypatch, tmp_path):
+def test_direct_save_skips_preview_and_calls_save_pages(qapp, monkeypatch,
+                                                        tmp_path):
     """勾了「直接保存」⇒ 不弹预览，且确实调用 save_manager.save_pages"""
     fake_msgbox = _FakeMessageBox()
     monkeypatch.setattr(gui, "QMessageBox", fake_msgbox)
@@ -179,6 +199,8 @@ def test_direct_save_skips_preview_and_calls_save_pages(monkeypatch, tmp_path):
     app = _StubApp(direct_save=True, selected=None)
     result = _make_result(tmp_path)
     app._on_scan_finished(result.job_id, result)
+    # 落盘在后台线程 ⇒ 等它真的结束（否则断言会跑在落盘之前）
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     assert app.preview_calls == [], "勾了直接保存就不该再弹预览"
     assert len(calls) == 1, "直接保存必须真的调用 save_manager.save_pages"
@@ -196,7 +218,7 @@ def test_direct_save_skips_preview_and_calls_save_pages(monkeypatch, tmp_path):
     assert "已保存到" in fake_msgbox.information_calls[0][1]
 
 
-def test_direct_save_uses_selected_device_info(monkeypatch, tmp_path):
+def test_direct_save_uses_selected_device_info(qapp, monkeypatch, tmp_path):
     """设备名/IP 取自当前选中设备；未选中设备时留空且不报错"""
     monkeypatch.setattr(gui, "QMessageBox", _FakeMessageBox())
 
@@ -208,6 +230,7 @@ def test_direct_save_uses_selected_device_info(monkeypatch, tmp_path):
     app = _StubApp(direct_save=True, selected=scanner)
     result = _make_result(tmp_path)
     app._on_scan_finished(result.job_id, result)
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     _, kwargs = calls[0]
     assert kwargs["device_name"] == "HP LaserJet MFP M232"
@@ -247,7 +270,7 @@ def test_direct_save_unchecked_still_shows_preview(monkeypatch, tmp_path):
     assert calls == [], "没勾直接保存时不应调用 save_manager.save_pages"
 
 
-def test_direct_save_failure_is_not_silent(monkeypatch, tmp_path):
+def test_direct_save_failure_is_not_silent(qapp, monkeypatch, tmp_path):
     """保存失败必须弹错误提示，不能静默吞掉"""
     fake_msgbox = _FakeMessageBox()
     monkeypatch.setattr(gui, "QMessageBox", fake_msgbox)
@@ -260,6 +283,7 @@ def test_direct_save_failure_is_not_silent(monkeypatch, tmp_path):
     app = _StubApp(direct_save=True)
     result = _make_result(tmp_path)
     app._on_scan_finished(result.job_id, result)
+    assert _wait_for(lambda: app._direct_save_finished, qapp=qapp), "直接保存没结束"
 
     assert fake_msgbox.critical_calls, "保存失败必须弹错误提示"
     assert not fake_msgbox.information_calls
