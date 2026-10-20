@@ -1654,6 +1654,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self.coordinator.config_save_failed.connect(self._on_config_save_failed)
         except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
             logger.debug("协调器没有 config_save_failed 信号: %s", e)
+        # ★ 页元数据写入失败（协调器如实上报；不接 ⇒ 用户只看到"扫描成功"，
+        #   实际那几页既没有自动纠偏角、也没有手动旋转/裁边框）
+        try:
+            self.coordinator.page_meta_save_failed.connect(
+                self._on_page_meta_save_failed)
+        except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
+            logger.debug("协调器没有 page_meta_save_failed 信号: %s", e)
         _ensure_ui_dispatcher()
         self._current_job_id = None
         self.coordinator.load_config()
@@ -2702,11 +2709,40 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
         return _confirm
 
+    def _on_page_meta_save_failed(self, job_id, page_no):
+        """
+        协调器报告「某页的元数据没写进去」（拿不到跨进程锁 / page_meta.json 损坏）。
+
+        ★ 不接的后果：用户看到「扫描成功」，但那一页**既没有自动纠偏角、
+          也没有手动旋转/裁边框**（`save_manager` 读不到元数据就按 0 度处理）
+          ⇒ 用户完全不知情 ⇒ 以为纠偏生效了。
+        ★ 只提示、不中断扫描（页已经扫到了；整批作废等于让用户白费一叠纸）。
+        """
+        logger.error("页元数据未写入：job=%s page=%s", job_id, page_no)
+        try:
+            self.status_bar.showMessage(
+                f"⚠ 第 {page_no} 页的元数据未写入"
+                f"（该页将没有自动纠偏/旋转）")
+        except RuntimeError:
+            logger.debug("页元数据失败提示时主窗口已销毁")
+
     def _on_scan_finished(self, job_id, result):
         self._reset_scan_ui()
         if not result.cached_paths:
             self.status_bar.showMessage("扫描未产生任何页面")
             return
+        # ★ 页元数据写入失败的页数（终审 F-3）：扫描"成功"，但那几页既没有
+        #   自动纠偏角、也没有手动旋转/裁边框 ⇒ 必须在用户去看产物**之前**
+        #   汇总告知（只在信号触发那一刻提示不够：用户未必盯着状态栏）。
+        failed_meta = int(getattr(getattr(self, "coordinator", None),
+                                  "page_meta_failed_pages", 0) or 0)
+        if failed_meta:
+            try:
+                self.status_bar.showMessage(
+                    f"⚠ 有 {failed_meta} 页的元数据未写入"
+                    f"（这些页将没有自动纠偏/旋转）")
+            except RuntimeError:
+                logger.debug("页元数据汇总提示时主窗口已销毁")
         # ★ 批次 4：会话模式（双面 / 续扫）⇒ **不弹预览对话框**，
         #   页面先进会话，合并后统一给预览。
         #   ★ 取模式必须**防御式**：既有测试里的最小替身（_StubApp）只借了
@@ -2883,6 +2919,27 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self._absorb_cancelled_pages(job_id, side, resume_from)
             self.status_bar.showMessage(
                 f"已中断：从第 {resume_from} 页重扫（前 {max(resume_from - 1, 0)} 页已保留）")
+            return
+        # ★ 取消时已扫出的页**没有丢**（页文件仍在缓存目录里），只是没入会话。
+        #   不说清楚 ⇒ 用户会以为白扫了（成功时明确说"N 页已加入会话"，
+        #   取消时只字未提 ⇒ 强烈反差，典型"我的扫描去哪了"投诉）。
+        #   方案 A：只报页数 + 指明可找回（不静默收编进会话 ——
+        #   用户取消往往正是因为不想收这批；弹模态框让用户拍板属另一方案，
+        #   涉及关窗时序，待后续评估）。
+        try:
+            pages = len(cache_manager.list_pages(job_id))
+        except Exception:
+            pages = 0
+        if pages:
+            stale_hours = 0
+            try:
+                stale_hours = int(cache_manager.load_cache_config().get(
+                    "stale_hours", 24))
+            except Exception:
+                stale_hours = 24
+            self.status_bar.showMessage(
+                f"扫描已取消：已扫出的 {pages} 页仍在缓存目录"
+                f"（{stale_hours} 小时内可找回），未加入会话")
             return
         self.status_bar.showMessage("扫描已取消")
 
