@@ -14,6 +14,7 @@ import time
 import pytest
 
 import cache_manager
+import config_io
 import history_manager
 import profile_manager
 
@@ -382,3 +383,80 @@ class TestWriteFailure:
 
         assert [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert _tmp_leftovers(tmp_path) == []
+
+
+# ── config_io 共享模块本身 ──────────────────────────────────
+
+
+class TestConfigIo:
+    """直接验证共享模块 config_io 的三个原语（收口后的唯一实现）"""
+
+    def test_config_dir_uses_appdata(self, tmp_path, monkeypatch):
+        """配置目录取 %APPDATA%\\HP_Scan_Tool\\，并确保目录存在"""
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+        d = config_io.config_dir()
+        assert d == os.path.join(str(tmp_path), "HP_Scan_Tool")
+        assert os.path.isdir(d)
+
+    def test_atomic_write_json_content_and_no_tmp(self, tmp_path):
+        """写成功后文件内容正确，且临时文件已被清理"""
+        target = str(tmp_path / "cfg.json")
+        config_io.atomic_write_json(target, {"a": 1, "中文": "值"})
+
+        with open(target, "r", encoding="utf-8") as f:
+            assert json.load(f) == {"a": 1, "中文": "值"}
+        assert _tmp_leftovers(tmp_path) == [], "临时文件必须已清理"
+
+    def test_atomic_write_json_keeps_old_file_on_failure(self, tmp_path, monkeypatch):
+        """写失败时旧文件原样保留，临时文件被清理"""
+        target = str(tmp_path / "cfg.json")
+        config_io.atomic_write_json(target, {"old": True})
+        with open(target, "r", encoding="utf-8") as f:
+            before = f.read()
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(config_io.os, "replace", boom)
+        with pytest.raises(OSError):
+            config_io.atomic_write_json(target, {"new": True})
+
+        with open(target, "r", encoding="utf-8") as f:
+            assert f.read() == before, "写失败时旧文件必须原样保留"
+        assert _tmp_leftovers(tmp_path) == []
+
+    def test_config_lock_is_mutually_exclusive(self, tmp_path):
+        """两个线程同时进临界区：绝不重叠"""
+        target = str(tmp_path / "cfg.json")
+        state = {"inside": 0, "max_inside": 0}
+        guard = threading.Lock()
+
+        def worker():
+            with config_io.config_lock(target):
+                with guard:
+                    state["inside"] += 1
+                    state["max_inside"] = max(state["max_inside"], state["inside"])
+                time.sleep(0.2)
+                with guard:
+                    state["inside"] -= 1
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert state["max_inside"] == 1, "临界区重叠：跨进程锁没起作用"
+
+    def test_config_lock_file_persists_after_use(self, tmp_path):
+        """锁的是字节区间，不是文件生命周期：用完之后锁文件仍然存在"""
+        target = str(tmp_path / "cfg.json")
+
+        with config_io.config_lock(target) as acquired:
+            assert acquired is True
+        assert (tmp_path / "cfg.json.lock").exists()
+
+        # 再取一次锁，锁文件仍在
+        with config_io.config_lock(target) as acquired:
+            assert acquired is True
+        assert (tmp_path / "cfg.json.lock").exists()
