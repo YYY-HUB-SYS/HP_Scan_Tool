@@ -11,10 +11,10 @@ import sys
 import threading
 from datetime import datetime
 
+import config_io
 from config_io import (
     atomic_write_json as _atomic_write_json,
     config_dir,
-    config_lock as _file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,8 @@ _lock = threading.Lock()
 # ── 原子写 + 跨进程锁 ──────────────────────────────────────
 # 实现已收口到共享模块 config_io：
 #   atomic_write_json —— 唯一临时文件 + 写后校验 + os.replace 原子替换
-#   config_lock       —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删）
+#   config_write_lock —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删），
+#                        **严格版**：拿不到锁抛 ConfigLockTimeout，事务体不执行
 
 # 已备份过的损坏文件（路径 + mtime + size），避免反复读取刷出一堆备份
 _CORRUPT_BACKED_UP = set()
@@ -60,27 +61,43 @@ class _HistoryReadError(Exception):
     """
 
 
-def append(entry: dict):
-    """追加一条扫描记录。线程安全 + 跨进程安全（读-改-写全程持锁）。
+def append(entry: dict) -> bool:
+    """追加一条扫描记录。线程安全 + 跨进程安全（读-改-写全程持**严格**锁）。
 
-    读失败（OSError）时**放弃本次写入**并记 error 日志 ——
-    读不出来 ≠ 内容为空，用空列表覆盖会把用户的全部历史静默清空。
+    返回是否真的追加成功：
+    - True  = 已落盘
+    - False = 本次**没有写入**（拿不到跨进程锁 / 读不出来 / 写失败）
+
+    三种失败各有各的语义，**绝不**合并成"静默丢数据"：
+    1. 拿不到跨进程锁（ConfigLockTimeout）⇒ **整个"读-改-写"事务放弃**。
+       严格锁在**事务体开始前**就抛异常 ⇒ `_load()` 根本没被调用 ⇒
+       读失败**不会**被当成"历史为空" ⇒ 原历史文件原样保留（F-7 的护栏不被改坏）。
+    2. 读不出来（OSError ⇒ _HistoryReadError）⇒ 放弃本次写入。
+       读不出来 ≠ 内容为空，用空列表覆盖会把用户的全部历史静默清空。
+    3. 其它异常（写失败等）⇒ 放弃本次写入并记 error 日志。
     """
     entry.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
     with _lock:
         fpath = _history_file()
         try:
-            with _file_lock(fpath):
+            with config_io.config_write_lock(fpath):
                 records = _load()
                 records.append(entry)
                 # 保留最近 500 条
                 if len(records) > 500:
                     records = records[-500:]
-                _save(records)
+                if not _save(records):
+                    return False
+        except config_io.ConfigLockTimeout as e:
+            logger.error("扫描历史追加被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
+            return False
         except _HistoryReadError as e:
             logger.error("扫描历史读取失败，本次追加已放弃（不覆盖原文件）: %s", e)
+            return False
         except Exception as e:
             logger.error("追加扫描历史失败: %s", e)
+            return False
+        return True
 
 
 def list_records(limit: int = 50) -> list:
@@ -93,15 +110,24 @@ def list_records(limit: int = 50) -> list:
     return list(reversed(records[-limit:]))
 
 
-def clear():
-    """清空所有历史记录。"""
+def clear() -> bool:
+    """清空所有历史记录。
+
+    拿不到跨进程锁 ⇒ 本次**不清空**（原历史保持不变）并返回 False。
+    """
     with _lock:
         fpath = _history_file()
         try:
-            with _file_lock(fpath):
-                _save([])
+            with config_io.config_write_lock(fpath):
+                if not _save([]):
+                    return False
+        except config_io.ConfigLockTimeout as e:
+            logger.error("清空扫描历史被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
+            return False
         except Exception as e:
             logger.error("清空扫描历史失败: %s", e)
+            return False
+        return True
 
 
 def _backup_corrupt(fpath: str):
@@ -164,14 +190,17 @@ def _load() -> list:
     return data
 
 
-def _save(records: list):
+def _save(records: list) -> bool:
     """
     保存扫描历史（唯一临时文件 + 原子替换 + 写后校验）。
 
     写失败不抛异常，只记 error 日志；原子替换保证失败时旧文件原样保留。
+    返回是否真的写入（False = 写失败，调用方据此放弃本次事务）。
     """
     fpath = _history_file()
     try:
         _atomic_write_json(fpath, records)
     except Exception as e:
         logger.error("扫描历史保存失败: %s", e)
+        return False
+    return True

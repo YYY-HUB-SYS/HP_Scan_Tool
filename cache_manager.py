@@ -25,10 +25,10 @@ import shutil
 import threading
 import time
 
+import config_io
 from config_io import (
     atomic_write_json as _atomic_write_json,
     config_dir,
-    config_lock as _file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,23 +113,37 @@ def load_cache_config() -> dict:
 # ── 原子写 + 跨进程锁 ──────────────────────────────────────
 # 实现已收口到共享模块 config_io：
 #   atomic_write_json —— 唯一临时文件 + 写后校验 + os.replace 原子替换
-#   config_lock       —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删）
+#   config_write_lock —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删），
+#                        **严格版**：拿不到锁抛 ConfigLockTimeout，事务体不执行
+#                        ⇒ 绝不"未持锁还写入"（那会覆盖别人的更新 = 丢数据）
 
 
-def save_cache_config(cfg: dict):
-    """保存缓存配置（唯一临时文件 + 跨进程锁 + 原子替换）。写失败不抛异常，只记日志。"""
+def save_cache_config(cfg: dict) -> bool:
+    """保存缓存配置（唯一临时文件 + 跨进程严格锁 + 原子替换）。
+
+    返回是否真的写入：
+    - True  = 已落盘
+    - False = 拿不到跨进程锁（本次**未写入**，原文件保持不变）或写失败
+
+    失败不抛异常（避免 GUI 因配置写失败而崩），但**必须**让调用方能知道
+    这次没存上 ⇒ 返回 False + 记 error 日志。
+    """
     global _config_cache, _config_cache_time
     path = _cache_config_path()
-    with _config_lock:
+    with _config_lock:  # 同进程线程锁：挡同进程多线程，与跨进程锁不重复
         try:
-            with _file_lock(path):
+            with config_io.config_write_lock(path):
                 _atomic_write_json(path, cfg)
+        except config_io.ConfigLockTimeout as e:
+            logger.error("缓存配置保存被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", path, e)
+            return False
         except Exception as e:
             logger.error("缓存配置保存失败: %s", e)
-            return
+            return False
         # 更新缓存
         _config_cache = cfg
         _config_cache_time = time.time()
+        return True
 
 
 def _cache_root() -> str:

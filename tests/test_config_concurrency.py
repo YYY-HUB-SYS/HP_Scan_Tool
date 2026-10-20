@@ -142,11 +142,11 @@ class TestFileLock:
     def test_lock_file_persists(self, tmp_path):
         """锁文件是持久文件（不删除），只锁它的字节区间"""
         target = str(tmp_path / "cfg.json")
-        with cache_manager._file_lock(target) as acquired:
+        with config_io.config_lock(target) as acquired:
             assert acquired is True
         assert (tmp_path / "cfg.json.lock").exists()
         # 再取一次锁，锁文件仍在
-        with cache_manager._file_lock(target):
+        with config_io.config_lock(target):
             pass
         assert (tmp_path / "cfg.json.lock").exists()
 
@@ -155,7 +155,7 @@ class TestFileLock:
         import msvcrt
 
         target = str(tmp_path / "cfg.json")
-        with cache_manager._file_lock(target):
+        with config_io.config_lock(target):
             fd = os.open(target + ".lock", os.O_RDWR | os.O_CREAT)
             try:
                 with pytest.raises(OSError):
@@ -169,12 +169,12 @@ class TestFileLock:
         script = (
             "import sys\n"
             "sys.path.insert(0, sys.argv[1])\n"
-            "import cache_manager\n"
+            "import config_io\n"
             "print('STARTED', flush=True)\n"
-            "with cache_manager._file_lock(sys.argv[2]) as ok:\n"
+            "with config_io.config_lock(sys.argv[2]) as ok:\n"
             "    print('ACQUIRED' if ok else 'TIMEOUT', flush=True)\n"
         )
-        with cache_manager._file_lock(target):
+        with config_io.config_lock(target):
             proc = subprocess.Popen(
                 [sys.executable, "-c", script, PROJECT_ROOT, target],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -13,10 +13,10 @@ import sys
 import threading
 import time
 
+import config_io
 from config_io import (
     atomic_write_json as _atomic_write_json,
     config_dir,
-    config_lock as _file_lock,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,8 @@ _PROFILES_CACHE_TTL = 2.0
 # ── 原子写 + 跨进程锁 ──────────────────────────────────────
 # 实现已收口到共享模块 config_io：
 #   atomic_write_json —— 唯一临时文件 + 写后校验 + os.replace 原子替换
-#   config_lock       —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删）
+#   config_write_lock —— msvcrt 跨进程排他锁（同目录 <name>.lock，常驻不删），
+#                        **严格版**：拿不到锁抛 ConfigLockTimeout，事务体不执行
 
 
 def _read_profiles_from_disk() -> dict:
@@ -84,11 +85,12 @@ def _load_profiles():
     return _profiles_cache
 
 
-def _save_profiles(profiles):
+def _save_profiles(profiles) -> bool:
     """
     保存所有配置文件（唯一临时文件 + 原子替换）。写失败不抛异常，只记日志。
 
-    调用方须已持有 _file_lock（跨进程读-改-写事务由调用方加锁）。
+    调用方须已持有 config_io.config_write_lock（跨进程读-改-写事务由调用方加锁）。
+    返回是否真的写入（False = 写失败）。
     """
     global _profiles_cache, _profiles_cache_time
     path = _profile_path()
@@ -96,9 +98,10 @@ def _save_profiles(profiles):
         _atomic_write_json(path, profiles)
     except Exception as e:
         logger.error("保存配置文件失败: %s", e)
-        return
+        return False
     _profiles_cache = profiles
     _profiles_cache_time = time.time()
+    return True
 
 
 def get_profile(ip: str) -> dict:
@@ -118,42 +121,62 @@ def get_profile(ip: str) -> dict:
         return profiles.get(ip, {}).copy()
 
 
-def save_profile(ip: str, params: dict):
+def save_profile(ip: str, params: dict) -> bool:
     """
     保存指定设备的配置文件。
 
     Args:
         ip: 设备 IP 地址
         params: 参数字典（分辨率、颜色、格式、来源等）
+
+    Returns:
+        本次操作是否成功（True = 目标状态已落盘；False = 本次**没生效**：
+        拿不到跨进程锁 ⇒ 原文件保持不变，或写失败）。绝不"未持锁还写入"
+        （那会覆盖别人的更新 = 丢数据）。
     """
     if not ip:
-        return
+        return False
     with _lock:
         path = _profile_path()
         try:
-            with _file_lock(path):
+            with config_io.config_write_lock(path):
                 # 锁内重读磁盘：拿到其他进程刚写的配置，避免丢写
                 profiles = _read_profiles_from_disk()
                 profiles[ip] = params.copy()
-                _save_profiles(profiles)
+                if not _save_profiles(profiles):
+                    return False
+        except config_io.ConfigLockTimeout as e:
+            logger.error("保存配置文件被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", path, e)
+            return False
         except Exception as e:
             logger.error("保存配置文件失败: %s", e)
+            return False
+        return True
 
 
-def delete_profile(ip: str):
-    """删除指定设备的配置文件"""
+def delete_profile(ip: str) -> bool:
+    """删除指定设备的配置文件。
+
+    返回本次操作是否成功（False = 拿不到锁/写失败 ⇒ 本次没生效，原文件不变）。
+    """
     if not ip:
-        return
+        return False
     with _lock:
         path = _profile_path()
         try:
-            with _file_lock(path):
+            with config_io.config_write_lock(path):
                 profiles = _read_profiles_from_disk()
                 if ip in profiles:
                     del profiles[ip]
-                    _save_profiles(profiles)
+                    if not _save_profiles(profiles):
+                        return False
+        except config_io.ConfigLockTimeout as e:
+            logger.error("删除配置文件被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", path, e)
+            return False
         except Exception as e:
             logger.error("删除配置文件失败: %s", e)
+            return False
+        return True
 
 
 def get_all_profiles() -> dict:
@@ -162,12 +185,21 @@ def get_all_profiles() -> dict:
         return _load_profiles().copy()
 
 
-def clear_all():
-    """清除所有配置文件"""
+def clear_all() -> bool:
+    """清除所有配置文件。
+
+    返回本次操作是否成功（False = 拿不到锁/写失败 ⇒ 本次没清空，原文件不变）。
+    """
     with _lock:
         path = _profile_path()
         try:
-            with _file_lock(path):
-                _save_profiles({})
+            with config_io.config_write_lock(path):
+                if not _save_profiles({}):
+                    return False
+        except config_io.ConfigLockTimeout as e:
+            logger.error("清除配置文件被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", path, e)
+            return False
         except Exception as e:
             logger.error("清除配置文件失败: %s", e)
+            return False
+        return True

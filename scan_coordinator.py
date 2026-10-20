@@ -182,7 +182,7 @@ def load_config() -> dict:
         return {}
 
 
-def save_config(cfg: dict):
+def save_config(cfg: dict) -> bool:
     """
     原子写入 scan_config.json。
 
@@ -191,14 +191,25 @@ def save_config(cfg: dict):
         （旧的固定临时名 `scan_config.json.tmp` 在并发写下会交错写，
           产出**非法 JSON** 并被 os.replace 发布成正式配置 ⇒
           下次 load_config 命中 JSONDecodeError 返回 {} ⇒ 用户设置整体丢失）
-      - config_lock：同目录 <name>.lock 跨进程排他锁
+      - config_write_lock：同目录 <name>.lock 跨进程排他锁（**严格版**）
+
+    返回是否真的写入：
+    - True  = 已落盘
+    - False = 拿不到跨进程锁（本次**未写入**，原文件保持不变）或写失败
+    失败**不抛异常**（避免 GUI 槽里未捕获异常），但必须**记 error 日志** ——
+    写失败绝不能只留一条 debug 日志（用户会以为设置已保存）。
     """
     path = os.path.join(_app_dir(), "scan_config.json")
     try:
-        with config_io.config_lock(path):
+        with config_io.config_write_lock(path):
             config_io.atomic_write_json(path, cfg)
+    except config_io.ConfigLockTimeout as e:
+        logger.error("配置保存被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", path, e)
+        return False
     except Exception as e:
-        logger.debug("配置保存失败: %s", e)
+        logger.error("配置保存失败: %s", e)
+        return False
+    return True
 
 
 class ScanCoordinator(QObject):
@@ -234,7 +245,8 @@ class ScanCoordinator(QObject):
         return self.cfg
 
     def save_config(self):
-        save_config(self.cfg)
+        """保存配置。返回是否真的写入（False = 本次未存上）。"""
+        return save_config(self.cfg)
 
     def set_custom_name(self, ip: str, name: str):
         """设置设备自定义名称"""
