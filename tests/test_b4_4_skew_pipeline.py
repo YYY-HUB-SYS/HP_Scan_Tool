@@ -40,6 +40,30 @@ REAL_SAMPLE = os.path.join(PROJECT_ROOT, ".verify_out", "D1_platen",
                            "HP_Scan_20261020_210142_001.jpg")
 
 
+def _count_red_pixels(rgb_img):
+    """数一数图里有多少个「纯红」像素（Pillow 把标量 fillcolor 当打包整数的产物）。
+
+    ★ 用 `getcolors`（C 实现）而不是逐像素 Python 循环 —— 2480×3507 的内嵌图
+      逐像素要跑 870 万次，慢到拖垮测试。
+    ★ 判定门槛与「纯红」对齐：JPEG 重压缩后纯红会变成 (254,0,0) 之类，
+      所以门槛放宽到 r>180 / g<90 / b<90。
+    """
+    counts = rgb_img.getcolors(maxcolors=1 << 24)
+    if counts is None:
+        # 颜色数爆了（极端噪声图）⇒ 退化成逐像素统计（慢但正确）
+        total = 0
+        for r, g, b in rgb_img.getdata():
+            if r > 180 and g < 90 and b < 90:
+                total += 1
+        return total
+    total = 0
+    for count, col in counts:
+        r, g, b = col[:3]
+        if r > 180 and g < 90 and b < 90:
+            total += count
+    return total
+
+
 # ── fixtures ──────────────────────────────────────────────────────────
 
 
@@ -736,7 +760,16 @@ class TestApplyDeskewOnSave:
 
     def test_deskewed_pdf_output_corners_are_white_not_red(self, tmp_path,
                                                            cache_root, small_page):
-        """★★ 回归锁死 P1（PDF 路径）：PDF 内嵌图的四角也必须是白。"""
+        """★★ 回归锁死 P1（PDF 路径）：PDF 内嵌图**不能含红色像素**。
+
+        ★★ 为什么**不能只查四角**（旧版本就是这么写的 ⇒ **空转断言**）：
+          PDF 走 `_save_a4_pdf` → `_a4_canvas`，把纠偏后的页**居中贴到
+          2480×3507 的白色 A4 画布** ⇒ 产物内嵌图的**四角是画布角，永远是白**
+          ⇒ 旧断言在"红块缺陷形态"下**依然 PASS**
+          ⇒ 而默认输出格式就是 PDF ⇒ P1 在**最常用的路径上没有任何护栏**。
+          （实测：注入修复前形态后旧断言仍绿，红块落在画布中部、占比 0.00327。）
+        ⇒ 改成断言**整张内嵌图不含红像素**（红块落在画布哪里都抓得住）。
+        """
         job = "job_corners_pdf"
         data = _skewed_bytes(small_page, 3.0)
         cache_file = _write_cache_page(cache_root, job, 1, data,
@@ -751,10 +784,48 @@ class TestApplyDeskewOnSave:
         imgs = reader.pages[0].images
         assert imgs, "PDF 里没有内嵌图"
         with Image.open(io.BytesIO(imgs[0].data)) as im:
-            corners = corner_pixels(im.convert("RGB"))
-        for c in corners:
-            assert all(abs(v - 255) <= 8 for v in c[:3]), (
-                "PDF 内嵌图四角应是白，实际 %s" % (corners,))
+            red = _count_red_pixels(im.convert("RGB"))
+        assert red == 0, (
+            "PDF 内嵌图含 %d 个红色像素（标量 fillcolor=255 在 RGB 下是纯红）"
+            % red)
+
+    def test_pdf_red_pixel_assertion_is_not_vacuous(self, tmp_path, cache_root,
+                                                    small_page, monkeypatch):
+        """★★ 非空转自检：注入"纯红缺陷形态"后，红像素断言**必须**抓得住。
+
+        为什么要专门加这条：旧断言查的是 A4 画布四角（永远白）⇒ 缺陷形态下
+        依然 PASS ⇒ PDF 路径无护栏却"看起来有测试"。
+        这条测试把**断言本身的判别力**钉住：注入缺陷 ⇒ 断言必须变红。
+        """
+        def _red_deskew(img, angle, **kwargs):
+            """模拟"修复前形态"：RGB 图用标量 fillcolor=255 ⇒ Pillow 当成 (255,0,0)。"""
+            if img is None or angle is None:
+                return img
+            angle = float(angle)
+            if abs(angle) < 1e-9:
+                return img
+            if img.mode == "P":
+                img = img.convert("RGB")
+            return img.rotate(angle, resample=Image.BICUBIC, fillcolor=255)
+
+        monkeypatch.setattr(skew_detect, "deskew_image", _red_deskew)
+
+        job = "job_corners_pdf_red"
+        data = _skewed_bytes(small_page, 3.0)
+        cache_file = _write_cache_page(cache_root, job, 1, data,
+                                       deskew_angle=-3.0)
+        out = _out_base(tmp_path, "corners_pdf_red")
+        save_manager.save_pages(job, "pdf", out, [(cache_file, 0)], [[0]])
+        pdf = _out_path(out, "pdf")
+        from pypdf import PdfReader
+        reader = PdfReader(pdf)
+        imgs = reader.pages[0].images
+        assert imgs, "PDF 里没有内嵌图"
+        with Image.open(io.BytesIO(imgs[0].data)) as im:
+            red = _count_red_pixels(im.convert("RGB"))
+        assert red > 0, (
+            "注入纯红缺陷形态后仍数不到红像素 ⇒ 红像素断言是空转的，"
+            "PDF 路径依然没有护栏")
 
     def test_deskew_keeps_canvas_size(self, tmp_path, cache_root, small_page):
         """不 expand ⇒ 画布尺寸不变（只多了一圈补白）。"""

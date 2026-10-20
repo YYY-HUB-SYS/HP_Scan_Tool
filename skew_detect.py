@@ -270,10 +270,11 @@ def deskew_image(img, angle, fillcolor=None):
         # 调色板图：标量 fillcolor 是**调色板索引**，不是颜色 ⇒ 先转 RGB
         img = img.convert("RGB")
     if fillcolor is None:
-        if mode in ("1", "L"):
-            fillcolor = 255
-        elif mode == "RGBA":
-            fillcolor = (255, 255, 255, 255)
-        else:
-            fillcolor = (255, 255, 255)
+        # ★ 按**波段数**生成白，而不是按模式名白名单：
+        #   Pillow 对各模式的 fillcolor 要求不同 —— RGB/RGBA 要 3/4 元组、
+        #   LA 要 2 元组、I/I;16/F 要标量 ⇒ 写死白名单**必然漏模式**，
+        #   漏掉的模式直接抛 TypeError ⇒ 那一页**整页落盘失败**（用户拿不到）。
+        #   （实测旧白名单漏掉 LA / F / I / I;16 四个模式。）
+        bands = len(img.getbands())
+        fillcolor = 255 if bands == 1 else tuple([255] * bands)
     return img.rotate(angle, resample=Image.BICUBIC, fillcolor=fillcolor)

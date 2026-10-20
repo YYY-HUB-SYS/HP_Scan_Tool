@@ -203,6 +203,52 @@ class TestDeskewImage:
         out = deskew_image(page, estimate_skew(page))
         assert out.size == page.size
 
+    # ── 回归 N1：模式白名单不全 ⇒ LA/F/I/I;16 直接抛 TypeError ──────────
+    #
+    # 缺陷背景：修 P1（RGB 图的**标量** fillcolor=255 被 Pillow 解释成打包整数
+    # ⇒ 四角纯红，实测占页面 4.36%）时，填充色改成了「按模式取白」，
+    # 但那份**白名单只覆盖了 1 / L / RGBA / RGB** ⇒ `LA` / `F` / `I` / `I;16`
+    # 这些模式拿到三元组白 ⇒ Pillow 直接抛 TypeError
+    # ⇒ 那一页**整页落盘失败**（save_manager 捕获后计入 failed_pages，
+    #   用户根本拿不到这一页）。
+    # 正确做法：按**波段数**生成白元组（bands==1 ⇒ 标量 255，否则 n 元组）。
+
+    #: 各模式下的「白」初值（CMYK 的 0 才是白，不参与角像素断言）
+    _WHITE_INIT = {
+        "1": 255,
+        "L": 255,
+        "LA": (255, 255),
+        "I": 255,
+        "I;16": 65535,
+        "F": 255.0,
+        "RGB": (255, 255, 255),
+        "RGBA": (255, 255, 255, 255),
+    }
+
+    @pytest.mark.parametrize("mode", ["1", "L", "LA", "I", "I;16", "F",
+                                       "RGB", "RGBA", "CMYK", "P"])
+    def test_every_pillow_mode_is_supported(self, mode):
+        """★ 回归 N1：任何 Pillow 模式纠偏都**不能抛 TypeError**。
+
+        现实触发概率低（扫描档位只有 RGB24/Grayscale8 ⇒ RGB/L），
+        但 `_read_cache_image` 是 `Image.open(...).copy()`，**原样保留源模式**
+        ⇒ 只要扫描仪吐出 16 位 PNG / 32 位 TIFF 就会命中 ⇒ 该页整页丢失。
+        """
+        img = Image.new(mode, (40, 40))
+        out = deskew_image(img, 3.0)
+        assert out is not None, mode
+        assert out.size == img.size, mode
+        assert out.mode in (mode, "RGB"), (mode, out.mode)
+
+    @pytest.mark.parametrize("mode", ["1", "L", "LA", "I", "I;16", "F",
+                                       "RGB", "RGBA"])
+    def test_fill_is_white_in_every_supported_mode(self, mode):
+        """填充色必须是**白**，不是 RGB 标量那种"打包整数 = 纯红"。"""
+        img = Image.new(mode, (40, 40), self._WHITE_INIT[mode])
+        out = deskew_image(img, 3.0)
+        corner = out.convert("RGB").getpixel((0, 0))
+        assert all(abs(v - 255) <= 8 for v in corner), (mode, corner)
+
 
 # ---------------------------------------------------------------- ink_ratio
 

@@ -321,6 +321,25 @@ class TestBatchOrder:
 
 
 class TestOutputArtifacts:
+    def test_image_session_fast_path_creates_missing_output_directory(self, tmp_path,
+                                                                     cache_root):
+        """★ 回归 P4：会话落盘的 **JPEG 快路径**也必须先建输出目录。
+
+        缺陷背景：`save_pages` 的快路径是 `shutil.copy2`（绕开 `_write_image`
+        ⇒ 不建父目录）；`save_session` 的图片快路径**同样**是 `copy2`
+        ⇒ 输出目录不存在时整批页全失败（正是 P4 的原始症状），
+        而且快路径是最常见的那条。
+        """
+        paths = _write_job_pages(cache_root, "job_img_mkdir",
+                                 [(1, RED), (2, GREEN)])
+        session = new_session(mode="batch", ext="jpg", dpi=300)
+        session.add_pages("job_img_mkdir", list(paths.values()), side="single",
+                          page_nos=[1, 2])
+        out_base = str(tmp_path / "not" / "yet" / "imgs")
+        result = save_manager.save_session(session, out_base)
+        assert len(result) == 2
+        assert all(os.path.exists(p) for p in result), list(result)
+
     def test_image_session_global_page_numbers_continuous(self, tmp_path,
                                                           cache_root):
         """★ 图片格式：每页一个文件，**全局页号连续**（跨批次不重号）"""

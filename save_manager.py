@@ -579,12 +579,22 @@ def _save_a4_pdf(img, path, dpi=300):
             canvas.close()
 
 
-def _write_image(img, path, ext, dpi=300):
-    """按扩展名落盘一张图片"""
-    # 输出目录可能还不存在（PDF 分支会建，图片分支原先不会 ⇒ 目录缺失时整批失败）
+def _ensure_parent_dir(path):
+    """确保目标文件的**父目录**存在（输出目录可能还没建）。
+
+    ★ JPEG 快路径（`shutil.copy2`）**绕开** `_write_image` ⇒ 以前只有慢路径
+      会建目录 ⇒ 输出目录不存在时整批页全失败（P4 的原始症状）。
+      所有"往某个文件路径写"的地方都必须先过这里。
+    """
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _write_image(img, path, ext, dpi=300):
+    """按扩展名落盘一张图片"""
+    # 输出目录可能还不存在（PDF 分支会建，图片分支原先不会 ⇒ 目录缺失时整批失败）
+    _ensure_parent_dir(path)
     if ext == "pdf":
         _save_a4_pdf(img, path, dpi=dpi)
     elif ext in ("jpg", "jpeg"):
@@ -926,6 +936,7 @@ def save_pages(job_id: str, ext: str, output_path: str,
                             and not exposure_active and not apply_angle
                             and _is_intact_jpeg(cache_file)):
                         # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径，逐字节一致）
+                        _ensure_parent_dir(fpath)      # ★ 快路径绕开 _write_image ⇒ 这里必须自己建目录
                         shutil.copy2(cache_file, fpath)
                     else:
                         # 快路径的前置条件不满足（曝光/旋转/纠偏，或缓存页不是完整 JPEG）
@@ -1243,6 +1254,7 @@ def save_session(session, out_path=None, extra_dirs=None,
                             and not exposure_active and not apply_angle
                             and _is_intact_jpeg(cache_file)):
                         # 无曝光、无旋转、无纠偏 ⇒ 直接复制原始字节（快路径）
+                        _ensure_parent_dir(fpath)      # ★ 快路径绕开 _write_image ⇒ 这里必须自己建目录
                         shutil.copy2(cache_file, fpath)
                     else:
                         img = _open_page_image(cache_file, rotation, exposure,

@@ -196,6 +196,33 @@ class TestJpgFastPathValidation:
             digest_out = hashlib.sha256(f.read()).hexdigest()
         assert digest_out == digest_src, "快路径的逐字节一致语义被破坏了"
 
+    # ── 回归 P4：JPEG 快路径绕开 _write_image ⇒ 不建输出目录 ──────────────
+    #
+    # 缺陷背景：`_write_image` 补了「建父目录」（慢路径 / PDF / save_single
+    # 都因此修好），但 JPEG **快路径**是 `shutil.copy2(cache_file, fpath)`
+    # —— **绕开** `_write_image` ⇒ 输出目录不存在时 copy2 抛 FileNotFoundError
+    # ⇒ **整批页全失败**（正是 P4 的原始症状），而且快路径是最常见的那条。
+
+    def test_fast_path_creates_missing_output_directory(self, tmp_path, isolated):
+        """★ 回归 P4：多页 JPEG 走快路径时，输出目录不存在也必须能落盘。"""
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (300, 400), (12, 34, 56)).save(src, "JPEG")
+        out = str(tmp_path / "not" / "yet" / "HP_Scan.jpg")
+        result = save_manager.save_pages("job_mkdir", "jpg", out,
+                                         [(str(src), 0)], [[0]])
+        assert result.failed_pages == 0, "目录缺失不该让整批页失败"
+        assert result.saved_page_count == 1
+        assert os.path.exists(result[0]), "产物没落盘"
+
+    def test_save_single_fast_path_creates_missing_output_directory(self, tmp_path,
+                                                                     isolated):
+        """★ 回归 P4：单页保存走快路径时同样必须先建输出目录。"""
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (300, 400), (12, 34, 56)).save(src, "JPEG")
+        out = str(tmp_path / "not" / "yet" / "single.jpg")
+        path = save_manager.save_single(str(src), "jpg", out, job_id="job_single_mkdir")
+        assert os.path.exists(path), "产物没落盘"
+
     def test_non_jpeg_cache_page_becomes_a_valid_jpeg(self, tmp_path, isolated):
         """PNG 缓存页不再被原样塞进 .jpg（那是个谁也打不开的文件）。"""
         src = tmp_path / "src.png"
