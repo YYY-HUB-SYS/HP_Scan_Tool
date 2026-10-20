@@ -10,7 +10,11 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime
+
+from PIL import Image
+from PySide6.QtCore import QObject, QMutex, QMutexLocker, QRunnable, QThreadPool, Signal
 
 import cache_manager
 import history_manager
@@ -38,6 +42,26 @@ SOURCE_MAP = {
 
 # 默认输出目录
 DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
+
+
+class ScanCancelled(Exception):
+    """扫描被用户取消"""
+
+    def __init__(self, job_id: str = ""):
+        super().__init__(f"扫描已取消: {job_id}")
+        self.job_id = job_id
+
+
+@dataclass
+class ScanResult:
+    """一次扫描的结果"""
+    job_id: str
+    ext: str
+    page_count: int
+    cached_paths: list
+    output_path: str
+    source: str
+    adf_detected: bool
 
 
 def _label_for(s: ScannerInfo) -> str:
@@ -90,19 +114,31 @@ def save_config(cfg: dict):
         logger.debug("配置保存失败: %s", e)
 
 
-class ScanCoordinator:
+class ScanCoordinator(QObject):
     """
-    扫描编排器 — 隔离业务逻辑，不依赖 tkinter。
-    GUI 层（ScanApp）持有此对象，通过方法调用+回调与之交互。
+    扫描编排器 — 事件驱动。
+    持有扫描线程池，通过信号向 GUI 报告进度与结果。
+    GUI 只负责收集参数与呈现结果，不直接调用引擎。
     """
 
-    def __init__(self):
+    scan_started = Signal(str)
+    scan_progress = Signal(str, str, int)
+    scan_finished = Signal(str, object)
+    scan_failed = Signal(str, str)
+    scan_cancelled = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.scanners: list[ScannerInfo] = []
         self._scanners_lock = threading.Lock()
         self._active_scans = 0
         self._scan_lock = threading.Lock()
         self._scan_cancel = threading.Event()
         self.cfg: dict = {}
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(4)
+        self._cancel_events: dict = {}
+        self._cancel_mutex = QMutex()
 
     # ── 配置 ──
 
@@ -259,74 +295,152 @@ class ScanCoordinator:
         with self._scan_lock:
             return self._active_scans
 
-    def cancel_scan(self):
-        self._scan_cancel.set()
-
     def is_cancelled(self) -> bool:
         return self._scan_cancel.is_set()
 
-    def execute_scan_to_cache(self, scanner, resolution, color_mode_ui,
-                               output_format, source, status_callback=None):
+    def resolve_source(self, scanner, requested: str) -> tuple:
         """
-        执行扫描并写入缓存。
-        返回 (job_id, ext, page_count, cache_path_or_none)。
-        在后台线程调用。
+        决定实际扫描来源，返回 (实际来源, 是否探测到输稿器有纸)。
+
+        requested 为协议值："Platen" / "Feeder" / "Auto"
+        - "Auto"：探测 ADF，有纸用 Feeder，否则 Platen
+        - "Feeder"：设备确有 ADF 能力时才探测，有纸用 Feeder，否则回退 Platen
+        - "Platen"：保持 Platen
+        设备没有 ADF 能力或没有 eSCL 地址时，任何请求都落到 Platen。
+
+        注：探测默认常开 —— 设备确有 ADF 能力且探测到有纸时一律走 Feeder，
+        无论请求是 "Platen" 还是 "Feeder"（与 brief 提交的测试断言一致）。
         """
-        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        cache_manager.register_job(job_id)
+        has_adf = getattr(scanner, "has_adf", False)
+        if not has_adf or not getattr(scanner, "escl_url", ""):
+            return "Platen", False
+        try:
+            st = get_scanner_status(scanner.escl_url, timeout=5.0)
+            loaded = bool(st.get("adf_loaded"))
+        except Exception as e:
+            logger.debug("ADF 状态检测失败，保持原来源: %s", e)
+            if requested in ("Platen", "Feeder"):
+                return requested, False
+            return "Platen", False
+        if loaded:
+            return "Feeder", True
+        return "Platen", False
+
+    def run_scan_sync(self, scanner, params: dict, cancel_event=None,
+                      job_id: str = None) -> ScanResult:
+        """
+        同步执行一次扫描并写入缓存。线程池任务与单元测试都走这个方法。
+        """
+        resolution = params.get("resolution", 300)
+        color_mode_ui = params.get("color_mode_ui", "彩色")
+        output_format = params.get("output_format", "jpg")
+        duplex = params.get("duplex", False)
+        output_dir = params.get("output_dir") or DEFAULT_OUT_DIR
+        requested = self._source_to_protocol(params.get("source", "平板"))
+
+        source, adf_detected = self.resolve_source(scanner, requested)
         color_mode = COLOR_MODE_MAP.get(color_mode_ui, "RGB24")
 
-        if self.is_cancelled():
-            return None
+        if job_id is None:
+            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cache_manager.register_job(job_id)
 
-        # 自动检测 ADF
-        if scanner.has_adf:
-            try:
-                st = get_scanner_status(scanner.escl_url, timeout=5.0)
-                if st.get("adf_loaded"):
-                    source = "Feeder"
-                    if status_callback:
-                        status_callback("输稿器检测到纸张，自动切换为 ADF 扫描")
-                else:
-                    source = "Platen"
-                    if status_callback:
-                        status_callback("输稿器为空，自动切换为平板扫描")
-            except Exception as e:
-                logger.debug("ADF 状态检测失败，保持手动选择: %s", e)
+        cached_paths = []
+        ext = output_format
 
-        use_adf = source == "Feeder"
-
-        if use_adf:
+        if source == "Feeder":
             def _progress(n, _total):
-                if status_callback:
-                    status_callback(f"正在扫描... 已获取 {n} 页")
+                self.scan_progress.emit(job_id, f"已扫描 {n} 页", n)
 
             pages = execute_multipage_scan(
-                scanner=scanner,
-                resolution=resolution,
-                color_mode=color_mode,
-                output_format=output_format,
-                source=source,
-                timeout=300.0,
-                progress_callback=_progress,
+                scanner=scanner, resolution=resolution, color_mode=color_mode,
+                output_format=output_format, source=source, duplex=duplex,
+                timeout=300.0, progress_callback=_progress,
+                cancel_event=cancel_event,
             )
-            ext = pages[0][1] if pages else output_format
-            for i, (data, ext) in enumerate(pages, 1):
-                cache_manager.write_page(job_id, i, data, ext)
-                del data
-            return (job_id, ext, len(pages), None)
+            for i, (data, page_ext) in enumerate(pages, 1):
+                ext = page_ext
+                path = cache_manager.write_page(job_id, i, data, page_ext)
+                cached_paths.append(path)
+                self._apply_a4_crop(path, resolution)
         else:
             data, ext = execute_scan(
-                scanner=scanner,
-                resolution=resolution,
-                color_mode=color_mode,
-                output_format=output_format,
-                source=source,
-                timeout=90.0,
+                scanner=scanner, resolution=resolution, color_mode=color_mode,
+                output_format=output_format, source=source, duplex=duplex,
+                timeout=90.0, cancel_event=cancel_event,
             )
-            cache_path = cache_manager.write_page(job_id, 1, data, ext)
-            del data
-            return (job_id, ext, 1, cache_path)
+            if not data:
+                raise ScanCancelled(job_id)
+            path = cache_manager.write_page(job_id, 1, data, ext)
+            cached_paths.append(path)
+            self._apply_a4_crop(path, resolution)
+
+        output_path = os.path.join(
+            output_dir,
+            f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+
+        return ScanResult(
+            job_id=job_id, ext=ext, page_count=len(cached_paths),
+            cached_paths=cached_paths, output_path=output_path,
+            source=source, adf_detected=adf_detected,
+        )
+
+    def start_scan(self, scanner, params: dict) -> str:
+        """异步启动扫描，立即返回 job_id。结果通过信号通知。"""
+        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        cancel_event = threading.Event()
+        with QMutexLocker(self._cancel_mutex):
+            self._cancel_events[job_id] = cancel_event
+        self._pool.start(_ScanTask(self, scanner, params, job_id, cancel_event))
+        return job_id
+
+    def cancel_scan(self, job_id: str) -> None:
+        """取消指定扫描任务"""
+        with QMutexLocker(self._cancel_mutex):
+            ev = self._cancel_events.get(job_id)
+        if ev is not None:
+            ev.set()
+
+    def shutdown(self) -> None:
+        """取消全部在途任务并停止线程池。GUI 关闭时调用。"""
+        with QMutexLocker(self._cancel_mutex):
+            events = list(self._cancel_events.values())
+        for ev in events:
+            ev.set()
+        self._pool.clear()
+        self._pool.waitForDone(3000)
+
+    def _clear_cancel_event(self, job_id: str) -> None:
+        with QMutexLocker(self._cancel_mutex):
+            self._cancel_events.pop(job_id, None)
+
+    @staticmethod
+    def _source_to_protocol(source_text: str) -> str:
+        """UI 文本 → 协议来源值（Auto 表示自动探测）"""
+        if source_text == "自动":
+            return "Auto"
+        if source_text in SOURCE_MAP:
+            return SOURCE_MAP[source_text]
+        if source_text in ("Platen", "Feeder", "Auto"):
+            return source_text
+        return "Platen"
+
+    @staticmethod
+    def _apply_a4_crop(cache_path: str, dpi: int) -> None:
+        """扫描后处理：A4 居中裁剪（不超过原图）。失败不影响扫描结果。"""
+        try:
+            from escl_engine import crop_to_a4
+            with open(cache_path, "rb") as f:
+                raw = f.read()
+            img = Image.open(io.BytesIO(raw))
+            cropped = crop_to_a4(img, dpi=dpi)
+            if cropped.size != img.size:
+                buf = io.BytesIO()
+                cropped.convert("RGB").save(buf, format="JPEG")
+                with open(cache_path, "wb") as f:
+                    f.write(buf.getvalue())
+        except Exception as e:
+            logger.debug("A4 裁剪失败: %s", e)
 
     def execute_wia_to_cache(self, resolution, color_mode_ui, output_format):
         """WIA 降级扫描并写入缓存。返回 (job_id, ext, cache_path) 或 None。"""
@@ -413,3 +527,36 @@ def delete_cached_page(job_id, page_idx, ext, splits):
         elif sp > page_idx:
             new_splits.append(sp - 1)
     return new_splits
+
+
+class _ScanTask(QRunnable):
+    """在协调器线程池中执行的扫描任务"""
+
+    def __init__(self, coordinator, scanner, params, job_id, cancel_event):
+        super().__init__()
+        self.setAutoDelete(True)
+        self._coordinator = coordinator
+        self._scanner = scanner
+        self._params = params
+        self._job_id = job_id
+        self._cancel_event = cancel_event
+
+    def run(self):
+        coord = self._coordinator
+        job_id = self._job_id
+        try:
+            coord.scan_started.emit(job_id)
+            result = coord.run_scan_sync(self._scanner, self._params,
+                                         cancel_event=self._cancel_event,
+                                         job_id=job_id)
+            if self._cancel_event.is_set():
+                coord.scan_cancelled.emit(job_id)
+            else:
+                coord.scan_finished.emit(job_id, result)
+        except ScanCancelled:
+            coord.scan_cancelled.emit(job_id)
+        except Exception as e:
+            logger.error("扫描失败 [%s]: %s", job_id, e, exc_info=True)
+            coord.scan_failed.emit(job_id, str(e))
+        finally:
+            coord._clear_cancel_event(job_id)
