@@ -177,19 +177,28 @@ class TestScanJobConflict:
         assert session.post.call_count == 1
 
     def test_service_unavailable_raises_actionable_message(self):
-        """输稿器空载时打印机在创建任务阶段返回 503，错误信息必须可执行"""
+        """输稿器空载时打印机在创建任务阶段返回 503，错误信息必须可执行。
+
+        ★ 2026-10-21 契约变更：503 不再是"一次都不重试"的分支 ——
+        实测 503 有两个来源（输稿器空载 / 设备还在收尾上一个 ScanJob），
+        503 是**可重试**的瞬时状态 ⇒ 改为与 409 同一套有界退避
+        （2/4/8 秒，共 14 秒，等待可取消），重试用尽后才抛可执行错误。
+        """
         s = _scanner()
         session = mock.MagicMock()
         session.post.return_value = _Resp(503, "")
-        with pytest.raises(RuntimeError) as exc:
-            escl_engine._create_scan_job(
-                session, s, 300, "RGB24", "jpg", "Feeder", False)
+        with mock.patch("escl_engine.time.sleep") as sleeper:
+            with pytest.raises(RuntimeError) as exc:
+                escl_engine._create_scan_job(
+                    session, s, 300, "RGB24", "jpg", "Feeder", False)
         msg = str(exc.value)
         assert "503" in msg
         assert "输稿器" in msg
         # 必须给出"放纸"这个可执行动作，不能只说设备名
         assert "纸张" in msg
-        assert session.post.call_count == 1
+        # 503 走有界退避：重试次数有界、退避总时长有界
+        assert session.post.call_count == 4, "503 必须重试（1 次 + 3 次退避）"
+        assert [c.args[0] for c in sleeper.call_args_list] == [2, 4, 8]
 
     def test_conflict_then_other_error_keeps_original_message(self):
         s = _scanner()

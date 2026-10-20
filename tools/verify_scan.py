@@ -70,6 +70,26 @@ def _a4_crop(path, dpi):
         print("  [warn] A4 裁剪失败: %s" % e)
 
 
+def _probe_size(path):
+    """
+    读出文件的像素尺寸（**只读**，不修改文件）。失败返回 None。
+
+    ★ 为什么需要它：`_a4_crop` 是**原地覆写**（把缓存页改成 A4 画布），
+      覆写之后再量就只剩裁剪后的尺寸 ⇒ 裁剪前的原始扫描幅面
+      （设备 MaxWidth×MaxHeight）在磁盘上根本不存在。
+      本函数在裁剪**之前**调一次，把原始幅面记进 report.json，
+      于是 report.json 同时给出「裁剪前 / 裁剪后」两组尺寸。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        from PIL import Image
+        with Image.open(io.BytesIO(raw)) as img:
+            return img.width, img.height
+    except Exception:
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="HP Scan Tool 真机验证")
     ap.add_argument("--ip", required=True)
@@ -78,8 +98,12 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--resolution", type=int, default=300)
     ap.add_argument("--source", default="Platen", choices=["Platen", "Feeder"])
+    ap.add_argument("--no-a4-crop", action="store_true",
+                    help="跳过 A4 归一（原样保留设备原始扫描幅面）。"
+                         "默认行为不变（仍然原地裁剪成 A4 画布）")
     args = ap.parse_args()
 
+    a4_crop = not args.no_a4_crop
     os.makedirs(args.out, exist_ok=True)
 
     print("[1/5] 探测 eSCL ...")
@@ -101,6 +125,7 @@ def main():
     t0 = time.time()
     cached = []
     declared_exts = []   # 设备声明的每页 ext
+    raw_sizes = {}       # 页序号 → 裁剪**前**的像素尺寸（原始扫描幅面）
     ext = "jpg"
     scan_error = None
     try:
@@ -113,7 +138,9 @@ def main():
                 declared_exts.append(page_ext)
                 p = cache_manager.write_page(job_id, i, data, page_ext)
                 cached.append(p)
-                _a4_crop(p, args.resolution)
+                raw_sizes[i] = _probe_size(p)      # ← 裁剪前（原始幅面）
+                if a4_crop:
+                    _a4_crop(p, args.resolution)
         else:
             data, ext = execute_scan(
                 scanner=scanner, resolution=args.resolution, color_mode="RGB24",
@@ -121,7 +148,9 @@ def main():
             declared_exts.append(ext)
             p = cache_manager.write_page(job_id, 1, data, ext)
             cached.append(p)
-            _a4_crop(p, args.resolution)
+            raw_sizes[1] = _probe_size(p)          # ← 裁剪前（原始幅面）
+            if a4_crop:
+                _a4_crop(p, args.resolution)
     except Exception as e:
         scan_error = e
     elapsed = time.time() - t0
@@ -157,6 +186,12 @@ def main():
     page_meta = []
     for i, cpath in enumerate(cached, 1):
         entry = {"index": i, "cache_file": os.path.basename(cpath)}
+        # 裁剪**前**（原始扫描幅面）—— 与下面的 width/height（裁剪后）成对，
+        # 让 report.json 同时给出两套口径，避免"只量到 A4 画布"。
+        raw_size = raw_sizes.get(i)
+        if raw_size:
+            entry["raw_width"] = raw_size[0]
+            entry["raw_height"] = raw_size[1]
         try:
             with Image.open(cpath) as img:
                 entry["width"] = img.width
@@ -193,7 +228,15 @@ def main():
         "device": {"ip": args.ip, "model": scanner.model, "escl_url": url,
                    "has_adf": scanner.has_adf},
         "params": {"resolution": args.resolution, "source": args.source,
-                   "requested_pages": args.pages},
+                   "requested_pages": args.pages,
+                   "a4_crop": a4_crop},
+        # ★ 两套口径（2026-10-21 订正）：`_a4_crop` 是**原地覆写**，
+        #   裁剪前的原始扫描幅面在磁盘上不存在 ⇒ 必须靠 raw_* 字段留底。
+        "size_basis": {
+            "raw": "pages[].raw_width/raw_height = 裁剪前（设备原始扫描幅面）",
+            "cropped": "pages[].width/height = 裁剪后（A4 画布）",
+            "a4_crop_applied": a4_crop,
+        },
         "result": {"page_count": len(cached), "saved_page_count": len(saved),
                    "ext": result_ext, "exts": saved_exts,
                    "declared_exts": declared_exts,

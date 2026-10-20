@@ -581,6 +581,58 @@ _CONFLICT_MESSAGE = (
     "请在打印机面板上取消该任务，或稍后重试；若持续失败可重启打印机。"
 )
 
+# 503（设备未就绪 / 输稿器空载）的有界退避：2/4/8 秒，共 14 秒。
+#
+# ★ 为什么与 409 用**同一套**时长（2026-10-21 修）：
+#   409 等的是设备侧残留 job 的 TTL（15-20 分钟）⇒ 等满 14 秒也等不到，
+#   所以 409 的退避本质上是"给设备一点收尾时间"，失败即报错；
+#   503 等的是**设备收尾上一个 job** 的窗口 —— 实测 2026-10-21（真机
+#   17.17.171.111）：上一个 ScanJob 刚被 DELETE，紧接着的建 job 请求就
+#   收到 503；复核 ScannerStatus 发现上一个 job 仍是 JobState=Canceled
+#   ⇒ 设备确实还在收尾，间隔 8~10 秒后不再复现。
+#   2/4/8 秒共 14 秒的退避**刚好覆盖**这个 8~10 秒窗口 ⇒ 这次等待是
+#   有意义的，不是白等；因此 503 与 409 共用同一组时长与同一套写法
+#   （有限次数 + 有限退避 + 等待可被用户取消）。
+_SERVICE_UNAVAILABLE_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
+
+# 503 的错误文案：**必须按扫描来源给不同的下一步指引**。
+#
+# ★ 2026-10-21 修（旧文案只有输稿器那一句，是错的）：
+#   旧文案 = "打印机当前不可用（HTTP 503）。若选择的是输稿器(ADF)扫描，
+#   请确认输稿器里已放入纸张后重试；否则请等待设备空闲后重试。"
+#   但本次请求 XML 里的 `InputSource` 决定 503 的真实原因：
+#     - Platen（平板）⇒ 设备还没从上一个 job 收尾 ⇒ "去输稿器放纸"是
+#       **指错方向**，用户会去白跑一趟输稿器；
+#     - Feeder（输稿器）⇒ 输稿器空载 ⇒ "确认已放纸"才是对症的话。
+#   所以文案按 source 分流（见 `_service_unavailable_message`）。
+_SERVICE_UNAVAILABLE_MESSAGE_PLEN = (
+    "打印机当前不可用（HTTP 503，来源：平板）：设备尚未就绪，"
+    "可能仍在收尾上一个扫描任务。请稍候重试"
+    "（已自动重试 {retries} 次仍未成功）；"
+    "若持续失败，请确认打印机面板上没有其它任务在执行。"
+)
+_SERVICE_UNAVAILABLE_MESSAGE_FEEDER = (
+    "打印机当前不可用（HTTP 503，来源：输稿器）：设备尚未就绪，"
+    "且输稿器里可能没有纸。请确认输稿器里已放入纸张后重试"
+    "（已自动重试 {retries} 次仍未成功）；"
+    "若持续失败，请确认打印机面板上没有其它任务在执行。"
+)
+
+# 传输层失败（连不上 / 超时）的用户文案。
+# ★ 为什么要专门翻译：requests 抛的是 urllib3 的英文长串
+#   （`HTTPConnectionPool(host='127.0.0.1', port=1): Max retries exceeded
+#   with url: /eSCL/ScanJobs (Caused by NewConnectionError(...))`），
+#   GUI 把它原样弹给用户 ⇒ 用户看到一堆英文，看不到"下一步该做什么"，
+#   与 `ScanDeviceError` 的设计意图（消息里已写清用户下一步）相悖。
+_CONNECT_ERROR_MESSAGE = (
+    "无法连接打印机，请确认已开机并与本机在同一网络；"
+    "若刚刚断网或打印机刚从休眠唤醒，请稍后重试。"
+)
+_TIMEOUT_ERROR_MESSAGE = (
+    "连接打印机超时，请确认已开机并与本机在同一网络；"
+    "若打印机刚从休眠唤醒，请稍后重试。"
+)
+
 # 超时文案：必须写清"设备没响应"这件事本身 + 用户能做的下一步。
 # 单独提成常量（而不是就地写在 raise 里）—— CLI 的错误呈现测试要断言
 # 的就是**生产环境真正抛出的这段文字**。
@@ -638,13 +690,46 @@ def _sleep_cancellable(seconds, cancel_event=None, slice_seconds=0.2):
     return bool(cancel_event.is_set())
 
 
+def _service_unavailable_message(source: str) -> str:
+    """
+    按扫描来源给出**不同**的 503 指引。
+
+    - Feeder（输稿器）⇒ 设备可能在等纸 ⇒ 保留"确认已放纸"；
+    - 其它（Platen 平板 / 未知来源）⇒ 设备多半还在收尾上一个 job
+      ⇒ 指引是"设备尚未就绪，请稍候重试"，**不得**把用户指向输稿器。
+    """
+    template = (_SERVICE_UNAVAILABLE_MESSAGE_FEEDER
+                if (source or "").strip().lower() == "feeder"
+                else _SERVICE_UNAVAILABLE_MESSAGE_PLEN)
+    return template.format(retries=len(_SERVICE_UNAVAILABLE_BACKOFF_SECONDS))
+
+
+def _transport_error_to_device_error(exc: BaseException) -> ScanDeviceError:
+    """
+    把 requests 的传输层异常翻译成**可操作的中文**设备错误。
+
+    ★ 根因不许丢：原始异常用 `raise ... from exc` 链在 `__cause__` 上
+      （协调器 `logger.error(..., exc_info=True)` 会把整条链打进日志，
+      CLI 的 traceback 路径也拿得到）；消息里只留**异常类型名**做面包屑，
+      不把 urllib3 的英文长串甩给用户。
+    """
+    if isinstance(exc, requests.Timeout):
+        base = _TIMEOUT_ERROR_MESSAGE
+    else:
+        base = _CONNECT_ERROR_MESSAGE
+    return ScanDeviceError(f"{base}（原始错误类型：{type(exc).__name__}）")
+
+
 def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex,
                       max_pages=1, cancel_event=None):
     """
     创建扫描任务（POST ScanJobs），返回 (base, job_uri, ext)。
     调用者负责关闭 session。
 
-    cancel_event：可选的取消信号，409 退避等待期间用它及时中断。
+    source：本次请求的 InputSource（Platen / Feeder）—— 503 的错误文案
+    **按它分流**（平板的 503 不得把用户指向输稿器）。
+
+    cancel_event：可选的取消信号，409 / 503 退避等待期间用它及时中断。
     """
     escl_url = scanner.escl_url
     if not escl_url:
@@ -673,32 +758,59 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     )
 
     headers = {"Content-Type": "application/xml"}
-    r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
-    if r.status_code == 409:
-        # 打印机上残留一个未完成的 ScanJob（此前某次扫描异常中断留下的）。
-        # 该型号不支持列举与整体删除（GET/DELETE /eSCL/ScanJobs 均返回 405），
-        # 客户端无法主动清理，只能等打印机侧 TTL 回收（实测 15-20 分钟）。
-        #
-        # 退避是**有界**的（默认 2/4/8 秒共 14 秒）：等满 14 秒也等不到
-        # 15-20 分钟的 TTL，与其傻等，不如立刻报错并告诉用户要等多久。
-        # 等待过程可被 cancel_event 随时中断（原先一次 sleep 14 秒不可取消）。
-        for delay in _CONFLICT_BACKOFF_SECONDS:
+    job_url = f"{base}/ScanJobs"
+
+    def _post():
+        """POST ScanJobs。传输层异常 → 中文可操作错误（根因链在 __cause__）。"""
+        try:
+            return session.post(job_url, data=xml_body, headers=headers,
+                                 timeout=30)
+        except requests.RequestException as e:
+            raise _transport_error_to_device_error(e) from e
+
+    # ★ 409（设备残留 job）与 503（设备未就绪 / 输稿器空载）都是**可重试**的
+    #   瞬时状态 ⇒ 共用同一套有界退避：有限次数 + 有限退避 + 等待可被取消。
+    #   两者只在"最终错误文案"上不同（409 讲 TTL，503 讲按来源的处置）。
+    r = _post()
+    conflict_retry = 0
+    unavailable_retry = 0
+    while True:
+        if r.status_code == 409:
+            # 打印机上残留一个未完成的 ScanJob（此前某次扫描异常中断留下的）。
+            # 该型号不支持列举与整体删除（GET/DELETE /eSCL/ScanJobs 均返回 405），
+            # 客户端无法主动清理，只能等打印机侧 TTL 回收（实测 15-20 分钟）。
+            #
+            # 退避是**有界**的（2/4/8 秒共 14 秒）：等满 14 秒也等不到
+            # 15-20 分钟的 TTL，与其傻等，不如立刻报错并告诉用户要等多久。
+            # 等待过程可被 cancel_event 随时中断（原先一次 sleep 14 秒不可取消）。
+            if conflict_retry >= len(_CONFLICT_BACKOFF_SECONDS):
+                raise ScanDeviceError(_CONFLICT_MESSAGE)
+            delay = _CONFLICT_BACKOFF_SECONDS[conflict_retry]
+            conflict_retry += 1
             logger.info("扫描任务被占用 (409)，%s 秒后重试: %s", delay, scanner.ip)
             if _sleep_cancellable(delay, cancel_event):
                 raise ScanJobCancelled("扫描已取消（等待打印机释放任务时中断）")
-            r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
-            if r.status_code != 409:
-                break
-        else:
-            raise ScanDeviceError(_CONFLICT_MESSAGE)
-    if r.status_code == 503:
-        # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
-        # 阶段就返回 503（设备在等纸），不是扫描超时。给出用户可执行动作。
-        raise ScanDeviceError(
-            "打印机当前不可用（HTTP 503）。"
-            "若选择的是输稿器(ADF)扫描，请确认输稿器里已放入纸张后重试；"
-            "否则请等待设备空闲后重试。"
-        )
+            r = _post()
+            continue
+        if r.status_code == 503:
+            # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
+            # 阶段就返回 503（设备在等纸），不是扫描超时。
+            # 实测 2026-10-21：source=Platen 时**同样**会收到 503 —— 原因是
+            # 设备还没从上一个 ScanJob 收尾（ScannerStatus 复核上一个 job
+            # 仍是 JobState=Canceled），间隔 8~10 秒后不再复现。
+            # ⇒ 503 是**可重试**的瞬时状态：有界退避（2/4/8 秒，与 409 同套）
+            # 后仍失败才报错，文案按来源分流（平板 ≠ 输稿器）。
+            if unavailable_retry >= len(_SERVICE_UNAVAILABLE_BACKOFF_SECONDS):
+                raise ScanDeviceError(_service_unavailable_message(source))
+            delay = _SERVICE_UNAVAILABLE_BACKOFF_SECONDS[unavailable_retry]
+            unavailable_retry += 1
+            logger.info("打印机暂不可用 (503)，%s 秒后重试: %s", delay, scanner.ip)
+            if _sleep_cancellable(delay, cancel_event):
+                raise ScanJobCancelled("扫描已取消（等待打印机就绪时中断）")
+            r = _post()
+            continue
+        break
+
     if r.status_code not in (200, 201, 202):
         raise ScanDeviceError(f"创建扫描任务失败 HTTP {r.status_code}: {r.text[:300]}")
 
