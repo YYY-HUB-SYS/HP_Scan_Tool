@@ -6,8 +6,6 @@ eSCL (AirScan) 扫描引擎 — 合并版
   - photo-scan-split: 极简 mDNS 发现
 """
 
-import copy
-import io
 import logging
 import time
 import xml.etree.ElementTree as ET
@@ -26,7 +24,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 __all__ = [
     "ScannerInfo", "discover_scanners", "probe_escl",
     "fetch_capabilities", "get_scanner_status", "probe_scanner_status",
-    "execute_scan", "execute_multipage_scan", "scan_to_file",
+    "execute_scan", "execute_multipage_scan",
     "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
     "REQUEST_FORMAT", "ScanCancelled", "ScanJobCancelled", "ScanDeviceError",
     "SCAN_TIMEOUT_MESSAGE", "FIRST_PAGE_TIMEOUT_MESSAGE",
@@ -874,50 +872,6 @@ def execute_multipage_scan(
             except Exception:
                 pass
         session.close()
-
-
-def scan_to_file(
-    scanner: ScannerInfo,
-    output_path: str,
-    resolution: int = 300,
-    color_mode: str = "RGB24",
-    output_format: str = "jpg",
-    source: str = "Platen",
-    duplex: bool = False,
-    timeout: float = 120.0,
-) -> str:
-    """扫描并保存到文件，返回文件路径。"""
-    data, ext = execute_scan(
-        scanner=scanner,
-        resolution=resolution,
-        color_mode=color_mode,
-        output_format=output_format,
-        source=source,
-        duplex=duplex,
-        timeout=timeout,
-    )
-
-    # PDF：打印机只出图片（见 REQUEST_FORMAT），PDF 在本地合成。
-    # 若设备确实直出了 PDF 字节（老设备/直连调用方），原样落盘。
-    if output_format.lower() == "pdf":
-        pdf_path = output_path.rsplit(".", 1)[0] + ".pdf"
-        if data[:5] == b"%PDF-":
-            with open(pdf_path, "wb") as f:
-                f.write(data)
-        else:
-            with Image.open(io.BytesIO(data)) as src:
-                src.convert("RGB").save(pdf_path, "PDF")
-        return pdf_path
-
-    # 确保扩展名正确
-    final_path = output_path
-    if not output_path.lower().endswith(f".{ext}") and not output_path.lower().endswith(f".{output_format}"):
-        final_path = f"{output_path}.{ext}"
-
-    with open(final_path, "wb") as f:
-        f.write(data)
-
-    return final_path
 
 
 def auto_crop(img: Image.Image, threshold: int = 240, padding: int = 5) -> Image.Image:
