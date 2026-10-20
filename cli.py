@@ -94,7 +94,9 @@ def cmd_discover(args):
     timeout = args.timeout
     fmt = args.format
 
-    print(f"正在发现扫描仪 (超时={timeout}s)...")
+    # 进度提示走 stderr：--format json 时 stdout 必须是纯 JSON，
+    # 否则 cli.py discover --format json | jq 之类的消费方式会解析失败。
+    print(f"正在发现扫描仪 (超时={timeout}s)...", file=sys.stderr)
 
     if args.wsd_only:
         from wsd_engine import discover_wsd

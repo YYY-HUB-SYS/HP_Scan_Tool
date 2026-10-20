@@ -1,7 +1,8 @@
 """
 cli.py 单元测试 — HP Scan Tool v4.0
-覆盖: argparse 子命令解析 / 默认值 / choices 验证
-不测试实际命令执行（需要网络），只测试参数解析。
+覆盖: argparse 子命令解析 / 默认值 / choices 验证 / 命令体行为
+命令体测试会真实调用 cmd_* 函数；涉及网络的扫描仪发现已打桩替换，
+不产生真实网络流量。--format json 时 stdout 必须是纯 JSON。
 """
 
 import pytest
@@ -191,6 +192,13 @@ class TestDiscoverCommand:
         assert called["mdns"] == 4.0
 
     def test_wsd_only(self, monkeypatch, capsys):
+        """走 WSD 分支。
+
+        覆盖强度说明：本用例**不覆盖**被修复的那行 `elif args.mdns_only:`——
+        `if args.wsd_only:` 为真时短路，那个 elif 根本不求值。
+        该缺陷的回归保护由 test_default_uses_both_protocols /
+        test_mdns_only / test_json_output_shape 三个用例承担。
+        """
         called = {}
 
         def fake_wsd(timeout=4.0):
@@ -209,8 +217,30 @@ class TestDiscoverCommand:
         monkeypatch.setattr(cli, "discover_all_scanners", lambda timeout=4.0: [s])
         assert cli.cmd_discover(self._args("discover", "--format", "json")) == 0
         import json as _json
-        # cmd_discover 先在 stdout 打印一行进度提示，再打印 JSON 数组，
-        # 因此从首个 "[" 起截取 JSON 主体。
         out = capsys.readouterr().out
-        data = _json.loads(out[out.index("["):])
+        # stdout 必须是纯 JSON：进度提示已改到 stderr，首字符即数组开头
+        assert out.startswith("[")
+        data = _json.loads(out)
+        assert len(data) == 1 and data[0]["ip"] == "1.2.3.4"
+
+    def test_json_stdout_is_pure_json(self, monkeypatch, capsys):
+        """--format json 时 stdout 只能是 JSON 数组，进度提示必须落在 stderr。
+
+        回归缺陷：进度提示原先打印到 stdout，导致整段 stdout 不是合法 JSON，
+        `cli.py discover --format json | jq` 之类的消费方式直接解析失败。
+        """
+        from escl_engine import ScannerInfo
+        s = ScannerInfo(name="t", ip="1.2.3.4", model="HP M232")
+        monkeypatch.setattr(cli, "discover_all_scanners", lambda timeout=4.0: [s])
+        assert cli.cmd_discover(self._args("discover", "--format", "json")) == 0
+        import json as _json
+        cap = capsys.readouterr()
+        # stdout 纯净：首字符即 JSON 数组开头，且不含进度文案
+        assert cap.out.startswith("[")
+        assert "正在发现扫描仪" not in cap.out
+        # 进度提示改到 stderr，不再污染 stdout
+        assert "正在发现扫描仪" in cap.err
+        assert "超时=4.0s" in cap.err
+        # 整段 stdout 可被直接解析
+        data = _json.loads(cap.out)
         assert len(data) == 1 and data[0]["ip"] == "1.2.3.4"
