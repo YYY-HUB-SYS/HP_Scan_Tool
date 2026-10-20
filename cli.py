@@ -28,6 +28,22 @@ import save_manager
 
 logger = logging.getLogger(__name__)
 
+# ★ CLI **不接管**全局 logging，但必须掐掉 Python 的兜底 handler。
+#
+# 背景（复审 N-1）：CLI 从不调用 `logging.basicConfig` ⇒ 一条日志记录如果
+# 在整条 logger 链上找不到任何 handler，Python 会启用兜底 handler
+# `logging.lastResort`，把它**直接写进 stderr**。而 `logger.exception(...)`
+# 自带 `exc_info=True` ⇒ 记录里还带着完整 traceback（含本地绝对路径）
+# ⇒ 用户在「去打印机面板取消任务 / 等 15-20 分钟」这类**可执行指引**后面
+# 紧接着又看到一坨 Python 栈。
+#
+# 处理：给本模块的 logger 挂一个 `NullHandler`。
+#   - `Logger.callHandlers` 因此统计到 handler（found >= 1）⇒ `lastResort`
+#     不再启用 ⇒ 本模块的记录**不会**落 stderr；
+#   - 记录仍照常向上传播给 root（谁配置了 logging 谁拿得到）⇒
+#     CLI 后续要用 logging 依然可用，不是把 logging 整个关掉。
+logger.addHandler(logging.NullHandler())
+
 # 设备 / 协议类"可操作"错误的特征词。
 #
 # 协议层（escl_engine）对这些失败已经写好了**用户下一步该做什么**
@@ -57,16 +73,27 @@ def _report_scan_error(exc: BaseException) -> None:
     """
     把扫描失败呈现给用户（只写 stderr，绝不写 stdout）。
 
-    - 设备/协议类可操作错误 ⇒ 原样打印消息（含可执行指引），不甩 traceback；
-    - 其它意外错误 ⇒ 打印消息 **加** 完整 traceback（便于排障）。
-    - 两种情况都记一份完整 traceback 到日志（可操作错误也不丢排障线索）。
+    - 设备/协议类可操作错误 ⇒ stderr **只有**协议层写好的可执行指引，
+      **不带 traceback**（复审 N-1：traceback 里全是本地绝对路径，
+      用户看不懂也不知道下一步该干什么）；
+    - 意外错误（编程错误等）⇒ stderr 给消息 **加** 一份 traceback（便于排障），
+      且**只打一次**（复审 N-2：原先 `logger.exception` 与 `print_exc` 各打一份，
+      同一份栈在 stderr 里连出两遍，噪声翻倍）。
+
+    日志侧：两种情况都记一条 error 记录，但**不带 exc_info** ——
+    带 exc_info 等于把 traceback 挂到记录上，而记录会传播给 root
+    （外部若给 root 挂了 stderr handler，就会多出一份 traceback，
+    破坏「只打一次」）。本模块的 logger 挂了 NullHandler ⇒ 记录不落 stderr，
+    但外部若配置了 logging 仍能拿到这条记录。
     """
     print(f"错误: {exc}", file=sys.stderr)
     if _is_actionable_device_error(exc):
-        logger.exception("扫描失败（设备/协议类可操作错误）")
+        logger.error("扫描失败（设备/协议类可操作错误）: %s", exc)
     else:
-        logger.exception("扫描失败（意外错误）")
-        traceback.print_exc(file=sys.stderr)
+        logger.error("扫描失败（意外错误）: %s", exc)
+        # 意外错误：traceback 由**这一处**负责输出（全进程只此一份）
+        traceback.print_exception(type(exc), exc, exc.__traceback__,
+                                  file=sys.stderr)
 
 
 def _write_pdf_via_save_manager(data: bytes, fpath: str,

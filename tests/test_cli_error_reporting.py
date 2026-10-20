@@ -20,6 +20,8 @@ CLI 错误呈现 + 探测去重回归测试 — HP Scan Tool v4.0
 """
 
 import json
+import os
+import sys
 from unittest import mock
 
 import pytest
@@ -27,6 +29,14 @@ import requests
 
 import cli
 import escl_engine
+
+# ★ 子进程级探针（复审 N-1）。
+#   「stderr 里没有 traceback」这条判据**只能在子进程里**验：
+#   pytest 给 root logger 挂了 LogCaptureHandler ⇒ Python 的兜底 handler
+#   `logging.lastResort` 永不启用 ⇒ 进程内 capsys 看不到真实 CLI 进程的形态。
+#   详见同目录 cli_subprocess_probe.py。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cli_subprocess_probe  # noqa: E402
 
 
 # ── 测试替身 ────────────────────────────────────────────
@@ -95,16 +105,27 @@ class TestActionableGuidanceSurfaced:
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
         assert "15-20 分钟" in err, "必须告诉用户设备回收要多久"
 
-    def test_409_guidance_has_no_python_traceback(self, monkeypatch, capsys):
-        """可操作错误只给指引，**不甩** Python traceback。"""
-        _stub_probe(monkeypatch)
-        _raising_scan(monkeypatch, _real_409_error())
+    def test_409_guidance_has_no_python_traceback_in_real_process(self, tmp_path):
+        """★ 子进程级判据（复审 N-1）：**真实 CLI 进程**的 stderr 不得带 traceback。
 
-        cli.cmd_scan(_args("scan", "--ip", "192.168.1.2"))
+        原来的进程内断言是**假绿**：pytest 给 root logger 挂了
+        `LogCaptureHandler` ⇒ `Logger.callHandlers` 一定找到 handler ⇒
+        Python 的兜底 handler `logging.lastResort` **永不启用**
+        ⇒ 进程内 capsys 看不到真实 CLI 进程会看到的那份 traceback。
+        ⇒ 这条判据必须起**子进程**（`python -m cli ...`）验。
+        """
+        rc, out, err = cli_subprocess_probe.run_cli(
+            ["scan", "--ip", "127.0.0.1"], mode="conflict",
+            appdata=tmp_path / "appdata")
 
-        err = capsys.readouterr().err
-        assert "Traceback" not in err, "设备类错误不该退化成 traceback"
-        assert "  File " not in err, "不该把源码路径甩给用户"
+        assert rc != 0, "失败退出码必须非 0"
+        assert out == "", f"失败时 stdout 必须为空，实际 {out!r}"
+        assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
+        assert "15-20 分钟" in err, "必须告诉用户设备回收要多久"
+        assert "Traceback" not in err, (
+            "真实 CLI 进程的 stderr 不得带 traceback；实际 %r" % err)
+        assert "  File " not in err, (
+            "不该把源码路径甩给用户；实际 %r" % err)
 
     def test_503_adf_paper_guidance_reaches_stderr(self, monkeypatch, capsys):
         """503（输稿器空载）：stderr 必须说清"放纸"这个可执行动作。"""
@@ -167,6 +188,8 @@ class TestActionableGuidanceSurfaced:
         assert rc != 0
         err = capsys.readouterr().err
         assert "Traceback" in err, "意外错误必须保留 traceback"
+        assert err.count("Traceback") == 1, (
+            "意外错误的 traceback 只能打一次（复审 N-2），实际 %d 次" % err.count("Traceback"))
         assert "某个内部变量是 None" in err
         assert capsys.readouterr().out == ""
 
