@@ -14,7 +14,19 @@ from typing import Optional
 
 from PIL import Image
 
+# ★★ PIL 的编码插件是**惰性加载**的（`Image.save()` 首次用到某格式时才 import
+#   对应插件）。本文件的「直接保存」与「会话落盘」都在**后台线程**里写文件 ⇒
+#   若第一次 `Image.save()` 恰好发生在后台线程，插件的懒加载会与 GC 撞车，
+#   进程直接 `Fatal Python error: Aborted`（整轮测试/整个应用被杀）。
+#   ⇒ 在**主线程**导入时先把插件预热掉（一次性成本，几十毫秒）。
+try:
+    Image.init()
+except Exception:            # pragma: no cover - 预热失败不该挡住启动
+    pass
+
 import cache_manager
+import doc_merge
+import document_session
 import history_manager
 import page_meta
 import preset_manager
@@ -82,6 +94,7 @@ from PySide6.QtWidgets import (
     QSplitter, QToolButton,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
     QSlider, QInputDialog,
+    QRadioButton, QListWidget, QListWidgetItem,
 )
 
 # ────────── 设计系统常量 ──────────
@@ -1000,6 +1013,357 @@ def apply_cache_settings(config: dict, limit_mb: int, trigger_percent: int,
     return config
 
 
+# ────────── 文档会话（批次 4 · B4-6）──────────
+#
+# 分三层：
+#   ① **纯逻辑**（本节）—— 不依赖 Qt 窗口，可直接单测
+#   ② **弹窗**（SkewWarningDialog / SessionMergePreviewDialog）
+#   ③ **接线**（ScanApp 里的方法）
+#
+# ★ 合并算法一律**委托 doc_merge**（本文件不重写合并规则）。
+
+#: 扫描模式（与 document_session.MODES 对齐）
+SESSION_MODE_SINGLE = "single"
+SESSION_MODE_DUPLEX = "duplex"
+SESSION_MODE_BATCH = "batch"
+
+#: 模式 → 界面文案
+SESSION_MODE_TEXT = {
+    SESSION_MODE_SINGLE: "单面",
+    SESSION_MODE_DUPLEX: "双面（手动）",
+    SESSION_MODE_BATCH: "加入现有文档（续扫）",
+}
+
+#: 会话状态 → 界面文案
+SESSION_STATE_TEXT = {
+    "scanning": "扫描中",
+    "awaiting_flip": "待翻面",
+    "paused": "已暂停",
+    "completed": "已完成",
+    "abandoned": "已放弃",
+}
+
+#: 单选按钮样式（与 resources/styles/app.qss 里的 QCheckBox 指示器同色系
+#: ⇒ 新控件贴现有风格，**不动既有控件的样式**）
+_RADIO_QSS = """
+QRadioButton {
+    color: #334155;
+    spacing: 8px;
+}
+QRadioButton::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1.5px solid #CBD5E1;
+    border-radius: 9px;
+    background: white;
+}
+QRadioButton::indicator:hover {
+    border-color: #0D9488;
+}
+QRadioButton::indicator:checked {
+    background: #0D9488;
+    border: 1.5px solid #0D9488;
+}
+"""
+
+
+def _page_no_from_path(path) -> int:
+    """从缓存文件名解析页号（`page_003.jpg` → 3）；解析不出来返回 0"""
+    name = os.path.basename(str(path))
+    if not name.startswith("page_"):
+        return 0
+    digits = ""
+    for ch in name[5:]:
+        if not ch.isdigit():
+            break
+        digits += ch
+    try:
+        return int(digits) if digits else 0
+    except ValueError:
+        return 0
+
+
+def session_merged_pages(session) -> list:
+    """
+    会话页的**最终页序**（合并规则一律委托 doc_merge，本函数不重写算法）。
+
+    · duplex ⇒ `interleave_duplex(front, back, reverse_back=session.reverse_back)`
+      （side == "single" 的页按**正面**处理）
+    · batch / single ⇒ 按 job_id 分组（首次出现顺序，组内原序）⇒ `merge_batches`
+
+    ★ 与 `save_manager._session_merged_pages` 同规则（同一套 doc_merge 调用），
+      差别只在这里返回 PageRef 供**预览**用；真正落盘的页序由 save_manager 负责。
+    """
+    pages = list(getattr(session, "pages", None) or [])
+    mode = getattr(session, "mode", SESSION_MODE_SINGLE)
+    if mode == SESSION_MODE_DUPLEX:
+        front = [p for p in pages
+                 if getattr(p, "side", "single") in ("front", "single")]
+        back = [p for p in pages if getattr(p, "side", "single") == "back"]
+        return doc_merge.interleave_duplex(
+            front, back, reverse_back=bool(getattr(session, "reverse_back", True)))
+    batches = []
+    for p in pages:
+        job_id = getattr(p, "job_id", "")
+        if batches and batches[-1][0] == job_id:
+            batches[-1][1].append(p)
+        else:
+            batches.append((job_id, [p]))
+    return doc_merge.merge_batches([b[1] for b in batches])
+
+
+def resume_from_page(session, job_id, page_no, drop_cache=True) -> list:
+    """
+    「从第 N 页重扫」—— **可复用 API**（批次 4 断点续扫地基，不是弹窗专用逻辑）。
+
+    丢弃 `job_id` 这一批里**第 N 页及之后**的页，**保留前 N-1 页**；
+    `drop_cache=True` 时同时删掉被丢页的缓存文件（页元数据交给既有孤儿清理）。
+
+    :param session: DocumentSession（None ⇒ 空操作）
+    :param job_id: 批次（job）id —— 范围**只限该批次**，其它批次不受影响
+    :param page_no: 起始页号（1 基）
+    :return: 被丢弃的 PageRef 列表（保持原顺序）
+    """
+    if session is None:
+        return []
+    return session.remove_pages_from(job_id, page_no, drop_cache=drop_cache)
+
+
+def protect_session_jobs(session) -> None:
+    """
+    登记会话引用的 job 目录保护（不被 eviction / cleanup_stale 清掉）。
+
+    ★ `cache_manager._protected_dirs` 是**进程内**集合 ⇒ 进程重启后为空
+      ⇒ **跨进程恢复时必须重新登记**，否则跨天续扫的页会被
+      `cleanup_stale`（24 小时过期线）删掉。
+    """
+    for job_id in list(getattr(session, "referenced_job_ids", []) or []):
+        try:
+            cache_manager.protect_dir(job_id)
+        except Exception as e:
+            logger.error("缓存目录保护失败 [%s]: %s", job_id, e)
+
+
+def cleanup_session_jobs(session) -> None:
+    """
+    会话结束（落盘成功 / 用户放弃）：**先解除保护、再删缓存目录**，最后清页元数据。
+
+    ⚠ 顺序不能反：目录还受保护时，某些清理路径会跳过它 ⇒ 永远清不掉。
+    """
+    job_ids = list(getattr(session, "referenced_job_ids", []) or [])
+    for job_id in job_ids:
+        try:
+            cache_manager.unprotect_dir(job_id)
+        except Exception as e:
+            logger.debug("解除缓存目录保护失败 [%s]: %s", job_id, e)
+    for job_id in job_ids:
+        try:
+            cache_manager.remove_job(job_id)
+        except Exception as e:
+            logger.error("删除会话缓存目录失败 [%s]: %s", job_id, e)
+        try:
+            page_meta.PageMetaStore(cache_manager._cache_root()).remove_job(job_id)
+        except Exception as e:
+            logger.debug("清页元数据失败 [%s]: %s", job_id, e)
+        _release_job_protection(job_id)
+
+
+def _load_thumbnail_pixmap(path, max_size=(420, 300)):
+    """离屏加载缩略图（**不在弹窗里加载全尺寸大图**）；失败返回 None"""
+    try:
+        with Image.open(path) as src:
+            img = src.convert("RGB")
+            img.thumbnail(max_size)
+            return pil_to_qpixmap(img)
+    except Exception as e:
+        logger.warning("缩略图加载失败 [%s]: %s", path, e)
+        return None
+
+
+class SkewWarningDialog(QDialog):
+    """
+    倾斜强提醒弹窗（批次 4 · B4-6）。
+
+    ★★ 上一轮 GUI 出过 `0xc0000374`（堆损坏）：根因是**弹窗拿一个已
+      `deleteLater` 的对话框当 parent**（弹窗自己的嵌套事件循环把它析构了）
+      + 对话框销毁后仍往它自己的 `_ui_post` 发信号。
+      ⇒ 本类的三条硬规矩：
+        ① **parent 用 None**（绝不挂到任何可能先销毁的对象上）
+        ② **先 exec() 弹窗、后 accept()**（按钮只在弹窗存活期间 accept）
+        ③ **结果用属性 `choice` 传回，不用信号** ⇒ 对话框销毁后
+           根本没有"往已销毁对象发信号"的机会
+    """
+
+    #: 中断并从第 N 页重扫
+    CHOICE_RESUME = "resume"
+    #: 继续扫描（自动纠偏）
+    CHOICE_CONTINUE = "continue"
+    #: 强制保存（不纠偏）
+    CHOICE_FORCE = "force"
+
+    def __init__(self, job_id, page_no, angle, cache_path, parent=None):
+        # ★ parent 缺省 None：调用方**不要**传可能已销毁的对话框当 parent
+        super().__init__(parent)
+        self.setWindowTitle("页面倾斜过大")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self._choice = ""
+        self._job_id = str(job_id)
+        self._page_no = int(page_no)
+        self._angle = float(angle)
+        self._cache_path = str(cache_path or "")
+        self._setup_ui()
+
+    # ── 结果 ──
+    @property
+    def choice(self) -> str:
+        """用户的选择（空串 = 没选/关掉了弹窗）"""
+        return self._choice
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING["md"])
+
+        # 文案
+        self.message_label = QLabel(
+            f"第 {self._page_no} 页倾斜过大（{self._angle:.1f}°），建议重新放置后重扫。")
+        self.message_label.setWordWrap(True)
+        self.message_label.setStyleSheet(
+            f"color: {COLORS['text_primary']}; font-size: 13px;")
+        layout.addWidget(self.message_label)
+
+        # 预览图（缩略图，不加载全尺寸大图）
+        self.preview_label = QLabel("（无预览图）")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(180)
+        self.preview_label.setStyleSheet(
+            f"color: {COLORS['text_muted']}; border: 1px solid {COLORS['border']};"
+            f"border-radius: {RADIUS['md']}px; background: {COLORS['surface']};")
+        layout.addWidget(self.preview_label)
+        pixmap = _load_thumbnail_pixmap(self._cache_path) if self._cache_path else None
+        if pixmap is not None and not pixmap.isNull():
+            self.preview_label.setPixmap(pixmap)
+
+        # 三个按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(SPACING["sm"])
+
+        self.btn_resume = AnimatedButton("中断并从第 N 页重扫", button_type="accent")
+        self.btn_resume.clicked.connect(self._on_resume)
+        btn_layout.addWidget(self.btn_resume)
+
+        self.btn_continue = AnimatedButton("继续扫描（自动纠偏）", button_type="primary")
+        self.btn_continue.clicked.connect(self._on_continue)
+        btn_layout.addWidget(self.btn_continue)
+
+        self.btn_force = AnimatedButton("强制保存（不纠偏）", button_type="secondary")
+        self.btn_force.clicked.connect(self._on_force)
+        btn_layout.addWidget(self.btn_force)
+
+        layout.addLayout(btn_layout)
+
+    # ── 三个按钮的行为（★ 都在弹窗存活期间设置结果，再 accept）──
+    def _on_resume(self):
+        self._choice = self.CHOICE_RESUME
+        self.accept()
+
+    def _on_continue(self):
+        self._choice = self.CHOICE_CONTINUE
+        self.accept()
+
+    def _on_force(self):
+        self._choice = self.CHOICE_FORCE
+        self.accept()
+
+
+class SessionMergePreviewDialog(QDialog):
+    """
+    合并预览（双面 / 续扫合并后给用户确认页序，再落盘）。
+
+    ★ 同样遵守"parent 用 None + 结果用属性传回"的规矩（见 SkewWarningDialog）。
+    """
+
+    def __init__(self, session, merged_pages, duplex=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("合并预览")
+        self.setModal(True)
+        self.resize(560, 560)
+        self._session = session
+        self._pages = list(merged_pages or [])
+        self._duplex = bool(duplex)
+        self._setup_ui()
+
+    @property
+    def pages(self) -> list:
+        """合并后的页序（PageRef 列表）"""
+        return list(self._pages)
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING["md"])
+
+        front = sum(1 for p in self._pages
+                    if getattr(p, "side", "single") in ("front", "single"))
+        back = sum(1 for p in self._pages if getattr(p, "side", "single") == "back")
+        if self._duplex:
+            summary = f"共 {len(self._pages)} 页（正面 {front} 页 / 背面 {back} 页）—— 确认后合并成一个文档"
+        else:
+            summary = f"共 {len(self._pages)} 页 —— 确认后合并成一个文档"
+        self.summary_label = QLabel(summary)
+        self.summary_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(self.summary_label)
+
+        # 页序列表
+        self.page_list = QListWidget()
+        self.page_list.setMinimumHeight(200)
+        for idx, page in enumerate(self._pages, 1):
+            side = getattr(page, "side", "single")
+            side_text = {"front": "正面", "back": "背面"}.get(side, "单面")
+            item = QListWidgetItem(
+                f"第 {idx} 页 · {side_text} · 原第 {getattr(page, 'page_no', 0)} 页")
+            self.page_list.addItem(item)
+        self.page_list.currentRowChanged.connect(self._on_row_changed)
+        layout.addWidget(self.page_list, 1)
+
+        # 预览图
+        self.preview_label = QLabel("（无预览图）")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(200)
+        self.preview_label.setStyleSheet(
+            f"color: {COLORS['text_muted']}; border: 1px solid {COLORS['border']};"
+            f"border-radius: {RADIUS['md']}px; background: {COLORS['surface']};")
+        layout.addWidget(self.preview_label)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(SPACING["sm"])
+        btn_layout.addStretch(1)
+
+        self.btn_cancel = AnimatedButton("取消", button_type="secondary")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+
+        self.btn_save = AnimatedButton("保存并结束", button_type="primary")
+        self.btn_save.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_save)
+
+        layout.addLayout(btn_layout)
+
+        if self._pages:
+            self.page_list.setCurrentRow(0)
+
+    def _on_row_changed(self, row):
+        """选中某一页 ⇒ 显示它的缩略图"""
+        if row < 0 or row >= len(self._pages):
+            return
+        path = getattr(self._pages[row], "cache_path", "")
+        pixmap = _load_thumbnail_pixmap(path) if path else None
+        if pixmap is not None and not pixmap.isNull():
+            self.preview_label.setPixmap(pixmap)
+        else:
+            self.preview_label.setText("（无预览图）")
+
+
 # ────────── 主窗口 ──────────
 class ScanApp(QMainWindow, _UiPostMixin):
     """主窗口（UI 优化版）"""
@@ -1025,6 +1389,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self.coordinator.source_warning.connect(self._on_source_warning)
         except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
             logger.debug("协调器没有 source_warning 信号: %s", e)
+        # ★ 批次 4：倾斜强提醒（协调器在**工作线程**发 ⇒ GUI 侧走 _post_ui 投递回主线程）
+        try:
+            self.coordinator.skew_warning.connect(self._on_skew_warning)
+        except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
+            logger.debug("协调器没有 skew_warning 信号: %s", e)
         _ensure_ui_dispatcher()
         self._current_job_id = None
         self.coordinator.load_config()
@@ -1054,9 +1423,22 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # WIA 路径的取消信号（GUI 兜底持有；正常已登记进协调器）
         self._wia_cancel_event = None
 
+        # ── 文档会话（批次 4 · B4-6）──
+        # ★ 必须在 _setup_ui() 之前建好：界面构建时会连接模式切换信号，
+        #   信号一触发就会读这些状态。
+        self._session_store = document_session.SessionStore()
+        self._session = None                   # 当前 DocumentSession（None = 无会话）
+        self._session_mode = SESSION_MODE_SINGLE
+        self._pending_side_by_job = {}         # job_id → 本批次的页面来源（front/back/single）
+        self._pending_resume_from = {}         # job_id → 「从第 N 页重扫」的 N
+        self._force_keep_pages = set()          # (job_id, page_no) ⇒ 强制保存（不纠偏）
+        self._skew_suppressed_jobs = set()      # 本批次不再提醒倾斜
+        self._session_save_finished = False     # 会话落盘完成标记（测试等待用）
+
         # 先构建界面（隐藏状态）
         self._setup_ui()
         self._refresh_extra_dirs()
+        self._update_session_ui()
 
         # 连接跨线程信号
         self.discover_finished.connect(self._on_discover_finished)
@@ -1221,6 +1603,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self._loading.close()
             self._loading = None
         self.show()
+        # ★ 批次 4：启动时恢复未完成的文档会话（并**重新登记缓存保护**）
+        self._restore_open_sessions()
         self.status_bar.showMessage("点击「刷新」搜索打印机，或「手动添加」输入IP")
 
     def _build_scanner_panel(self, parent_layout):
@@ -1331,6 +1715,57 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self._sync_direct_save_checkbox()
         self.direct_save_check.stateChanged.connect(self._on_direct_save_changed)
         params_layout.addWidget(self.direct_save_check, 5, 0, 1, 2)
+
+        # ── 批次 4：扫描模式 / 双面子选项 / 会话状态 ──
+        # ★ **追加**在参数区末尾（行 6 起）：既有控件（行 0~5）的位置、
+        #   样式、顺序**一律不动**。
+        # 扫描模式（单选）
+        params_layout.addWidget(QLabel("扫描模式:"), 6, 0)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(SPACING["sm"])
+        self.mode_single_radio = QRadioButton("单面")
+        self.mode_duplex_radio = QRadioButton("双面（手动）")
+        self.mode_batch_radio = QRadioButton("加入现有文档（续扫）")
+        for radio in (self.mode_single_radio, self.mode_duplex_radio,
+                      self.mode_batch_radio):
+            radio.setStyleSheet(_RADIO_QSS)
+            mode_row.addWidget(radio)
+        mode_row.addStretch(1)
+        params_layout.addLayout(mode_row, 6, 1)
+        self.mode_single_radio.setChecked(True)
+        # ★ 连 `clicked`（不是 `toggled`）：toggled 在互斥切换的**中间态**就发
+        #   （旧的先 uncheck、新的后 check）⇒ 用 toggled 会读到错误的模式。
+        #   clicked 在状态最终确定后才发 ⇒ 读到的模式一定是最终值。
+        for radio in (self.mode_single_radio, self.mode_duplex_radio,
+                      self.mode_batch_radio):
+            radio.clicked.connect(self._on_scan_mode_changed)
+
+        # 双面子选项
+        self.reverse_back_check = QCheckBox("背面顺序反转（双面：背面整叠翻面 ⇒ 顺序相反）")
+        self.reverse_back_check.setChecked(True)
+        self.reverse_back_check.toggled.connect(self._on_reverse_back_changed)
+        params_layout.addWidget(self.reverse_back_check, 7, 0, 1, 2)
+
+        # 会话状态区（只读文本 + 少量按钮）
+        self.session_info_label = QLabel("当前会话：无")
+        self.session_info_label.setWordWrap(True)
+        self.session_info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        params_layout.addWidget(self.session_info_label, 8, 0, 1, 2)
+
+        session_btn_layout = QHBoxLayout()
+        session_btn_layout.setSpacing(SPACING["sm"])
+        self.session_new_btn = AnimatedButton("新建会话", button_type="secondary")
+        self.session_new_btn.clicked.connect(self._new_session)
+        session_btn_layout.addWidget(self.session_new_btn)
+
+        self.session_save_btn = AnimatedButton("结束并保存", button_type="primary")
+        self.session_save_btn.clicked.connect(self._save_session_action)
+        session_btn_layout.addWidget(self.session_save_btn)
+
+        self.session_abandon_btn = AnimatedButton("放弃会话", button_type="secondary")
+        self.session_abandon_btn.clicked.connect(self._abandon_session_action)
+        session_btn_layout.addWidget(self.session_abandon_btn)
+        params_layout.addLayout(session_btn_layout, 9, 0, 1, 2)
 
         layout.addWidget(params_group)
 
@@ -1838,12 +2273,36 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
         self._save_profile()
 
+        # ── 批次 4：会话模式（双面 / 续扫）──
+        # 先把会话切到"扫描中"，并记下这一批是正面还是背面。
+        mode = self._current_session_mode()
+        side = "single"
+        if mode != SESSION_MODE_SINGLE:
+            session = self._ensure_session(mode)
+            if mode == SESSION_MODE_DUPLEX:
+                if session.state == "awaiting_flip":
+                    # 用户已翻面 ⇒ 这一批是**背面**
+                    side = "back"
+                    self._set_session_state(session, "scanning")
+                else:
+                    side = "front"
+            else:  # batch：每一批都是追加
+                if session.state == "paused":
+                    self._set_session_state(session, "scanning")
+                side = "single"
+            try:
+                self._session_store.save(session)
+            except Exception as e:
+                logger.error("会话状态落盘失败: %s", e)
+
         params = {
             "resolution": self.resolution_val,
             "color_mode_ui": self.color_mode_val,
             "output_format": self.output_format_val,
             "source": self.source_combo.currentText(),
-            "duplex": self.duplex_val,
+            # ★ 手动双面 = **两趟单面**（正面一趟、背面一趟）⇒ 这一趟必须单面，
+            #   合并由 doc_merge 负责，不是扫描仪的双面功能。
+            "duplex": False if mode == SESSION_MODE_DUPLEX else self.duplex_val,
             "output_dir": out_dir,
         }
 
@@ -1858,6 +2317,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.status_bar.addPermanentWidget(self.cancel_scan_btn)
 
         self._current_job_id = self.coordinator.start_scan(self.selected, params)
+        if mode != SESSION_MODE_SINGLE:
+            self._pending_side_by_job[self._current_job_id] = side
 
     def _cancel_scan(self):
         """取消扫描"""
@@ -1895,6 +2356,21 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self._reset_scan_ui()
         if not result.cached_paths:
             self.status_bar.showMessage("扫描未产生任何页面")
+            return
+        # ★ 批次 4：会话模式（双面 / 续扫）⇒ **不弹预览对话框**，
+        #   页面先进会话，合并后统一给预览。
+        #   ★ 取模式必须**防御式**：既有测试里的最小替身（_StubApp）只借了
+        #     `_on_scan_finished` 这一个方法，没有会话接线 ⇒ 回落到单面。
+        mode = SESSION_MODE_SINGLE
+        getter = getattr(self, "_current_session_mode", None)
+        if getter is not None:
+            try:
+                mode = getter()
+            except Exception as e:            # pragma: no cover - 防御
+                logger.debug("取扫描模式失败，按单面处理: %s", e)
+                mode = SESSION_MODE_SINGLE
+        if mode != SESSION_MODE_SINGLE and getattr(self, "_session", None) is not None:
+            self._session_batch_finished(job_id, result, mode)
             return
         scanner = self.selected
         # 「直接保存」勾选 ⇒ 跳过预览对话框，直接落盘
@@ -2008,6 +2484,17 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
     def _on_scan_cancelled(self, job_id):
         self._reset_scan_ui()
+        # ★ 防御式取状态：既有测试的最小替身可能没有会话接线
+        pending = getattr(self, "_pending_resume_from", None) or {}
+        sides = getattr(self, "_pending_side_by_job", None) or {}
+        resume_from = pending.pop(job_id, None)
+        side = sides.pop(job_id, "single")
+        if resume_from is not None:
+            # ★ 「从第 N 页重扫」：把已扫到的页收进会话，再裁掉第 N 页及之后
+            self._absorb_cancelled_pages(job_id, side, resume_from)
+            self.status_bar.showMessage(
+                f"已中断：从第 {resume_from} 页重扫（前 {max(resume_from - 1, 0)} 页已保留）")
+            return
         self.status_bar.showMessage("扫描已取消")
 
     def _reset_scan_ui(self):
@@ -2070,6 +2557,479 @@ class ScanApp(QMainWindow, _UiPostMixin):
                                         extra_dirs=self.extra_dirs,
                                         exposure=exposure)
         dialog.exec()
+
+    # ────────── 文档会话（批次 4 · B4-6）──────────
+    #
+    # 三种模式：
+    #   单面    → 走既有流程（预览 / 直接保存），**不用会话**
+    #   双面    → 会话（front / back 两批）⇒ 交错合并成一个文档
+    #   续扫    → 会话（多批追加）⇒ 拼接合并成一个文档
+    #
+    # ★ 状态与缓存保护的对应（见报告）：
+    #   扫完一批   → paused / awaiting_flip ⇒ **保持保护**
+    #   落盘成功   → completed ⇒ 解除保护 + 清缓存 + 清页元数据
+    #   用户放弃   → abandoned ⇒ 解除保护 + 清缓存
+    #   进程重启   → 从 sessions/*.json 恢复 ⇒ **重新 protect_dir**
+
+    # ── 模式 ──
+    def _current_session_mode(self) -> str:
+        """当前界面选中的扫描模式（single / duplex / batch）"""
+        radio = getattr(self, "mode_batch_radio", None)
+        if radio is not None and radio.isChecked():
+            return SESSION_MODE_BATCH
+        radio = getattr(self, "mode_duplex_radio", None)
+        if radio is not None and radio.isChecked():
+            return SESSION_MODE_DUPLEX
+        return SESSION_MODE_SINGLE
+
+    def _reverse_back_enabled(self) -> bool:
+        """双面：背面是否整叠翻面（顺序相反）"""
+        check = getattr(self, "reverse_back_check", None)
+        if check is None:
+            return True
+        return bool(check.isChecked())
+
+    def _on_reverse_back_changed(self, checked):
+        """双面「背面顺序反转」切换 ⇒ 同步到当前会话"""
+        session = getattr(self, "_session", None)
+        if session is None or session.mode != SESSION_MODE_DUPLEX:
+            return
+        session.reverse_back = bool(checked)
+        try:
+            self._session_store.save(session)
+        except Exception as e:
+            logger.error("会话落盘失败: %s", e)
+
+    def _on_scan_mode_changed(self, _checked=False):
+        """
+        扫描模式切换。
+
+        ★ 中途从「双面」改选「单面」⇒ **放弃暂存的正面**（brief §3.2）。
+          （双面 → 续扫 切换**不**放弃：那些页是有价值的，留着下次启动可恢复。）
+        """
+        mode = self._current_session_mode()
+        session = getattr(self, "_session", None)
+        if mode == SESSION_MODE_SINGLE and session is not None:
+            if session.mode == SESSION_MODE_DUPLEX and session.total_pages > 0:
+                self._discard_session(session, "已放弃暂存的正面（改选单面）")
+        self._session_mode = mode
+        self._update_session_ui()
+
+    # ── 会话生命周期 ──
+    def _ensure_session(self, mode):
+        """确保有一个与 mode 匹配、仍打开的会话（没有就新建）"""
+        session = getattr(self, "_session", None)
+        if session is not None and session.mode == mode and session.is_open:
+            return session
+        session = document_session.new_session(
+            mode=mode,
+            ext=self.output_format_val,
+            dpi=int(self.resolution_val),
+            reverse_back=self._reverse_back_enabled(),
+        )
+        self._session = session
+        try:
+            self._session_store.save(session)
+        except Exception as e:
+            logger.error("新建会话落盘失败: %s", e)
+        self._update_session_ui()
+        return session
+
+    def _set_session_state(self, session, state):
+        """切会话状态（非法转换**不抛** —— 只在确实能切时才切）"""
+        if session is None or session.state == state:
+            return
+        if not session.can_transition(state):
+            logger.warning("非法会话状态转换被忽略: %s → %s", session.state, state)
+            return
+        session.set_state(state)
+
+    def _discard_session(self, session, reason=""):
+        """放弃会话：置 abandoned + 解除保护 + 清缓存"""
+        if session is None:
+            return
+        try:
+            if session.is_open:
+                session.mark_abandoned()
+        except Exception as e:
+            logger.error("会话置 abandoned 失败: %s", e)
+        try:
+            self._session_store.save(session)      # 终态 ⇒ 自动解除保护
+        except Exception as e:
+            logger.error("会话落盘失败: %s", e)
+        cleanup_session_jobs(session)
+        if getattr(self, "_session", None) is session:
+            self._session = None
+        if reason:
+            self.status_bar.showMessage(reason)
+        self._update_session_ui()
+
+    def _new_session(self):
+        """「新建会话」"""
+        session = getattr(self, "_session", None)
+        if session is not None and session.total_pages > 0 and session.is_open:
+            reply = QMessageBox.question(
+                self, "新建会话",
+                f"当前会话还有 {session.total_pages} 页未保存，新建会话将放弃它们。继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            self._discard_session(session, "已放弃当前会话")
+        self._session = None
+        mode = self._current_session_mode()
+        if mode == SESSION_MODE_SINGLE:
+            self.status_bar.showMessage("单面模式不使用会话")
+            self._update_session_ui()
+            return
+        self._ensure_session(mode)
+        self.status_bar.showMessage("已新建会话")
+
+    def _save_session_action(self):
+        """「结束并保存」⇒ 合并预览 → 落盘"""
+        session = getattr(self, "_session", None)
+        if session is None or session.total_pages == 0:
+            QMessageBox.information(self, "提示", "当前没有可保存的会话")
+            return
+        self._confirm_and_save_session(
+            session, duplex=(session.mode == SESSION_MODE_DUPLEX))
+
+    def _abandon_session_action(self):
+        """「放弃会话」⇒ 置 abandoned + 解除保护 + 清缓存"""
+        session = getattr(self, "_session", None)
+        if session is None:
+            QMessageBox.information(self, "提示", "当前没有会话")
+            return
+        reply = QMessageBox.question(
+            self, "放弃会话",
+            f"放弃当前会话（{session.total_pages} 页）？页面缓存会被清除，无法恢复。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        self._discard_session(session, "已放弃会话")
+
+    def _update_session_ui(self):
+        """刷新会话状态区的文字与按钮可用性"""
+        session = getattr(self, "_session", None)
+        label = getattr(self, "session_info_label", None)
+        if label is not None:
+            if session is None:
+                label.setText("当前会话：无")
+            else:
+                batches = len(set(session.referenced_job_ids))
+                mode_text = SESSION_MODE_TEXT.get(session.mode, session.mode)
+                state_text = SESSION_STATE_TEXT.get(session.state, session.state)
+                label.setText(
+                    f"当前会话：{mode_text} / {session.total_pages} 页 / "
+                    f"{batches} 批 / {state_text}")
+        save_btn = getattr(self, "session_save_btn", None)
+        if save_btn is not None:
+            save_btn.setEnabled(session is not None and session.total_pages > 0)
+        abandon_btn = getattr(self, "session_abandon_btn", None)
+        if abandon_btn is not None:
+            abandon_btn.setEnabled(session is not None and session.is_open)
+
+    # ── 一批扫描完成 ⇒ 并入会话 ──
+    def _session_batch_finished(self, job_id, result, mode):
+        """一批扫描完成 ⇒ 并入会话（双面 ⇒ 等翻面 / 批次 ⇒ 暂停）"""
+        session = self._session
+        if session is None:
+            return
+        side = self._pending_side_by_job.pop(job_id, "single")
+        paths = list(result.cached_paths)
+        page_nos = [_page_no_from_path(p) for p in paths]
+
+        # ★ 「从第 N 页重扫」：这一批里第 N 页及之后的页不要
+        resume_from = self._pending_resume_from.pop(job_id, None)
+        if resume_from is not None:
+            keep = [i for i, n in enumerate(page_nos) if n < resume_from]
+            for i, n in enumerate(page_nos):
+                if n >= resume_from:
+                    try:
+                        os.remove(paths[i])
+                    except OSError as e:
+                        logger.debug("删除被丢弃的缓存页失败 [%s]: %s", paths[i], e)
+            paths = [paths[i] for i in keep]
+            page_nos = [page_nos[i] for i in keep]
+
+        if not paths:
+            self.status_bar.showMessage("本批没有可加入会话的页面")
+            return
+
+        refs = session.add_pages(job_id, paths, side=side, page_nos=page_nos)
+        for ref in refs:
+            if (job_id, ref.page_no) in self._force_keep_pages:
+                ref.force_keep = True
+        session.output_path = result.output_path
+        session.ext = result.ext or session.ext
+
+        if mode == SESSION_MODE_DUPLEX and side == "front":
+            # 扫完正面 ⇒ 等用户翻面（**不弹预览对话框**）
+            self._set_session_state(session, "awaiting_flip")
+            try:
+                self._session_store.save(session)
+            except Exception as e:
+                logger.error("会话落盘失败: %s", e)
+            self._update_session_ui()
+            self.status_bar.showMessage(
+                f"正面已扫 {len(refs)} 页，请翻面放回后再次点击「扫描」"
+                f"（会话共 {session.total_pages} 页）")
+            return
+
+        if mode == SESSION_MODE_DUPLEX and side == "back":
+            # 背面也扫完了 ⇒ 合并预览 ⇒ 落盘
+            try:
+                self._session_store.save(session)
+            except Exception as e:
+                logger.error("会话落盘失败: %s", e)
+            self._update_session_ui()
+            self._confirm_and_save_session(session, duplex=True)
+            return
+
+        # 批次模式：扫完一批 ⇒ paused（可继续扫描或结束并保存）
+        self._set_session_state(session, "paused")
+        try:
+            self._session_store.save(session)
+        except Exception as e:
+            logger.error("会话落盘失败: %s", e)
+        self._update_session_ui()
+        self.status_bar.showMessage(
+            f"本批 {len(refs)} 页已加入会话（共 {session.total_pages} 页），"
+            f"可继续扫描或结束并保存")
+
+    def _absorb_cancelled_pages(self, job_id, side, resume_from):
+        """扫描被中断 ⇒ 把已扫到的页收进会话，再按「从第 N 页重扫」裁掉尾部"""
+        session = getattr(self, "_session", None)
+        if session is None:
+            return
+        try:
+            pages = cache_manager.list_pages(job_id)
+        except Exception as e:
+            logger.debug("读取中断扫描的缓存页失败 [%s]: %s", job_id, e)
+            return
+        if not pages:
+            return
+        paths = [p for (_n, _ext, p) in pages]
+        nos = [n for (n, _ext, _p) in pages]
+        refs = session.add_pages(job_id, paths, side=side, page_nos=nos)
+        for ref in refs:
+            if (job_id, ref.page_no) in self._force_keep_pages:
+                ref.force_keep = True
+        # ★ 丢弃第 N 页及之后（会话 + 缓存文件），保留前 N-1 页
+        resume_from_page(session, job_id, resume_from, drop_cache=True)
+        try:
+            self._session_store.save(session)
+        except Exception as e:
+            logger.error("会话落盘失败: %s", e)
+        self._update_session_ui()
+
+    # ── 合并 + 落盘 ──
+    def _confirm_and_save_session(self, session, duplex=False):
+        """合并预览 ⇒ 用户确认 ⇒ 落盘"""
+        merged = session_merged_pages(session)
+        if not merged:
+            QMessageBox.warning(self, "提示", "会话里没有可保存的页面")
+            return
+        # ★ parent 用 None（不挂到任何可能先销毁的对象上）
+        dialog = SessionMergePreviewDialog(session, merged, duplex=duplex)
+        accepted = dialog.exec() == QDialog.Accepted
+        if not accepted:
+            if duplex:
+                # 取消合并 ⇒ 回到"待翻面"，页面仍留在会话里
+                self._set_session_state(session, "awaiting_flip")
+                try:
+                    self._session_store.save(session)
+                except Exception as e:
+                    logger.error("会话落盘失败: %s", e)
+            self.status_bar.showMessage("已取消保存；页面仍保留在会话中")
+            self._update_session_ui()
+            return
+        self._save_session_now(session)
+
+    def _default_session_output_path(self) -> str:
+        """会话落盘的默认输出路径（与会话里记录的输出路径同规则）"""
+        out_dir = self.dir_entry.text() or self.output_dir
+        ext = self.output_format_val or "pdf"
+        return os.path.join(
+            out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
+
+    def _save_session_now(self, session):
+        """会话落盘（**后台线程**：几百页合并 PDF 要几十秒）"""
+        scanner = self.selected
+        dev_name = (scanner.model or "") if scanner else ""
+        dev_ip = (scanner.ip or "") if scanner else ""
+        out_path = session.output_path or self._default_session_output_path()
+        extra_dirs = list(self.extra_dirs or [])
+        session.ext = self.output_format_val or session.ext
+        session.dpi = int(self.resolution_val or session.dpi)
+        self._session_save_finished = False
+        _ensure_ui_dispatcher()
+
+        def _work():
+            return save_manager.save_session(
+                session, out_path=out_path, extra_dirs=extra_dirs,
+                device_name=dev_name, device_ip=dev_ip)
+
+        _run_in_background(_work, self._on_session_saved, self._on_session_save_error)
+
+    def _on_session_saved(self, saved_files):
+        """主线程：会话落盘完成"""
+        session = getattr(self, "_session", None)
+        failed = int(getattr(saved_files, "failed_pages", 0) or 0)
+        warnings = list(getattr(saved_files, "warnings", []) or [])
+        total = session.total_pages if session is not None else len(saved_files)
+        try:
+            if session is not None:
+                if failed:
+                    # 部分页失败 ⇒ 缓存保留、会话留在 paused（可重试）
+                    self._set_session_state(session, "paused")
+                else:
+                    self._set_session_state(session, "completed")
+                    cleanup_session_jobs(session)
+                    self._session = None
+                try:
+                    self._session_store.save(session)
+                except Exception as e:
+                    logger.error("会话状态落盘失败: %s", e)
+            summary = _format_save_summary(saved_files, total, failed, warnings)
+            self.status_bar.showMessage(f"会话已保存：{len(saved_files)} 个文件")
+            QMessageBox.information(
+                self, "保存完成" if not failed else "保存部分失败", summary)
+        except RuntimeError:
+            logger.debug("会话保存完成时主窗口已销毁")
+        finally:
+            self._session_save_finished = True
+            self._update_session_ui()
+
+    def _on_session_save_error(self, err):
+        """主线程：会话落盘失败（会话保留，可重试）"""
+        try:
+            logger.error("会话落盘失败: %s", err, exc_info=True)
+            self.status_bar.showMessage("会话保存失败")
+            QMessageBox.critical(self, "保存失败", f"会话保存失败: {err}")
+        except RuntimeError:
+            logger.debug("会话保存失败时主窗口已销毁")
+        finally:
+            self._session_save_finished = True
+            self._update_session_ui()
+
+    # ── 跨进程恢复 ──
+    def _restore_open_sessions(self):
+        """
+        启动时恢复未完成的会话。
+
+        ★★ **保护集合是进程内的** ⇒ `cache_manager._protected_dirs` 进程重启后为空
+          ⇒ 必须**重新 protect_dir**，否则跨天续扫的页会被 `cleanup_stale`
+          （24 小时过期线）删掉。
+        """
+        try:
+            sessions = self._session_store.list_open_sessions()
+        except Exception as e:
+            logger.error("读取未完成会话失败: %s", e)
+            return
+        if not sessions:
+            return
+        # 先把**所有**未完成会话引用的 job 目录重新登记保护
+        # （即使用户选择不继续，页面也不该被自动清理删掉）
+        for session in sessions:
+            protect_session_jobs(session)
+        latest = sessions[-1]
+        reply = QMessageBox.question(
+            self, "未完成的文档会话",
+            f"有未完成的文档会话（已扫 {latest.total_pages} 页），是否继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply == QMessageBox.Yes:
+            self._adopt_session(latest)
+        else:
+            self.status_bar.showMessage(f"有 {len(sessions)} 个未完成会话（未继续）")
+
+    def _adopt_session(self, session):
+        """接管一个未完成的会话（并把界面切到对应模式）"""
+        self._session = session
+        mode = session.mode
+        radio = None
+        if mode == SESSION_MODE_DUPLEX:
+            radio = getattr(self, "mode_duplex_radio", None)
+        elif mode == SESSION_MODE_BATCH:
+            radio = getattr(self, "mode_batch_radio", None)
+        else:
+            radio = getattr(self, "mode_single_radio", None)
+        if radio is not None:
+            radio.setChecked(True)          # ★ 用 setChecked（不触发 clicked）
+        check = getattr(self, "reverse_back_check", None)
+        if check is not None:
+            check.setChecked(bool(session.reverse_back))
+        protect_session_jobs(session)
+        self._update_session_ui()
+        self.status_bar.showMessage(f"已恢复会话（{session.total_pages} 页）")
+
+    # ────────── 倾斜强提醒（批次 4）──────────
+    def _on_skew_warning(self, job_id, page_no, angle, cache_path):
+        """
+        协调器在**工作线程**发来的倾斜强提醒。
+
+        ★ 绝不在工作线程里弹窗（Qt 要求 GUI 操作在主线程）⇒ 走 `_post_ui`
+          投递回主线程（这是本文件既有的跨线程通道）。
+        """
+        try:
+            self._post_ui(
+                lambda: self._show_skew_warning(job_id, page_no, angle, cache_path))
+        except RuntimeError:
+            logger.debug("倾斜提醒投递失败（主窗口已销毁）")
+
+    def _show_skew_warning(self, job_id, page_no, angle, cache_path):
+        """主线程：弹倾斜强提醒（三个按钮）"""
+        if job_id in self._skew_suppressed_jobs:
+            return
+        try:
+            # ★★ parent 用 None：绝不把弹窗挂到可能先销毁的对象上
+            #   （上一轮 0xc0000374 堆损坏的根因）
+            dialog = SkewWarningDialog(job_id, page_no, angle, cache_path)
+            dialog.exec()                    # ★ 先弹窗
+            choice = dialog.choice            # ★ 结果用属性取（不是信号）
+            dialog.deleteLater()             # ★ 之后不再碰这个对象
+        except RuntimeError as e:
+            logger.debug("倾斜提醒弹窗失败: %s", e)
+            return
+        if choice == SkewWarningDialog.CHOICE_RESUME:
+            self._resume_from_page(job_id, page_no)
+        elif choice == SkewWarningDialog.CHOICE_FORCE:
+            self._force_keep_pages.add((job_id, int(page_no)))
+            self._skew_suppressed_jobs.add(job_id)
+            self.status_bar.showMessage(f"第 {page_no} 页将原样保存（不纠偏）")
+        else:
+            self._skew_suppressed_jobs.add(job_id)
+            self.status_bar.showMessage("继续扫描（自动纠偏）")
+
+    def _resume_from_page(self, job_id, page_no):
+        """
+        「从第 N 页重扫」—— 中断当前扫描 + 丢弃第 N 页及之后的页（保留前 N-1 页）。
+
+        ★ 可复用 API：纯函数版本见模块级 `resume_from_page(session, job_id, page_no)`。
+        """
+        page_no = int(page_no)
+        try:
+            self.coordinator.cancel_scan(job_id)
+        except Exception as e:
+            logger.debug("取消扫描失败 [%s]: %s", job_id, e)
+        # 记下来：扫描被中断后（_on_scan_cancelled）按 N 裁掉尾部。
+        # ★ 只有**这一批还在扫描中**时才需要记 —— 已经并入会话的批次
+        #   直接在下面裁掉即可（否则会重复收录）。
+        pending_sides = getattr(self, "_pending_side_by_job", None) or {}
+        if job_id in pending_sides:
+            self._pending_resume_from[job_id] = page_no
+        session = getattr(self, "_session", None)
+        if session is not None:
+            dropped = resume_from_page(session, job_id, page_no, drop_cache=True)
+            if dropped:
+                logger.info("从第 %d 页重扫：丢弃 %d 页", page_no, len(dropped))
+                # ★ 立刻落盘：删页必须**活过落盘**（SessionStore.save 默认
+                #   merge=True 只进不退 ⇒ remove_pages_from 置位的 full_rewrite
+                #   标志会让 save 改走整体覆盖 ⇒ 磁盘上的副本也不会把页复活）。
+                try:
+                    self._session_store.save(session)
+                except Exception as e:
+                    logger.error("会话落盘失败: %s", e)
+        self.status_bar.showMessage(f"已中断扫描，将从第 {page_no} 页重扫")
 
     # ────────── 监听模式 ──────────
     def _start_listen(self):
