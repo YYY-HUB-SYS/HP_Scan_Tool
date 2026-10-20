@@ -99,7 +99,7 @@ def cmd_discover(args):
     if args.wsd_only:
         from wsd_engine import discover_wsd
         scanners = discover_wsd(timeout=timeout)
-    elif args.mdns-only:
+    elif args.mdns_only:
         scanners = discover_scanners(timeout=timeout)
     else:
         scanners = discover_all_scanners(timeout=timeout)

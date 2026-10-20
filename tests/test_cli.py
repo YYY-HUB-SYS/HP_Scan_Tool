@@ -151,3 +151,66 @@ class TestNoCommand:
         monkeypatch.setattr("sys.argv", ["hp_scan"])
         result = cli.main()
         assert result == 0
+
+
+# ── discover 命令体 ───────────────────────────────────────
+
+
+class TestDiscoverCommand:
+    """真正调用 cmd_discover，覆盖三条分支。
+
+    回归缺陷：原实现写作 `args.mdns-only`（减号），argparse dest 是
+    `mdns_only`。该 elif 表达式无条件求值，导致 discover 整条命令
+    抛 AttributeError，只有 --wsd-only 因走第一分支幸免。
+    """
+
+    def _args(self, *argv):
+        return cli._build_parser().parse_args(list(argv))
+
+    def test_default_uses_both_protocols(self, monkeypatch, capsys):
+        called = {}
+
+        def fake_all(timeout=4.0):
+            called["all"] = timeout
+            return []
+
+        monkeypatch.setattr(cli, "discover_all_scanners", fake_all)
+        assert cli.cmd_discover(self._args("discover", "--timeout", "3")) == 0
+        assert called["all"] == 3.0
+        assert "未发现任何扫描仪" in capsys.readouterr().out
+
+    def test_mdns_only(self, monkeypatch, capsys):
+        called = {}
+
+        def fake_mdns(timeout=4.0):
+            called["mdns"] = timeout
+            return []
+
+        monkeypatch.setattr(cli, "discover_scanners", fake_mdns)
+        assert cli.cmd_discover(self._args("discover", "--mdns-only")) == 0
+        assert called["mdns"] == 4.0
+
+    def test_wsd_only(self, monkeypatch, capsys):
+        called = {}
+
+        def fake_wsd(timeout=4.0):
+            called["wsd"] = timeout
+            return []
+
+        # cmd_discover 内部用 `from wsd_engine import discover_wsd`（函数内导入），
+        # 因此必须打在源模块上才能真正拦截调用；cli 模块本身没有该属性。
+        monkeypatch.setattr("wsd_engine.discover_wsd", fake_wsd)
+        assert cli.cmd_discover(self._args("discover", "--wsd-only")) == 0
+        assert called["wsd"] == 4.0
+
+    def test_json_output_shape(self, monkeypatch, capsys):
+        from escl_engine import ScannerInfo
+        s = ScannerInfo(name="t", ip="1.2.3.4", model="HP M232")
+        monkeypatch.setattr(cli, "discover_all_scanners", lambda timeout=4.0: [s])
+        assert cli.cmd_discover(self._args("discover", "--format", "json")) == 0
+        import json as _json
+        # cmd_discover 先在 stdout 打印一行进度提示，再打印 JSON 数组，
+        # 因此从首个 "[" 起截取 JSON 主体。
+        out = capsys.readouterr().out
+        data = _json.loads(out[out.index("["):])
+        assert len(data) == 1 and data[0]["ip"] == "1.2.3.4"
