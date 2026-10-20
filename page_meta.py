@@ -5,11 +5,17 @@
 并发与清理约定（v4.0）：
   1) 写入复用共享模块 config_io（不再另写一套锁）：
      - atomic_write_json —— 唯一临时名 + 写后校验 + os.replace 原子替换
-     - config_lock       —— msvcrt 跨进程排他锁（锁住整个"读-改-写"事务）
-     另外加一把**进程内** threading.Lock：config_lock 拿不到锁时会记日志
-     并放行写入（同进程多线程若只靠它，就可能真的丢更新），
-     进程内锁保证同进程并发永远串行。
-  2) 孤儿清理：缓存 job 目录已不存在的元数据条目会被删除（prune_orphans），
+     - config_write_lock —— msvcrt 跨进程排他锁（锁住整个"读-改-写"事务），
+       **拿不到锁就抛 ConfigLockTimeout**，事务体不执行 ⇒ 绝不"未持锁还写入"
+       （旧配置的 2 秒等待上限在机器满载时会被正常触发，导致丢更新；
+        config_io 的等待上限已提到 30 秒）
+     另外加一把**进程内** threading.Lock：同进程多线程必须串行。
+  2) 锁超时**不抛给调用方**（PySide6 ≥ 6.5 对槽内未捕获异常会 qFatal ⇒ 进程 abort）：
+     记 error 日志 + 跳过本次写入，并用返回值（False）明确告诉调用方
+     "这次写入没有发生"。
+  3) 元数据文件损坏时：记 error 日志 + **备份原文**（与 history_manager 同风格），
+     并且**禁止**用空字典覆盖原文件（否则其它 job 的页元数据被永久抹掉）。
+  4) 孤儿清理：缓存 job 目录已不存在的元数据条目会被删除（prune_orphans），
      一次性覆盖"扫描失败/取消、缓存被 eviction、程序异常退出"等所有
      "缓存没了但元数据还在"的路径，避免 page_meta.json 条目单调增长。
 """
@@ -18,8 +24,10 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import threading
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Optional
 
 import config_io
@@ -29,6 +37,9 @@ logger = logging.getLogger(__name__)
 # 进程内写事务锁：按元数据文件路径分桶，跨 PageMetaStore 实例共享
 _WRITE_LOCKS: dict[str, threading.Lock] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
+
+# 已备份过的损坏文件（路径 + mtime + size），避免反复读取刷出一堆备份
+_CORRUPT_BACKED_UP = set()
 
 
 def _write_lock(path: str) -> threading.Lock:
@@ -50,6 +61,33 @@ def _is_inside(root: str, path: str) -> bool:
         return os.path.commonpath([root_abs, path_abs]) == root_abs
     except ValueError:
         return False   # 不同盘符
+
+
+def _backup_corrupt(fpath: str):
+    """
+    把损坏的页元数据文件原文备份成 <name>.corrupt-<时间戳>，返回备份路径。
+
+    与 history_manager._backup_corrupt 同一套命名与去重规则：
+    同一份损坏内容只备份一次（路径+mtime+size 去重），备份失败不影响主流程
+    （原文仍在原处，不会被静默清空）。
+    """
+    try:
+        st = os.stat(fpath)
+    except OSError:
+        return None
+    key = (fpath, st.st_mtime_ns, st.st_size)
+    if key in _CORRUPT_BACKED_UP:
+        return None
+    _CORRUPT_BACKED_UP.add(key)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup = f"{fpath}.corrupt-{ts}"
+    try:
+        shutil.copyfile(fpath, backup)
+    except OSError as e:
+        logger.error("页元数据损坏备份失败: %s（%s）", fpath, e)
+        return None
+    logger.error("页元数据文件已损坏，原文已备份到: %s", backup)
+    return backup
 
 
 @dataclass
@@ -75,12 +113,45 @@ class PageMetaStore:
 
     def load(self) -> dict:
         """读全部元数据（原子替换保证不会读到半截文件）"""
+        data, _ = self._load_state()
+        return data
+
+    def _load_state(self) -> tuple[dict, bool]:
+        """
+        读全部元数据，返回 (数据, 是否**可以安全覆盖**原文件)。
+
+        - 文件不存在 → ({}, True)：正常首次写入
+        - 文件是空的 → ({}, True)：没有任何数据可丢，视为可安全覆盖
+        - 文件损坏（JSON 解析失败 / 编码乱码 / 顶层不是对象）→ 记 error 日志 +
+          **备份原文**，返回 ({}, False)：调用方**禁止**用空字典覆盖原文件，
+          否则其它 job 的页元数据（手动旋转、裁剪框）会被永久抹掉。
+        """
         try:
             with open(self._path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+                raw = f.read()
+        except FileNotFoundError:
+            return {}, True
+        except UnicodeDecodeError as e:
+            logger.error("页元数据文件编码损坏: %s（%s）", self._path, e)
+            _backup_corrupt(self._path)
+            return {}, False
+        except OSError as e:
+            logger.error("页元数据文件读取失败: %s（%s）", self._path, e)
+            return {}, False
+        if not raw.strip():
+            # 空文件：没有任何数据可丢，视为可安全覆盖
+            return {}, True
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error("页元数据文件损坏: %s（%s）", self._path, e)
+            _backup_corrupt(self._path)
+            return {}, False
+        if not isinstance(data, dict):
+            logger.error("页元数据文件格式错误（期望对象）: %s", self._path)
+            _backup_corrupt(self._path)
+            return {}, False
+        return data, True
 
     def get_job(self, job_id: str) -> dict:
         return self.load().get(job_id, {})
@@ -89,44 +160,83 @@ class PageMetaStore:
 
     @contextlib.contextmanager
     def _transaction(self):
-        """写事务临界区：进程内线程锁 → 跨进程文件锁（顺序固定，不会死锁）"""
+        """
+        写事务临界区：进程内线程锁 → 跨进程文件锁（顺序固定，不会死锁）。
+
+        yield True  = 拿到锁，事务体可以写
+        yield False = 没拿到锁（等待超时），事务体**不得写**——本次写入已跳过
+
+        ★ 锁超时不向上抛：page_meta 会被 GUI 与工作线程调用，
+          PySide6 ≥ 6.5 对槽内未捕获异常会 qFatal ⇒ 进程 abort。
+        """
         parent = os.path.dirname(self._path)
         if parent:
             os.makedirs(parent, exist_ok=True)
         with _write_lock(self._path):
-            with config_io.config_lock(self._path):
-                yield
+            with contextlib.ExitStack() as stack:
+                try:
+                    stack.enter_context(config_io.config_write_lock(self._path))
+                except config_io.ConfigLockTimeout as e:
+                    logger.error("页元数据写入被跳过（拿不到跨进程锁）: %s（%s）",
+                                 self._path, e)
+                    yield False
+                    return
+                yield True
 
     def _write(self, metas: dict) -> None:
         """原子写（调用方须持有事务锁）"""
         config_io.atomic_write_json(self._path, metas)
 
-    def save(self, metas: dict) -> None:
-        """整体覆盖写（加锁 + 原子替换）"""
-        with self._transaction():
+    def save(self, metas: dict) -> bool:
+        """整体覆盖写（加锁 + 原子替换）。返回是否真的写入。"""
+        with self._transaction() as acquired:
+            if not acquired:
+                return False
             self._write(metas)
+            return True
 
-    def set_page(self, job_id: str, page_no: int, meta: PageMeta) -> None:
-        """记录一页元数据（读-改-写全程持锁，并发调用不会互相覆盖）"""
+    def set_page(self, job_id: str, page_no: int, meta: PageMeta) -> bool:
+        """
+        记录一页元数据（读-改-写全程持锁，并发调用不会互相覆盖）。
+
+        返回 False 表示本次写入**没有发生**：拿不到跨进程锁，或原文件已损坏
+        （损坏时只备份不覆盖，绝不抹掉其它 job 的元数据）。
+        """
         payload = asdict(meta)
-        with self._transaction():
-            metas = self.load()
+        with self._transaction() as acquired:
+            if not acquired:
+                return False
+            metas, overwritable = self._load_state()
+            if not overwritable:
+                logger.error("页元数据原文件损坏，已跳过写入（原文与备份均保留）: %s",
+                             self._path)
+                return False
             metas.setdefault(job_id, {})[str(page_no)] = payload
             self._write(metas)
+            return True
 
-    def remove_job(self, job_id: str) -> None:
+    def remove_job(self, job_id: str) -> bool:
         """
         删除某 job 的元数据，并在**同一事务内**顺带清理孤儿条目。
 
         孤儿 = 缓存 job 目录已不存在的条目（扫描失败/取消、缓存被 eviction、
         程序异常退出等路径留下的残留）。保存成功后的清理走这里。
+
+        返回是否真的写入（False = 拿不到锁或原文件损坏，本次未改动）。
         """
-        with self._transaction():
-            metas = self.load()
+        with self._transaction() as acquired:
+            if not acquired:
+                return False
+            metas, overwritable = self._load_state()
+            if not overwritable:
+                logger.error("页元数据原文件损坏，已跳过删除（原文与备份均保留）: %s",
+                             self._path)
+                return False
             changed = self._drop_job_locked(metas, job_id)
             changed = self._prune_locked(metas) or changed
             if changed:
                 self._write(metas)
+            return True
 
     # ── 孤儿清理 ──
 
@@ -134,15 +244,22 @@ class PageMetaStore:
         """
         清理孤儿条目：缓存 job 目录已不存在的元数据条目。
 
-        返回被删除的 job_id 列表。
+        返回被删除的 job_id 列表（拿不到锁 / 原文件损坏时返回空列表，
+        并已记 error 日志）。
         """
         root = os.path.abspath(cache_root) if cache_root else self._cache_root
         if not os.path.isdir(root):
             # 缓存根不存在（换了根/盘没挂上）⇒ 不动元数据，避免误删全部
             logger.debug("缓存根不存在，跳过孤儿清理: %s", root)
             return []
-        with self._transaction():
-            metas = self.load()
+        with self._transaction() as acquired:
+            if not acquired:
+                return []
+            metas, overwritable = self._load_state()
+            if not overwritable:
+                logger.error("页元数据原文件损坏，已跳过孤儿清理（原文与备份均保留）: %s",
+                             self._path)
+                return []
             removed = self._prune_locked(metas, root)
             if removed:
                 self._write(metas)

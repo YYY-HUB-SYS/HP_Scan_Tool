@@ -29,7 +29,7 @@ __all__ = [
     "fetch_capabilities", "get_scanner_status", "probe_scanner_status",
     "execute_scan", "execute_multipage_scan", "scan_to_file",
     "auto_crop", "is_blank_page", "FORMAT_MIME", "MIME_EXT",
-    "REQUEST_FORMAT",
+    "REQUEST_FORMAT", "ScanJobCancelled",
 ]
 
 
@@ -533,18 +533,67 @@ REQUEST_FORMAT = {
     "pdf":  ("image/jpeg", "pdf"),   # 请求图片，落盘时本地合成 PDF
 }
 
+# 409（打印机上残留未完成任务）的有界退避：2/4/8 秒，共 14 秒。
+# 设备侧残留 job 的 TTL 实测 15-20 分钟 ⇒ 等满 14 秒也不可能等到回收，
+# 所以这里只做**有界**退避（期间可被用户取消），随后立即报错并明确告知 TTL。
+_CONFLICT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 
-def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=1):
+# 409 的错误文案：必须写清"设备回收要多久"和"用户能做什么"
+_CONFLICT_TTL_HINT = "15-20 分钟"
+_CONFLICT_MESSAGE = (
+    "打印机上残留了一个未完成的扫描任务（HTTP 409），重试 3 次仍未释放。"
+    "该型号不支持客户端清理，设备回收需要 15-20 分钟："
+    "请在打印机面板上取消该任务，或稍后重试；若持续失败可重启打印机。"
+)
+
+
+class ScanJobCancelled(RuntimeError):
+    """创建扫描任务期间被用户取消（409 退避等待过程中收到取消信号）。"""
+
+
+def _sleep_cancellable(seconds, cancel_event=None, slice_seconds=0.2):
     """
-    创建扫描任务（POST ScanJobs），返回 (base, job_uri, ext, session)。
+    可取消的等待。返回 True = 等待期间被取消。
+
+    - 有 cancel_event：分片睡眠（每片 0.2 秒），每片检查一次取消信号，
+      用户点取消后最多再等 0.2 秒就生效（原先一次 sleep 14 秒，用户无法中断）
+    - 无 cancel_event：一次 time.sleep(seconds)（保持既有调用形态不变）
+    """
+    if cancel_event is None:
+        time.sleep(seconds)
+        return False
+    remaining = float(seconds)
+    while remaining > 0:
+        if cancel_event.is_set():
+            return True
+        step = min(slice_seconds, remaining)
+        time.sleep(step)
+        remaining -= step
+    return bool(cancel_event.is_set())
+
+
+def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex,
+                      max_pages=1, cancel_event=None):
+    """
+    创建扫描任务（POST ScanJobs），返回 (base, job_uri, ext)。
     调用者负责关闭 session。
+
+    cancel_event：可选的取消信号，409 退避等待期间用它及时中断。
     """
     escl_url = scanner.escl_url
     if not escl_url:
         raise RuntimeError("未配置 eSCL URL")
 
     base = escl_url.rstrip("/")
-    mime, ext = REQUEST_FORMAT.get(output_format.lower(), ("image/jpeg", "jpg"))
+    fmt = (output_format or "jpg").lower()
+    if fmt not in REQUEST_FORMAT:
+        # ★ 不静默降级：不支持的输出格式必须显式报错。
+        #   旧实现直接回退 ("image/jpeg", "jpg")，用户要的 bmp 无声消失，
+        #   产出的是 .jpg 而用户以为拿到了 .bmp（历史缺陷 M-28）。
+        raise RuntimeError(
+            f"不支持的输出格式: {output_format}（支持: "
+            f"{'、'.join(sorted(REQUEST_FORMAT))}）")
+    mime, ext = REQUEST_FORMAT[fmt]
 
     xml_body = _build_scan_job_xml(
         resolution=resolution,
@@ -562,19 +611,20 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     if r.status_code == 409:
         # 打印机上残留一个未完成的 ScanJob（此前某次扫描异常中断留下的）。
         # 该型号不支持列举与整体删除（GET/DELETE /eSCL/ScanJobs 均返回 405），
-        # 客户端无法主动清理，只能等打印机侧 TTL 回收，这里做有限退避重试。
-        for delay in (2, 4, 8):
+        # 客户端无法主动清理，只能等打印机侧 TTL 回收（实测 15-20 分钟）。
+        #
+        # 退避是**有界**的（默认 2/4/8 秒共 14 秒）：等满 14 秒也等不到
+        # 15-20 分钟的 TTL，与其傻等，不如立刻报错并告诉用户要等多久。
+        # 等待过程可被 cancel_event 随时中断（原先一次 sleep 14 秒不可取消）。
+        for delay in _CONFLICT_BACKOFF_SECONDS:
             logger.info("扫描任务被占用 (409)，%s 秒后重试: %s", delay, scanner.ip)
-            time.sleep(delay)
+            if _sleep_cancellable(delay, cancel_event):
+                raise ScanJobCancelled("扫描已取消（等待打印机释放任务时中断）")
             r = session.post(f"{base}/ScanJobs", data=xml_body, headers=headers, timeout=30)
             if r.status_code != 409:
                 break
         else:
-            raise RuntimeError(
-                "打印机上有一个未完成的扫描任务（HTTP 409），重试 3 次仍未释放。"
-                "该型号不支持客户端清理，只能等打印机侧自动回收（实测约 15-20 分钟）。"
-                "请稍候再试；若持续失败，可在打印机面板上取消该任务或重启打印机。"
-            )
+            raise RuntimeError(_CONFLICT_MESSAGE)
     if r.status_code == 503:
         # 实测 2026-10-20：source=Feeder 且输稿器为空时，打印机在创建任务
         # 阶段就返回 503（设备在等纸），不是扫描超时。给出用户可执行动作。
@@ -623,12 +673,19 @@ def execute_scan(
     """
     session = requests.Session()
     session.verify = False
+    job_uri = None
+    ext = REQUEST_FORMAT.get((output_format or "jpg").lower(), ("image/jpeg", "jpg"))[1]
 
     try:
         # ADF 扫描需要设置 MaxScanPages
         max_pages = 1000 if source == "Feeder" else 1
-        base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=max_pages)
+        try:
+            base, job_uri, ext = _create_scan_job(
+                session, scanner, resolution, color_mode, output_format, source, duplex,
+                max_pages=max_pages, cancel_event=cancel_event)
+        except ScanJobCancelled:
+            # 409 退避期间被用户取消：按"取消"语义返回（协调器识别为取消）
+            return None, ext
 
         # 轮询 NextDocument（更短的间隔 + 更长的读取超时捕捉扫描数据）
         start = time.time()
@@ -658,10 +715,11 @@ def execute_scan(
         raise RuntimeError("扫描超时：未能在限定时间内获取扫描数据")
     finally:
         # 清理打印机上的扫描任务（防止任务累积导致409冲突）
-        try:
-            session.delete(job_uri, timeout=3)
-        except Exception:
-            pass
+        if job_uri:
+            try:
+                session.delete(job_uri, timeout=3)
+            except Exception:
+                pass
         session.close()
 
 
@@ -684,12 +742,18 @@ def execute_multipage_scan(
     """
     session = requests.Session()
     session.verify = False
+    job_uri = None
+    ext = REQUEST_FORMAT.get((output_format or "jpg").lower(), ("image/jpeg", "jpg"))[1]
 
     try:
         # ADF 扫描需要设置 MaxScanPages 为较大值
         max_pages = 1000 if source == "Feeder" else 1
-        base, job_uri, ext = _create_scan_job(
-            session, scanner, resolution, color_mode, output_format, source, duplex, max_pages=max_pages)
+        try:
+            base, job_uri, ext = _create_scan_job(
+                session, scanner, resolution, color_mode, output_format, source, duplex,
+                max_pages=max_pages, cancel_event=cancel_event)
+        except ScanJobCancelled:
+            return [], ext
 
         # 循环获取页面
         pages = []
@@ -736,10 +800,11 @@ def execute_multipage_scan(
 
         return pages
     finally:
-        try:
-            session.delete(job_uri, timeout=3)
-        except Exception:
-            pass
+        if job_uri:
+            try:
+                session.delete(job_uri, timeout=3)
+            except Exception:
+                pass
         session.close()
 
 

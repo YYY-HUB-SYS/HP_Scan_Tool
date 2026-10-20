@@ -55,6 +55,7 @@ def listen_for_scan(
     """
     session = requests.Session()
     session.verify = False
+    job_uri = None
 
     try:
         if progress_callback:
@@ -66,7 +67,7 @@ def listen_for_scan(
         max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
             session, scanner, resolution, color_mode, output_format, source, duplex,
-            max_pages=max_pages
+            max_pages=max_pages, cancel_event=cancel_event
         )
 
         if progress_callback:
@@ -108,6 +109,16 @@ def listen_for_scan(
         return None
 
     finally:
+        # ★ 清理打印机上的扫描任务（与 execute_scan 对齐）：
+        #   监听被取消/超时后，打印机上会残留一个未完成的 ScanJob；
+        #   紧接着的普通扫描会撞 409（提示"打印机上有一个未完成的扫描任务"，
+        #   其实是自己上次监听留下的），且要等 15–20 分钟 TTL 才被回收。
+        #   job_uri 可能未绑定（创建任务就失败）⇒ 用 None 哨兵，不抛二次异常。
+        if job_uri:
+            try:
+                session.delete(job_uri, timeout=3)
+            except Exception as e:
+                logger.debug("删除监听扫描任务失败（忽略）: %s", e)
         session.close()
 
 
@@ -145,6 +156,7 @@ def listen_for_multipage_scan(
     """
     session = requests.Session()
     session.verify = False
+    job_uri = None
 
     try:
         if progress_callback:
@@ -156,7 +168,7 @@ def listen_for_multipage_scan(
         max_pages = 1000 if source == "Feeder" else 1
         base, job_uri, ext = _create_scan_job(
             session, scanner, resolution, color_mode, output_format, source, duplex,
-            max_pages=max_pages
+            max_pages=max_pages, cancel_event=cancel_event
         )
 
         if progress_callback:
@@ -207,4 +219,11 @@ def listen_for_multipage_scan(
         return pages if pages else None
 
     finally:
+        # ★ 同 listen_for_scan：监听取消/超时后必须删掉打印机上的 ScanJob，
+        #   否则残留 job 会让紧接着的普通扫描撞 409（等 15–20 分钟 TTL 才回收）。
+        if job_uri:
+            try:
+                session.delete(job_uri, timeout=3)
+            except Exception as e:
+                logger.debug("删除监听扫描任务失败（忽略）: %s", e)
         session.close()

@@ -97,20 +97,29 @@ def _save_wia_image(img, ext: str) -> bytes:
     """
     将 WIA Image 对象转换为 bytes。
     先尝试 WIA ImageProcess 格式转换，再保存到临时文件，最后用 PIL 读取字节。
+
+    ★ 新契约（ext=pdf ⇒ 字节是**图片**，PDF 由 save_manager 本地合成）：
+      WIA 不支持 .pdf 扩展名，SaveFile("*.pdf") 必然失败，
+      旧实现走 FileData 兜底后 `pil_img.save(tmp_path)` 会让 PIL 按 .pdf
+      扩展名写出**真 PDF**字节 ⇒ 缓存页 page_001.pdf 打不开（预览无法渲染）。
+      这里对 pdf 内部按 jpg 处理（WIA 支持 jpg），保证交出去的是图片字节。
     """
+    # 内部实际使用的格式：pdf → jpg（图片字节），其余原样
+    save_ext = "jpg" if ext == "pdf" else ext
+
     # 尝试 WIA 格式转换
     try:
-        if ext in _WIA_FORMAT_GUID:
+        if save_ext in _WIA_FORMAT_GUID:
             from win32com.client import Dispatch
             img_proc = Dispatch("WIA.ImageProcess")
             img_proc.Filters.Add(img_proc.FilterInfos["Convert"].FilterID)
-            img_proc.Filters[1].Properties["FormatID"].Value = _WIA_FORMAT_GUID[ext]
+            img_proc.Filters[1].Properties["FormatID"].Value = _WIA_FORMAT_GUID[save_ext]
             img = img_proc.Apply(img)
     except Exception:
         pass  # 格式转换失败，用原始 img 继续
 
     # 保存到临时文件再读取字节
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{ext}")
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=f".{save_ext}")
     os.close(tmp_fd)
     try:
         try:
@@ -120,7 +129,7 @@ def _save_wia_image(img, ext: str) -> bytes:
             from PIL import Image
             import io
             if hasattr(img, "FileData"):
-                guid = _WIA_FORMAT_GUID.get(ext, _WIA_FORMAT_GUID["jpg"])
+                guid = _WIA_FORMAT_GUID.get(save_ext, _WIA_FORMAT_GUID["jpg"])
                 data = img.FileData.GetFile(FormatID=guid)
                 pil_img = Image.open(io.BytesIO(data.BinaryData))
                 pil_img.save(tmp_path)

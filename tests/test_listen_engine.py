@@ -31,9 +31,11 @@ def _patch_create_scan_job(monkeypatch):
     captured = {}
 
     def fake_create_scan_job(session, scanner, resolution, color_mode,
-                             output_format, source, duplex, max_pages=1):
+                             output_format, source, duplex, max_pages=1,
+                             cancel_event=None):
         captured["source"] = source
         captured["max_pages"] = max_pages
+        captured["cancel_event"] = cancel_event
         return ("http://1.2.3.4:80/eSCL",
                 "http://1.2.3.4:80/eSCL/ScanJobs/1", "jpg")
 

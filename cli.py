@@ -273,8 +273,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_scan = subparsers.add_parser("scan", help="执行扫描")
     p_scan.add_argument("--ip", required=True, help="打印机 IP 地址")
     p_scan.add_argument("--resolution", type=int, default=300, help="分辨率 DPI (默认 300)")
-    p_scan.add_argument("--format", default="jpg", choices=["jpg", "png", "pdf", "bmp"],
-                        help="输出格式 (默认 jpg)")
+    p_scan.add_argument("--format", default="jpg", choices=["jpg", "png", "pdf"],
+                        help="输出格式 (默认 jpg)。不支持的格式会直接报错，"
+                             "不会静默降级成别的格式")
     p_scan.add_argument("--color", default="color", choices=["color", "gray", "bw"],
                         help="颜色模式 (默认 color)")
     p_scan.add_argument("--source", default="Platen", choices=["Platen", "Feeder"],
