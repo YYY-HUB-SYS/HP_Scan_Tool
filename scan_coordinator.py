@@ -46,10 +46,17 @@ SOURCE_MAP = {
 DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
 
 # ── 用户可见提示文案（F-3）──
-WARN_CAPABILITY_UNKNOWN = (
+# ① 能力查询**失败/超时**（capabilities_known=False）⇒ 能力未知 ⇒ 按用户
+#    显式选择走（绝不静默改成平板），并告诉用户下一步该做什么。
+WARN_CAPABILITY_QUERY_FAILED = (
     "未能确认扫描仪的输稿器（ADF）能力（能力查询失败或超时），"
-    "已按您选择的「输稿器」继续扫描；若设备实际没有输稿器，扫描会直接报错。")
-WARN_NO_ADF = "该扫描仪不支持输稿器（ADF），已改为平板（Platen）扫描。"
+    "已按您选择的「输稿器」继续扫描；若设备实际没有输稿器，扫描会直接报错。"
+    "可稍后重试，或把来源改回「平板」后重扫。")
+# 向后兼容别名：旧名保留，指向同一个常量（既有调用点/用例不受影响）
+WARN_CAPABILITY_UNKNOWN = WARN_CAPABILITY_QUERY_FAILED
+# ② 能力查询**成功**且解析结果里没有 Adf 段 ⇒ 设备确实没有输稿器
+#    ⇒ 已回退平板，提示用户"设备不支持输稿器"。
+WARN_NO_ADF = "已确认该扫描仪不支持输稿器（ADF），已改为平板（Platen）扫描。"
 WARN_NO_PAPER = "输稿器（ADF）里没有纸，已改为平板（Platen）扫描。"
 WARN_PROBE_FAILED = "输稿器（ADF）状态探测失败，已按您选择的「输稿器」继续扫描。"
 
@@ -61,9 +68,12 @@ _CAPABILITY_FIELDS = ("has_adf", "has_duplex", "has_platen", "max_width",
 
 def capabilities_known(scanner) -> bool:
     """
-    该扫描仪的 eSCL 能力是否**已经确认拿到**（F-3 临时判定）。
+    该扫描仪的 eSCL 能力是否**已经确认拿到**。
 
-    见 `mark_capabilities_known` 的说明。
+    数据来源：`escl_engine.ScannerInfo.capabilities_known` 字段 —— 由
+    `fetch_capabilities` 在「HTTP 200 + XML 可解析」时就地置 True；
+    失败 / 超时 / 畸形 XML ⇒ 保持 False。
+    （用 `getattr` 兜底，兼容还没加该字段的旧对象/替身。）
     """
     return bool(getattr(scanner, "capabilities_known", False))
 
@@ -72,11 +82,8 @@ def mark_capabilities_known(scanner, known: bool = True) -> None:
     """
     标记该扫描仪的 eSCL 能力是否已确认拿到。
 
-    ★ **临时方案**（F-3）：`escl_engine.ScannerInfo` 目前没有 capabilities_known
-    字段（`escl_engine.py` 不在本波次的文件所有权里），这里用**实例属性**承载。
-    —— escl_engine 将来补上同名字段后，本函数与 `capabilities_known()` 的语义
-    完全不变（同一个实例属性、同一个 True/False 含义），可直接平滑切换，
-    协调器侧不需要再改。
+    `escl_engine.ScannerInfo` 现在已有同名**正式字段**（2026-10-21 落地），
+    本函数只是它的薄封装（保留是为了既有调用点与用例不必改）。
     """
     try:
         setattr(scanner, "capabilities_known", bool(known))
@@ -99,18 +106,26 @@ def fetch_capabilities_tracked(scanner, timeout: float = 3.0):
     """
     调用 escl_engine.fetch_capabilities，并判定"能力是否真的拿到了"。
 
-    ★ **临时方案**（F-3）：`fetch_capabilities` 失败时只记 debug 日志并原样
-    返回 scanner，调用方无法区分「设备真的没有 ADF」与「我们没查到能力」。
-    这里用**能力字段指纹前后对比**判定：
-      - 查询成功 ⇒ 设备至少有一项能力字段与查询前不同（型号 / 序列号 /
-        分辨率 / 颜色模式 / 格式 / 最大尺寸 / 有无 ADF）⇒ 能力已知
-      - 查询失败（超时 / 连不上 / XML 解析失败）⇒ 字段原封不动 ⇒ 能力未知
-    判定只会"保守"地偏保守方向：能力未知时保留用户显式选择的来源，
-    绝不会静默把「输稿器」改成「平板」。
+    ★ **主判据 = `scanner.capabilities_known`**（终局方案，2026-10-21 落地）
+      `fetch_capabilities` 在「HTTP 200 + XML 可解析」时把该字段置 True；
+      失败 / 超时 / 畸形 XML 一律不置位。
 
-    **终局方案**（推荐）：给 `ScannerInfo` 加 `capabilities_known: bool = False`
-    字段，由 `fetch_capabilities` 查询成功时置 True —— 那样所有调用方
-    （含 GUI / CLI / wsd_engine）自动拿到准确信号。
+    为什么不再用"能力字段指纹前后对比"当主判据：那条启发式在真实链路上有
+    **3 条独立失效路径，其中 2 条是系统性的** ——
+      ① WSD 发现链路：`wsd_engine` 已经先查过一次能力 ⇒ 本次查询是**幂等
+         no-op** ⇒ 指纹前后完全相同 ⇒ 永远判"能力未知"；
+      ② GUI 探测链路：GUI 直接调 `fetch_capabilities` ⇒ 协调器看不到任何
+         字段变化 ⇒ 永远判"能力未知"；
+      ③ 能力字段恰好等于 `ScannerInfo` 默认值（max_width=2480 / max_height=3508
+         / resolutions=[75,150,200,300,600] / color_modes=[...] / formats=[...]
+         / model='' / serial=''）⇒ 成功查询被误判为"未知"。
+
+    后果：真·无 ADF 的设备被判成"能力未知" ⇒ 用户选「输稿器」时**不回退
+    平板** ⇒ 设备回 503 ⇒ 用户看到扫描失败而不是自动落平板。
+
+    ★ **指纹对比保留为兜底**（残余作用）：仅当本次调用确实改动了能力字段、
+    但调用方（如被 mock 掉的 `fetch_capabilities`）没有置位时，补判 True。
+    指纹"不变 ⇒ 未知"这条推断**不再使用**（它是不安全的方向）。
     """
     before = _capability_fingerprint(scanner)
     try:
@@ -118,8 +133,10 @@ def fetch_capabilities_tracked(scanner, timeout: float = 3.0):
     except Exception as e:
         logger.debug("能力查询异常: %s", e)
         result = scanner
-    after = _capability_fingerprint(result)
-    if after != before:
+    if capabilities_known(result):
+        return result
+    # 兜底：字段确实变了 ⇒ 能力文档确实拿到了（调用方没置位时补判）
+    if _capability_fingerprint(result) != before:
         mark_capabilities_known(result, True)
     return result
 
@@ -397,10 +414,14 @@ class ScanCoordinator(QObject):
         - "Auto"：探测决定，有纸用 Feeder 否则 Platen
 
         ★ F-3：必须区分「设备真的没有 ADF」与「我们没查到能力」。
-        能力查询失败/超时（`fetch_capabilities` 失败，has_adf 保持默认 False）
-        时，**保留用户显式选择的来源**并给出提示；绝不静默把「输稿器」
-        改成「平板」—— 用户选了输稿器却扫了平板且界面无任何提示，
-        正是本轮要消灭的失败模式。
+        判据是 `scanner.capabilities_known`（由 `fetch_capabilities` 在
+        「HTTP 200 + XML 可解析」时置位）：
+          - **已知**（查询成功）+ 解析结果里没有 Adf 段 ⇒ 设备真的没有 ADF
+            ⇒ 强制平板，提示 `WARN_NO_ADF`；
+          - **未知**（查询失败/超时/畸形 XML）⇒ **保留用户显式选择的来源**
+            并给出 `WARN_CAPABILITY_QUERY_FAILED` 提示；绝不静默把
+            「输稿器」改成「平板」—— 用户选了输稿器却扫了平板且界面无任何
+            提示，正是本轮要消灭的失败模式。
 
         探测失败时**保留用户请求的来源**。probe_scanner_status 显式返回
         (探测是否成功, 状态字典)："探测失败"（连接失败 / 非 200 / XML 畸形，
@@ -422,15 +443,15 @@ class ScanCoordinator(QObject):
 
         if not has_adf:
             if capabilities_known(scanner):
-                # 能力已确认（查询成功且解析结果里没有 Adf 段）
+                # 能力**已确认**（查询成功且解析结果里没有 Adf 段）
                 # ⇒ 设备真的没有 ADF ⇒ 强制平板。
                 if requested == "Feeder":
                     return "Platen", False, WARN_NO_ADF
                 return "Platen", False, None
-            # 能力未知（查询失败/超时/解析不出 Adf 信息）
+            # 能力**未知**（查询失败/超时/XML 畸形 ⇒ capabilities_known=False）
             # ⇒ 按用户显式选择走，并把"能力未确认"提示给用户。
             if requested == "Feeder":
-                return "Feeder", False, WARN_CAPABILITY_UNKNOWN
+                return "Feeder", False, WARN_CAPABILITY_QUERY_FAILED
             # Auto：机器决策，探测不出 ADF 能力就落平板（保持既有行为）
             return "Platen", False, None
 

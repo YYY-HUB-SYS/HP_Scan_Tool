@@ -82,11 +82,12 @@ def _extract_ip(xaddr: str) -> Optional[str]:
 
 def _build_scanner_from_wsd(ip: str, svc) -> Optional[ScannerInfo]:
     """从 WSD 服务构建 ScannerInfo，并探测 eSCL 能力"""
-    # 尝试探测 eSCL
+    # 探测 eSCL：probe_escl 内部候选已含 http:80 与 https:443，
+    # **不需要**再补一轮 `port=443` —— 那一轮的请求 URL 集合与本轮
+    # 完全相同（port 形参此前被忽略），每台不可达设备多 4 次 HTTP 尝试
+    # + 最多约 3 秒延迟。probe_escl 的 port 形参 2026-10-21 起真正生效，
+    # 非标准端口由调用方显式传入即可。
     escl_url = probe_escl(ip, timeout=3.0)
-    if not escl_url:
-        # 也尝试 HTTPS
-        escl_url = probe_escl(ip, port=443, timeout=3.0)
 
     if not escl_url:
         return None  # WSD 发现但无 eSCL，暂不纳入
@@ -119,6 +120,67 @@ def _build_scanner_from_wsd(ip: str, svc) -> Optional[ScannerInfo]:
     return scanner
 
 
+def _merge_scanner_fields(target: ScannerInfo, other: ScannerInfo) -> None:
+    """
+    把 `other` 的信息**并进** `target`（就地修改）。
+
+    规则：
+      - 字符串字段（escl_url / model / serial / name / custom_name）：
+        空者被填；两者都有值时保留先到者（稳定、可预期）
+      - 布尔能力（has_adf / has_duplex / has_platen / capabilities_known）：
+        任一为真即真
+      - 列表能力（resolutions / color_modes / formats）：取并集
+      - 尺寸（max_width / max_height）：取更大者（默认值不是"没拿到"的标记）
+      - port：取先到者的非零值
+    """
+    for attr in ("escl_url", "model", "serial", "name", "custom_name"):
+        if not getattr(target, attr, "") and getattr(other, attr, ""):
+            setattr(target, attr, getattr(other, attr))
+    for attr in ("has_adf", "has_duplex", "has_platen", "capabilities_known"):
+        if getattr(other, attr, False):
+            setattr(target, attr, True)
+    for attr in ("resolutions", "color_modes", "formats"):
+        cur = list(getattr(target, attr, None) or [])
+        for v in (getattr(other, attr, None) or []):
+            if v not in cur:
+                cur.append(v)
+        setattr(target, attr, cur)
+    for attr in ("max_width", "max_height"):
+        try:
+            if int(getattr(other, attr, 0) or 0) > int(getattr(target, attr, 0) or 0):
+                setattr(target, attr, getattr(other, attr))
+        except (TypeError, ValueError):
+            pass
+    if not getattr(target, "port", 0) and getattr(other, "port", 0):
+        target.port = other.port
+
+
+def _merge_by_ip(scanners: list) -> list:
+    """
+    按 IP 去重：**合并**而不是"先到者胜"。
+
+    背景（独立核销 N-8）：mDNS 与 WSD 两条发现链路常同时发现同一台设备，
+    但它们给出的信息**互补** —— mDNS 侧构造的 ScannerInfo 不带 `escl_url`，
+    WSD 侧带。原实现按"先到者胜"去重，而 `results` 的顺序 = **线程完成
+    顺序**（不确定）⇒ mDNS 先完成时会留下 `escl_url=''` 的那条、把 WSD
+    侧探测到的 eSCL URL 丢掉 ⇒ `cli.py discover --format json` 的
+    escl_url 变成空串，同一台设备两次 discover 可能给出不同结果。
+
+    ⇒ 现在同一 IP 的多条结果取**并集**（escl_url / model / serial 等
+    谁有值取谁），同时仍然只产出一条 ScannerInfo。
+    """
+    merged: dict = {}
+    order: list = []
+    for s in scanners:
+        key = getattr(s, "ip", "")
+        if key not in merged:
+            merged[key] = s
+            order.append(key)
+            continue
+        _merge_scanner_fields(merged[key], s)
+    return [merged[k] for k in order]
+
+
 def discover_all_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     """
     并行使用 mDNS + WSD 发现扫描仪，按 IP 去重。
@@ -149,13 +211,9 @@ def discover_all_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     for t in threads:
         t.join(max(timeout + 2, 10))
 
-    # 按 IP 去重（优先保留 mDNS 结果，因为通常更完整）
-    seen_ips = set()
-    unique = []
-    for scanner in results:
-        if scanner.ip not in seen_ips:
-            seen_ips.add(scanner.ip)
-            unique.append(scanner)
+    # 按 IP 去重：同一 IP 的多条发现结果**合并**（escl_url / model / serial
+    # 等取并集），不再"先到者胜"（线程完成顺序不定 ⇒ 可能丢掉 eSCL URL）
+    unique = _merge_by_ip(results)
 
     logger.info(f"discover_all_scanners 完成: 共 {len(unique)} 台 (去重前 {len(results)} 台)")
     return unique

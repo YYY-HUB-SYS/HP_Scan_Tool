@@ -110,6 +110,14 @@ class ScannerInfo:
     color_modes: list = field(default_factory=lambda: ["RGB24", "Grayscale8"])
     formats: list = field(default_factory=lambda: ["image/jpeg", "application/pdf"])
     custom_name: str = ""
+    # ★ 能力是否**真的拿到过**（2026-10-21 落地终局方案）
+    # --------------------------------------------------------------
+    # 由 `fetch_capabilities` 在「HTTP 200 + XML 可解析」时置 True；
+    # 失败 / 超时 / 畸形 XML / 拿到的不是能力文档 ⇒ 保持 False。
+    # 这是"设备到底有没有 ADF"的**唯一权威信号** —— 不再靠
+    # "能力字段指纹前后有没有变"来猜（那种启发式在真实链路上有 3 条
+    # 失效路径，其中 2 条是系统性的，见 scan_coordinator 里的说明）。
+    capabilities_known: bool = False
 
     @property
     def display_name(self) -> str:
@@ -178,9 +186,38 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
     return listener.found
 
 
-def probe_escl(ip: str, port: int = 80, timeout: float = 2.0) -> Optional[str]:
-    """探测指定 IP 的 eSCL 服务（休眠唤醒仅用于 ReadTimeout）"""
-    bases = [f"http://{ip}:80", f"https://{ip}:443"]
+def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0) -> Optional[str]:
+    """
+    探测指定 IP 的 eSCL 服务（休眠唤醒仅用于 ReadTimeout）。
+
+    ★ `port` 语义（2026-10-21 修：此前该形参**被完全忽略**）
+    ------------------------------------------------------------------
+    改造前候选 base 恒为 `[http://{ip}:80, https://{ip}:443}]`，无论传什么
+    端口，于是：
+      - **非 80/443 端口的设备永远探不到**（形参形同虚设）；
+      - 调用方"再试一次 HTTPS"（`port=443`）请求的 URL 集合与上一轮
+        **完全相同** ⇒ 每台不可达设备多 4 次 HTTP 尝试 + 最多约 3 秒延迟。
+
+    现在的规则：
+      - `port` 不传（None，默认）⇒ 候选 `http://{ip}:80`、`https://{ip}:443`
+        —— 与改造前**逐字一致**，保证既有调用方行为不变；
+      - `port=80` ⇒ 同上（80 是标准 HTTP 端口，老候选已覆盖 `http:80`；
+        GUI 端口框默认值就是 80，保持不变以免回归）；
+      - `port=443` ⇒ 候选 `http://{ip}:443`、`https://{ip}:443`
+        （与上面那组**不相同** ⇒ 不再是重复探测）；
+      - 其它端口 P ⇒ 候选 `http://{ip}:P`、`https://{ip}:P`（非标端口设备可探）。
+    """
+    try:
+        port_no = int(port) if port is not None else None
+    except (TypeError, ValueError):
+        port_no = None
+    if not port_no or port_no == 80:
+        # 标准端口：保持老候选（http:80 + https:443）
+        bases = [f"http://{ip}:80", f"https://{ip}:443"]
+        wake_port = 80
+    else:
+        bases = [f"http://{ip}:{port_no}", f"https://{ip}:{port_no}"]
+        wake_port = port_no
     paths = ("/eSCL/ScannerStatus", "/ScannerStatus")
 
     def _try():
@@ -210,7 +247,7 @@ def probe_escl(ip: str, port: int = 80, timeout: float = 2.0) -> Optional[str]:
             import socket
             s = socket.socket()
             s.settimeout(0.5)
-            s.connect((ip, 80))
+            s.connect((ip, wake_port))
             s.close()
             time.sleep(1.5)
             r, _ = _try()
@@ -269,6 +306,13 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
     """
     从 /eSCL/ScannerCapabilities 解析扫描仪全部能力。
     直接修改传入的 scanner 对象（原地更新）。
+
+    ★ 能力是否"真的拿到"由 `scanner.capabilities_known` 表达（就地置位）：
+      - **置 True**：HTTP 200 且 XML 可解析（拿到了能力文档）
+      - **保持 False**：无 escl_url / 连接异常或超时 / 非 200（含 301→HTTPS
+        兜底后仍非 200）/ XML 畸形
+      - 已经 True 之后**不再清零**：能力一旦确认过就有效（后续一次查询失败
+        不该把"已知"降级回"未知"，否则会重新制造"假未知"⇒ 丢失自动回退）。
     """
     if not scanner.escl_url:
         return scanner
@@ -315,9 +359,15 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
 
         if status != 200:
             # ScannerCapabilities 失败 → 回退到 ScannerStatus 探测 ADF
+            # （注意：这不是能力文档 ⇒ capabilities_known 保持 False）
             _probe_adf_from_status(scanner, base, timeout)
             return scanner
         root = ET.fromstring(text)
+
+        # ★ 能力文档真的拿到了（HTTP 200 + XML 可解析）⇒ 置位"能力已知"。
+        # 这是"设备到底有没有 ADF"的**唯一权威信号**：不再靠"字段有没有变"
+        # 来猜（那种启发式在 WSD / GUI 链路上是幂等 no-op ⇒ 永远判"未知"）。
+        scanner.capabilities_known = True
 
         # 型号 / 序列号
         # HP 真机报的是 pwg:MakeAndModel，部分机型报 Model，两个都认，
