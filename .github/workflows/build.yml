@@ -9,9 +9,9 @@ on:
     branches: [ main ]
 
 jobs:
-  # 测试门禁：与打包并行、互不阻塞。
+  # 测试门禁：build 依赖 test，test 失败则不打包、不发版。
   # test 失败会让本次 workflow 标红（CI 界面可见红色 test job），
-  # 但 build 不依赖 test，打包与产物上传照常执行。
+  # 且 build/release 会被 needs 关系挡下，不产出 EXE、不发布 Release。
   test:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -35,6 +35,7 @@ jobs:
         run: python -m pytest tests/ -v
 
   build:
+    needs: test
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -64,7 +65,7 @@ jobs:
           retention-days: 30
 
   release:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/v')
