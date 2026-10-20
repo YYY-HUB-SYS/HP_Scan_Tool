@@ -303,15 +303,16 @@ class ScanCoordinator(QObject):
         决定实际扫描来源，返回 (实际来源, 是否探测到输稿器有纸)。
 
         requested 为协议值："Platen" / "Feeder" / "Auto"
-        - "Auto"：探测 ADF，有纸用 Feeder，否则 Platen
-        - "Feeder"：设备确有 ADF 能力时才探测，有纸用 Feeder，否则回退 Platen
-        - "Platen"：保持 Platen
+        - "Platen"：用户显式选了平板 → 保持 Platen，不探测也不覆盖
+        - "Feeder"：用户选了输稿器 → 探测到有纸才用 Feeder，否则回退 Platen
+        - "Auto"：探测决定，有纸用 Feeder 否则 Platen
         设备没有 ADF 能力或没有 eSCL 地址时，任何请求都落到 Platen。
-
-        注：探测默认常开 —— 设备确有 ADF 能力且探测到有纸时一律走 Feeder，
-        无论请求是 "Platen" 还是 "Feeder"（与 brief 提交的测试断言一致）。
         """
         has_adf = getattr(scanner, "has_adf", False)
+        if requested == "Platen":
+            # 用户显式选择平板：不探测、不覆盖。改造前的 GUI 也是
+            # "选平板就是平板"，这里必须保持一致，否则是行为回归。
+            return "Platen", False
         if not has_adf or not getattr(scanner, "escl_url", ""):
             return "Platen", False
         try:
@@ -319,12 +320,10 @@ class ScanCoordinator(QObject):
             loaded = bool(st.get("adf_loaded"))
         except Exception as e:
             logger.debug("ADF 状态检测失败，保持原来源: %s", e)
-            if requested in ("Platen", "Feeder"):
-                return requested, False
+            if requested == "Feeder":
+                return "Feeder", False
             return "Platen", False
-        if loaded:
-            return "Feeder", True
-        return "Platen", False
+        return ("Feeder", True) if loaded else ("Platen", False)
 
     def run_scan_sync(self, scanner, params: dict, cancel_event=None,
                       job_id: str = None) -> ScanResult:

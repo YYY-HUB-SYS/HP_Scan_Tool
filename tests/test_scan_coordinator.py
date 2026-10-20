@@ -63,11 +63,23 @@ class TestResolveSource:
         scanner.escl_url = ""
         assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
 
-    def test_adf_loaded_returns_feeder(self, coordinator, scanner):
+    def test_adf_loaded_returns_feeder_for_auto(self, coordinator, scanner):
         scanner.has_adf = True
         with mock.patch("scan_coordinator.get_scanner_status",
                         return_value={"state": "Idle", "adf_loaded": True}):
-            assert coordinator.resolve_source(scanner, "Platen") == ("Feeder", True)
+            assert coordinator.resolve_source(scanner, "Auto") == ("Feeder", True)
+
+    def test_platen_request_is_respected(self, coordinator, scanner):
+        """用户显式选平板时，即使 ADF 有纸也不得被切成 Feeder，且不发起探测。
+
+        改造前的 GUI `_detect_adf_source` 是"选平板就是平板"，这里必须保持一致，
+        否则用户选了平板却被拿输稿器扫，是行为回归。
+        """
+        scanner.has_adf = True
+        with mock.patch("scan_coordinator.get_scanner_status",
+                        return_value={"state": "Idle", "adf_loaded": True}) as probe:
+            assert coordinator.resolve_source(scanner, "Platen") == ("Platen", False)
+            assert probe.call_count == 0
 
     def test_adf_empty_returns_platen(self, coordinator, scanner):
         scanner.has_adf = True
@@ -114,7 +126,8 @@ class TestRunScanSync:
         with mock.patch("scan_coordinator.get_scanner_status",
                         return_value={"state": "Idle", "adf_loaded": True}), \
              mock.patch("scan_coordinator.execute_multipage_scan", return_value=pages):
-            result = coordinator.run_scan_sync(scanner, _params(tmp_path))
+            # 必须显式请求输稿器：显式选平板时不再探测，也不会切到 Feeder
+            result = coordinator.run_scan_sync(scanner, _params(tmp_path, source="ADF"))
         assert result.page_count == 3
         assert len(result.cached_paths) == 3
         assert result.source == "Feeder"
