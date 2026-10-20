@@ -74,12 +74,25 @@ def append(entry: dict) -> bool:
     2. 读不出来（OSError ⇒ _HistoryReadError）⇒ 放弃本次写入。
        读不出来 ≠ 内容为空，用空列表覆盖会把用户的全部历史静默清空。
     3. 其它异常（写失败等）⇒ 放弃本次写入并记 error 日志。
+
+    ★ 锁作用域（终审 I-2）：**跨进程锁在外、进程内锁在内**。
+      旧结构是「进程内锁 ⇒ 跨进程锁」⇒ 等跨进程锁（最长 30 秒）时
+      **攥着进程内锁** ⇒ 同进程其它线程（GUI 线程读一次历史）被连带
+      堵住 ⇒ 界面假死最长 30 秒。
+      现在等跨进程锁期间**不持有任何进程内锁**；进程内锁只保护
+      "读盘 → 改 → 写盘"那一小段事务体（见下方注释）。
     """
     entry.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
-    with _lock:
-        fpath = _history_file()
-        try:
-            with config_io.config_write_lock(fpath):
+    fpath = _history_file()
+    try:
+        # ── 跨进程锁（**最外层**）──────────────────────────────
+        # ★ 等待期间**不持有**进程内锁 ⇒ 同进程的读线程不被连带堵住。
+        with config_io.config_write_lock(fpath):
+            # ── 进程内锁（只保护事务体这一小段）───────────────
+            # 事务体整体在进程内锁内 ⇒ 同进程内不可能有两个线程同时做
+            # 读-改-写 ⇒ 不丢更新（既有护栏：8 线程 × 25 次 ⇒ 200/200）。
+            # 跨进程那一侧由上面的严格锁保证（两个进程各持一把文件锁）。
+            with _lock:
                 records = _load()
                 records.append(entry)
                 # 保留最近 500 条
@@ -87,16 +100,16 @@ def append(entry: dict) -> bool:
                     records = records[-500:]
                 if not _save(records):
                     return False
-        except config_io.ConfigLockTimeout as e:
-            logger.error("扫描历史追加被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
-            return False
-        except _HistoryReadError as e:
-            logger.error("扫描历史读取失败，本次追加已放弃（不覆盖原文件）: %s", e)
-            return False
-        except Exception as e:
-            logger.error("追加扫描历史失败: %s", e)
-            return False
-        return True
+    except config_io.ConfigLockTimeout as e:
+        logger.error("扫描历史追加被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
+        return False
+    except _HistoryReadError as e:
+        logger.error("扫描历史读取失败，本次追加已放弃（不覆盖原文件）: %s", e)
+        return False
+    except Exception as e:
+        logger.error("追加扫描历史失败: %s", e)
+        return False
+    return True
 
 
 def list_records(limit: int = 50) -> list:
@@ -113,20 +126,22 @@ def clear() -> bool:
     """清空所有历史记录。
 
     拿不到跨进程锁 ⇒ 本次**不清空**（原历史保持不变）并返回 False。
+
+    ★ 锁作用域同 append：**跨进程锁在外、进程内锁在内**（终审 I-2）。
     """
-    with _lock:
-        fpath = _history_file()
-        try:
-            with config_io.config_write_lock(fpath):
+    fpath = _history_file()
+    try:
+        with config_io.config_write_lock(fpath):
+            with _lock:
                 if not _save([]):
                     return False
-        except config_io.ConfigLockTimeout as e:
-            logger.error("清空扫描历史被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
-            return False
-        except Exception as e:
-            logger.error("清空扫描历史失败: %s", e)
-            return False
-        return True
+    except config_io.ConfigLockTimeout as e:
+        logger.error("清空扫描历史被跳过（拿不到跨进程锁，本次未写入）: %s（%s）", fpath, e)
+        return False
+    except Exception as e:
+        logger.error("清空扫描历史失败: %s", e)
+        return False
+    return True
 
 
 def _backup_corrupt(fpath: str):

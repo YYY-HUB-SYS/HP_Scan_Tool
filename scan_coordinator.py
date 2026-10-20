@@ -309,6 +309,19 @@ class ScanCoordinator(QObject):
     #             （拿不到跨进程锁 / 写盘异常）。
     #   ★ GUI 侧接线：连到状态栏提示"设置未生效"（接线点由 GUI 批次统一派发）。
     config_save_failed = Signal(str)
+    # ★ 终审 F-3：页元数据写入失败（`page_meta.set_page()` 返回 False）。
+    #   签名：page_meta_save_failed(job_id: str, page_no: int)
+    #     - job_id  ：该页所属的扫描任务 id
+    #     - page_no ：页号（1 基，与 page_meta 的页号一致）
+    #   触发条件：拿不到跨进程锁（等待超时）或 page_meta.json 已损坏
+    #             ⇒ `set_page()` 返回 False（**不抛异常**）。
+    #   ★ 为什么必须可见：页元数据里存着**原始尺寸 / 自动纠偏角 /
+    #     手动旋转 / 裁边框**。写不进去 ⇒ 用户看到"扫描成功"，产物却既没有
+    #     自动纠偏、也没有手动旋转（save_manager 读不到元数据就按 0 度处理）。
+    #   ★ 语义：**不中断整批扫描**（页已经扫到了）—— 用户更希望
+    #     "页扫到了、元数据没写上"并被告知，而不是整批作废。
+    #   ★ GUI 侧接线：连到状态栏 / 提示框（接线点需 GUI 批次补，本轮不动 GUI）。
+    page_meta_save_failed = Signal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -322,6 +335,12 @@ class ScanCoordinator(QObject):
         # 最近一次**配置写入尝试**的结果（没有尝试过 ⇒ True）。
         # 调用方（如 load_config 返回值必须是 dict 的老契约）可据此感知失败。
         self.last_config_save_ok: bool = True
+        # ★ 终审 F-3：本批扫描里**页元数据写入失败**的页数（每次 run_scan_sync
+        #   开头清零）。GUI 提示需要这个数字（"第 N 页的元数据没写上"）。
+        self.page_meta_failed_pages: int = 0
+        # ★ 终审 F-1：协调器是否**正在关闭**。关窗后完成的扫描不得交付结果
+        #   （GUI 会在主窗口销毁过程中弹预览框 ⇒ 卡死 / RuntimeError）。
+        self._shutting_down: bool = False
 
     # ── 配置 ──
 
@@ -614,6 +633,61 @@ class ScanCoordinator(QObject):
             return "Feeder", True, None
         return "Platen", False, None
 
+    def abandon_scan_result(self, job_id: str) -> None:
+        """
+        **放弃**一次扫描的结果：把 job 完全注销（不留受保护条目）。
+
+        用途：扫描已经完成（页已落盘），但结果**不交付**给用户
+        （关窗期间完成的扫描）⇒ 这时 job 不能留在 `_pending_jobs` 里
+        —— 受保护的 job 会被 eviction / stale 清理**双双跳过**
+        ⇒ 缓存目录永远占着磁盘（终审 F-1）。
+
+        与既有"失败/取消"路径保持同一套语义：
+          - 页元数据一并丢弃（`_discard_page_meta`）—— 取消/放弃的页
+            不该再带着"已扫描未保存"的元数据；
+          - 页**文件**留在缓存目录里（不删）—— 与既有取消路径一致
+            （GUI 的"从第 N 页重扫"要从缓存目录读回已扫到的页：
+            `_absorb_cancelled_pages` → `cache_manager.list_pages`）。
+            目录不再受保护 ⇒ 会被后续的 eviction / stale 清理回收。
+        """
+        try:
+            _discard_page_meta(job_id)
+        except Exception as e:       # pragma: no cover - 防御
+            logger.debug("放弃扫描结果时清页元数据失败 [%s]: %s", job_id, e)
+        try:
+            cache_manager.unregister_job(job_id)
+            cache_manager.unregister_pending_job(job_id)
+        except Exception as e:       # pragma: no cover - 防御
+            logger.debug("放弃扫描结果时注销 job 失败 [%s]: %s", job_id, e)
+
+    def _report_page_meta_failure(self, job_id: str, page_no: int) -> None:
+        """
+        页元数据写入失败 ⇒ **让用户看得见**（终审 F-3）。
+
+        `page_meta.set_page()` 在「拿不到跨进程锁」或「page_meta.json 已损坏」
+        时返回 False（**不抛异常**）⇒ 此前调用方把返回值丢了 ⇒ 页元数据
+        整批静默丢失：用户看到"扫描成功"，产物却既没有自动纠偏、
+        也没有手动旋转 / 裁边框（save_manager 读不到元数据就按 0 度处理）。
+
+        这里做三件事（缺一不可）：
+          ① 记 **error** 日志（默认日志级别下要看得见，不能只留 debug）；
+          ② 累计失败页数（`self.page_meta_failed_pages`，GUI 提示要用）；
+          ③ 发 `page_meta_save_failed(job_id, page_no)` 信号（GUI 接线成
+             状态栏 / 提示框；本模块**不 import 任何 GUI 控件**，只发信号）。
+
+        ★ **不中断整批扫描**：页已经扫到了，用户更希望"页扫到了、
+          元数据没写上"并被告知，而不是整批作废。
+        """
+        self.page_meta_failed_pages += 1
+        logger.error(
+            "页元数据未写入（job=%s page=%s）：该页将**没有**自动纠偏角、"
+            "手动旋转与裁边框（拿不到跨进程锁，或 page_meta.json 已损坏）",
+            job_id, page_no)
+        try:
+            self.page_meta_save_failed.emit(job_id, page_no)
+        except Exception as e:       # pragma: no cover - 对象已销毁等极端情况
+            logger.debug("发 page_meta_save_failed 信号失败: %s", e)
+
     def _note_skew(self, job_id: str, page_no: int, angle: float,
                    cache_path: str, streak: int, settings: dict) -> int:
         """
@@ -649,6 +723,8 @@ class ScanCoordinator(QObject):
         duplex = params.get("duplex", False)
         output_dir = params.get("output_dir") or DEFAULT_OUT_DIR
         requested = self._source_to_protocol(params.get("source", "平板"))
+        # 终审 F-3：本批的"页元数据写入失败"计数从 0 开始（GUI 提示要用）
+        self.page_meta_failed_pages = 0
 
         source, adf_detected, warning = self.resolve_source_detailed(scanner, requested)
         if warning:
@@ -703,7 +779,9 @@ class ScanCoordinator(QObject):
                     _check_cancel(cancel_event, job_id)
                     angle = _estimate_page_skew(data)
                     _check_cancel(cancel_event, job_id)
-                    _record_page_meta(job_id, i, data, path, deskew_angle=angle)
+                    if not _record_page_meta(job_id, i, data, path,
+                                             deskew_angle=angle):
+                        self._report_page_meta_failure(job_id, i)
                     skew_streak = self._note_skew(job_id, i, angle, path,
                                                  skew_streak, settings)
             else:
@@ -719,7 +797,9 @@ class ScanCoordinator(QObject):
                 _check_cancel(cancel_event, job_id)
                 angle = _estimate_page_skew(data)
                 _check_cancel(cancel_event, job_id)
-                _record_page_meta(job_id, 1, data, path, deskew_angle=angle)
+                if not _record_page_meta(job_id, 1, data, path,
+                                         deskew_angle=angle):
+                    self._report_page_meta_failure(job_id, 1)
                 self._note_skew(job_id, 1, angle, path, skew_streak, settings)
 
             # 文件名精度到**毫秒**（原先只到秒 ⇒ 同一秒内完成的两批会互相覆盖）
@@ -740,7 +820,12 @@ class ScanCoordinator(QObject):
             _discard_page_meta(job_id)
             # 失败/取消 ⇒ 完全注销：既不留受保护条目，也不让缓存目录
             # 永久堆积（不注销的话它的缓存目录永远不会被清理）。
+            # ★ 终审 F-1：`unregister_job` 只清 `_active_jobs`；这里再显式清
+            #   `_pending_jobs` ⇒ **无论走哪条分支**，job 都不会留在
+            #   "受保护且无人认领"的状态（受保护的 job 会被 eviction 与
+            #   stale 清理**双双跳过** ⇒ 缓存目录永不回收）。
             cache_manager.unregister_job(job_id)
+            cache_manager.unregister_pending_job(job_id)
             raise
 
         # 扫描成功 ⇒ 转成"已扫描未保存"，继续受 eviction 保护，
@@ -808,6 +893,11 @@ class ScanCoordinator(QObject):
 
     def shutdown(self) -> None:
         """取消全部在途任务并停止线程池。GUI 关闭时调用。"""
+        # ★ 终审 F-1：先标记"正在关闭"—— 关窗期间**恰好完成**的扫描不得
+        #   交付结果（GUI 会在主窗口销毁过程中弹预览框 ⇒ 卡死 / RuntimeError）。
+        #   这一条必须在置位取消事件**之前**做，否则线程池里的任务可能
+        #   在标志位写好之前就已经跑完。
+        self._shutting_down = True
         with QMutexLocker(self._cancel_mutex):
             events = list(self._cancel_events.values())
         for ev in events:
@@ -907,9 +997,20 @@ def _estimate_page_skew(data: bytes) -> float:
 
 
 def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str,
-                      deskew_angle: float = 0.0) -> None:
+                      deskew_angle: float = 0.0) -> bool:
     """
-    记录单页元数据（原始尺寸 + 缓存路径 + 纠偏角）。失败不影响扫描结果。
+    记录单页元数据（原始尺寸 + 缓存路径 + 纠偏角）。
+
+    返回**是否真的写入**（False = 本次**没有写入**）：
+      - `page_meta.set_page()` 在「拿不到跨进程锁（等待超时）」或
+        「page_meta.json 已损坏（已备份、拒绝覆盖）」时返回 False，
+        它**不抛异常** ⇒ 调用方**必须接住返回值**，否则页元数据会
+        **整批静默丢失**（终审 F-3：用户看到"扫描成功"，产物却既没有
+        自动纠偏、也没有手动旋转 / 裁边框）。
+      - 这里自身抛异常（读尺寸失败之类）⇒ 也按 False 返回。
+
+    ★ 失败**不影响扫描结果**（页已经扫到了）：调用方负责记 error 日志 +
+      发用户可见信号，但**不得**因此中断整批扫描。
 
     缓存里保留的永远是**原始扫描件**（不做任何像素改动），A4 归一与自动
     纠偏都推迟到落盘时做。原始尺寸必须在这里落盘，否则后续的自动纠偏/
@@ -937,15 +1038,23 @@ def _record_page_meta(job_id: str, page_no: int, data: bytes, cache_path: str,
             logger.debug("读取既有页元数据失败 [%s]: %s", job_id, e)
             existing = {}
         crop_rect = existing.get("crop_rect")
-        store.set_page(job_id, page_no, page_meta.PageMeta(
+        ok = store.set_page(job_id, page_no, page_meta.PageMeta(
             cache_path=cache_path, width=width, height=height,
             manual_rotation=_safe_int(existing.get("manual_rotation")),
             deskew_angle=_safe_float(deskew_angle),
             a4_normalized=bool(existing.get("a4_normalized", False)),
             crop_rect=tuple(crop_rect) if crop_rect else None,
         ))
+        if not ok:
+            # 终审 F-3：写不进去必须**记 error**（默认日志级别下看得见），
+            # 并由调用方发信号告知用户（不能只留一条 debug 日志）。
+            logger.error(
+                "页元数据写入被跳过（本次未写入）: job=%s page=%s"
+                "（拿不到跨进程锁，或 page_meta.json 已损坏）", job_id, page_no)
+        return bool(ok)
     except Exception as e:
-        logger.debug("写页元数据失败 [%s]: %s", job_id, e)
+        logger.error("写页元数据失败 [%s]: %s", job_id, e)
+        return False
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -1042,7 +1151,31 @@ class _ScanTask(QRunnable):
             result = coord.run_scan_sync(self._scanner, self._params,
                                          cancel_event=self._cancel_event,
                                          job_id=job_id)
-            if self._cancel_event.is_set():
+            # ★★ 终审 F-1：这里**不再**用取消标志复查结果 ★★
+            # ---------------------------------------------------------------
+            # 旧实现在 run_scan_sync 返回之后又读了一次 cancel_event.is_set()，
+            # 一旦为真就把一次**完全成功**的扫描改判成"已取消"：
+            #   ① 用户明明扫成功了，GUI 却显示"已取消"、不弹预览、不给保存入口
+            #      ⇒ 已经扫出来（纸上已经印过）的页**用户拿不到**；
+            #   ② 该 job 已经被 register_pending_job 登记进 `_pending_jobs`，
+            #      而取消分支**不会**再注销它 ⇒ 受保护的 job 会被
+            #      cache_manager._evict_oldest_jobs_locked 与 cleanup_stale
+            #      **双双跳过** ⇒ 缓存目录**永不回收**（终审实测：
+            #      `protected: {'jobR'}` + 缓存目录与 page_meta 均残留）。
+            #
+            # 判定条件（"取消优先"语义原样保留）：
+            #   - 取消发生在**取页之前 / 之中** ⇒ `run_scan_sync` 内部已经
+            #     抛 ScanCancelled（引擎侧的轮询检查 + 每页 write_page 之后的
+            #     `_check_cancel`）⇒ 落到下面的 `except EngineScanCancelled`
+            #     ⇒ 报"已取消"、不交付结果、job 完全注销。**这一条没变。**
+            #   - 取消发生在**成功之后**（页已落盘、元数据已写）⇒ 不改判，
+            #     扫描按**成功**交付。
+            # 换句话说：取消标志只在**取页窗口内**有话语权。
+            if coord._shutting_down:
+                # 关窗（GUI closeEvent → coordinator.shutdown()）期间恰好完成
+                # 的扫描：不交付结果 —— 交付会让 GUI 在主窗口销毁过程中弹
+                # 预览框。job 必须完全注销，否则留在受保护集合里永不回收。
+                coord.abandon_scan_result(job_id)
                 coord.scan_cancelled.emit(job_id)
             else:
                 coord.scan_finished.emit(job_id, result)
