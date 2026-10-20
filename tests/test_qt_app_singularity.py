@@ -14,9 +14,10 @@ pytest 连 traceback 都来不及打。单独跑任一文件都绿 ⇒ **跨文�
    且是 **function 级作用域** ⇒ 每个用例结束就把它**析构**掉。
 2. `tests/test_gui_consistency.py` 的 `qapp` fixture 写的是
    `QApplication.instance() or QApplication([])`。
-   当进程里只剩一个**已析构的 QCoreApplication** 时，
-   `QApplication.instance()` 返回的是**野指针**（非 None）⇒ `or` 短路
-   ⇒ **QApplication 从头到尾没被创建过**。
+   当进程里只有 QCoreApplication 时（实测：`type(x).__name__` 仍是
+   `QCoreApplication`、`isinstance(x, QApplication)` 为 **False**），
+   `QApplication.instance()` 返回的**就是那个 QCoreApplication**
+   （**非 None**）⇒ `or` 短路 ⇒ **QApplication 从头到尾没被创建过**。
 3. 下一个用例创建 `QCheckBox` ⇒ Qt 报
    `QWidget: Cannot create a QWidget without QApplication`
    ⇒ PySide6 在 C++ 侧 abort ⇒ 进程 0xC0000409 退出。
@@ -65,7 +66,7 @@ def test_process_holds_exactly_one_qapplication(qt_app):
     assert isinstance(core, QApplication), (
         "application 实例是 %s 而不是 QApplication —— QCoreApplication 与 "
         "QApplication 不能混用：QApplication.instance() 会把 QCoreApplication "
-        "当成 QApplication 返回（野指针），此后创建的 widget 必然崩"
+        "原样返回（非 None），`or` 因此短路，此后创建的 widget 必然崩"
         % type(core).__name__
     )
     assert QApplication.instance() is core
@@ -75,8 +76,10 @@ def test_no_test_module_instantiates_qcoreapplication():
     """
     任何测试模块都不得**自己 new 一个 QCoreApplication**。
 
-    function 级作用域的 QCoreApplication 会在用例结束时被析构，
-    留下的野指针会被后续 `QApplication.instance()` 当成合法实例取走。
+    实测：function 级作用域的 QCoreApplication **并不会被真正析构**
+    （`del` + `gc.collect()` 之后 `QCoreApplication.instance()` 依然返回它
+    —— PySide6 一直持有）⇒ 它会**长期占住** application 的位置，
+    后续 `QApplication.instance()` 每次都取到它。
     """
     import re
 
@@ -86,7 +89,8 @@ def test_no_test_module_instantiates_qcoreapplication():
         if re.search(r"QCoreApplication\s*\(\s*\[", text):
             offenders.append(path.name)
     assert offenders == [], (
-        "这些测试文件自己 new 了 QCoreApplication（用完即析构 ⇒ 留下野指针）：%s"
+        "这些测试文件自己 new 了 QCoreApplication（PySide6 不会释放它 ⇒ "
+        "它会长期占住 application 的位置）：%s"
         % offenders
     )
 

@@ -730,7 +730,8 @@ class TestRemovePagesFrom:
         assert reloaded is not None
         assert reloaded.full_rewrite is True
 
-        # 重启后再删一页并落盘 ⇒ 仍应是整体覆盖
+        # 重启后再删一页并落盘 ⇒ 已删的页仍不应复活
+        # （新语义是「删除优先」的三方合并，不再是"整体覆盖"）
         reloaded.remove_pages_from("jobA", 1)
         store.save(reloaded)
         disk = store.load(s.session_id)

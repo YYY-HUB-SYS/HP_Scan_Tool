@@ -473,6 +473,11 @@ def _ensure_ui_dispatcher():
     if _UI_DISPATCHER is None:
         _UI_DISPATCHER = _UiDispatcher()
         app = QApplication.instance()
+        # ★ 必须确认它**真的是** QApplication：进程里只有 QCoreApplication 时，
+        #   `QApplication.instance()` 返回的就是那个 QCoreApplication（非 None）
+        #   ⇒ 下面会拿错线程（实测 PySide6 按真实 C++ 类型包装，`isinstance` 是可靠判据）。
+        if not isinstance(app, QApplication):
+            app = None
         if app is not None and _UI_DISPATCHER.thread() is not app.thread():
             try:
                 _UI_DISPATCHER.moveToThread(app.thread())
@@ -3327,9 +3332,10 @@ class ScanApp(QMainWindow, _UiPostMixin):
             dropped = resume_from_page(session, job_id, page_no, drop_cache=True)
             if dropped:
                 logger.info("从第 %d 页重扫：丢弃 %d 页", page_no, len(dropped))
-                # ★ 立刻落盘：删页必须**活过落盘**（SessionStore.save 默认
-                #   merge=True 只进不退 ⇒ remove_pages_from 置位的 full_rewrite
-                #   标志会让 save 改走整体覆盖 ⇒ 磁盘上的副本也不会把页复活）。
+                # ★ 立刻落盘：删页必须**活过落盘**
+                #   （SessionStore.save 现在做 base/mine/theirs **三方逐页合并**：
+                #    「我删过的页」删除优先 ⇒ 已被我删掉的页不会被磁盘上的旧副本
+                #    复活；而并发追加的页两边都保留 ⇒ 不会像旧的整体覆盖那样吃掉它们）。
                 try:
                     self._session_store.save(session)
                 except Exception as e:
