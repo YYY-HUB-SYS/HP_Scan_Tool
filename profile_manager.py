@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 from config_io import (
     atomic_write_json as _atomic_write_json,
@@ -37,6 +38,9 @@ def _profile_path():
 
 _lock = threading.Lock()
 _profiles_cache = None
+_profiles_cache_time: float = 0
+# 内存缓存 TTL（E-4）：跨进程写入后，TTL 内读不到、TTL 外能读到。
+_PROFILES_CACHE_TTL = 2.0
 
 # ── 原子写 + 跨进程锁 ──────────────────────────────────────
 # 实现已收口到共享模块 config_io：
@@ -60,12 +64,23 @@ def _read_profiles_from_disk() -> dict:
 
 
 def _load_profiles():
-    """加载所有配置文件"""
-    global _profiles_cache
-    if _profiles_cache is not None:
+    """
+    加载所有配置文件（带**短 TTL** 的内存缓存，E-4）。
+
+    旧实现只在首次加载时读盘，跨进程写入永远读不到（get_profile /
+    get_all_profiles）。现在：TTL 内复用内存缓存，TTL 过期重新读盘 ——
+    TTL 语义：**TTL 内的外部改动读不到**（缓存命中），**TTL 外的外部改动
+    一定读得到**（重新读盘）。写路径（save_profile / delete_profile /
+    clear_all）锁内重读盘 + 写完立即刷新缓存，不受 TTL 影响。
+    """
+    global _profiles_cache, _profiles_cache_time
+    now = time.time()
+    if (_profiles_cache is not None
+            and (now - _profiles_cache_time) < _PROFILES_CACHE_TTL):
         return _profiles_cache
 
     _profiles_cache = _read_profiles_from_disk()
+    _profiles_cache_time = now
     return _profiles_cache
 
 
@@ -75,7 +90,7 @@ def _save_profiles(profiles):
 
     调用方须已持有 _file_lock（跨进程读-改-写事务由调用方加锁）。
     """
-    global _profiles_cache
+    global _profiles_cache, _profiles_cache_time
     path = _profile_path()
     try:
         _atomic_write_json(path, profiles)
@@ -83,6 +98,7 @@ def _save_profiles(profiles):
         logger.error("保存配置文件失败: %s", e)
         return
     _profiles_cache = profiles
+    _profiles_cache_time = time.time()
 
 
 def get_profile(ip: str) -> dict:

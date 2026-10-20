@@ -42,6 +42,8 @@ def cache_root(tmp_path, monkeypatch):
     monkeypatch.setattr(scan_coordinator.cache_manager, "_config_cache", None)
     monkeypatch.setattr(scan_coordinator.cache_manager, "_config_cache_time", 0)
     monkeypatch.setattr(scan_coordinator.cache_manager, "_active_jobs", set())
+    monkeypatch.setattr(scan_coordinator.cache_manager, "_pending_jobs", set())
+    monkeypatch.setattr(scan_coordinator.cache_manager, "_cache_size_cache", None)
     return root
 
 
@@ -69,9 +71,25 @@ def _params(tmp_path, **kw):
 
 
 class TestResolveSource:
-    def test_no_adf_capability_returns_platen(self, coordinator, scanner):
+    def test_known_no_adf_capability_returns_platen(self, coordinator, scanner):
+        """能力**已确认**且确实没有 ADF ⇒ 强制平板（设备真的不支持输稿器）。"""
         scanner.has_adf = False
+        scan_coordinator.mark_capabilities_known(scanner)
         assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
+
+    def test_unknown_capability_keeps_feeder(self, coordinator, scanner):
+        """F-3 回归护栏：能力**未知**（查询失败）时不得把用户选的输稿器改成平板。
+
+        改造前（基线 73c18f3）保留手动选择；本轮一度改成"has_adf 为假就落平板"
+        ⇒ 用户选了输稿器却扫了平板，界面零提示。现在能力未知时保留选择 + 提示。
+        """
+        scanner.has_adf = False
+        assert not scan_coordinator.capabilities_known(scanner)
+        assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
+        source, adf, warning = coordinator.resolve_source_detailed(
+            scanner, "Feeder")
+        assert (source, adf) == ("Feeder", False)
+        assert warning, "能力未知时必须给用户提示"
 
     def test_no_escl_url_returns_platen(self, coordinator, scanner):
         scanner.has_adf = True
@@ -132,24 +150,32 @@ class TestResolveSource:
             # Feeder 模式下：探测成功但没纸 -> 落 Platen（不是保留 Feeder）
             assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
 
-    @pytest.mark.parametrize("requested,probe_ok,adf_loaded,has_adf,expected", [
-        ("Platen", True, True, True, ("Platen", False)),   # 显式选平板：保持平板
-        ("Feeder", True, True, True, ("Feeder", True)),    # 选输稿器 + 有纸
-        ("Feeder", True, False, True, ("Platen", False)),  # 选输稿器 + 无纸
-        ("Feeder", False, False, True, ("Feeder", False)), # 选输稿器 + 探测失败：保留来源
-        ("Auto", True, True, True, ("Feeder", True)),      # 自动 + 有纸
-        ("Auto", True, False, True, ("Platen", False)),    # 自动 + 无纸
-        ("Auto", False, False, True, ("Platen", False)),   # 自动 + 探测失败
-        ("Feeder", True, True, False, ("Platen", False)),  # 设备无 ADF 能力
+    @pytest.mark.parametrize("requested,probe_ok,adf_loaded,has_adf,caps_known,expected", [
+        ("Platen", True, True, True, True, ("Platen", False)),   # 显式选平板：保持平板
+        ("Feeder", True, True, True, True, ("Feeder", True)),    # 选输稿器 + 有纸
+        ("Feeder", True, False, True, True, ("Platen", False)),  # 选输稿器 + 无纸
+        ("Feeder", False, False, True, True, ("Feeder", False)), # 选输稿器 + 探测失败：保留来源
+        ("Auto", True, True, True, True, ("Feeder", True)),      # 自动 + 有纸
+        ("Auto", True, False, True, True, ("Platen", False)),    # 自动 + 无纸
+        ("Auto", False, False, True, True, ("Platen", False)),   # 自动 + 探测失败
+        # 设备确实没有 ADF（能力已确认）⇒ 强制平板
+        ("Feeder", True, True, False, True, ("Platen", False)),
+        # 能力未知（查询失败）⇒ 保留用户显式选择，不再静默改成平板（F-3）
+        ("Feeder", True, True, False, False, ("Feeder", False)),
+        ("Auto", True, True, False, False, ("Platen", False)),
     ])
     def test_source_behavior_table(self, coordinator, scanner, requested,
-                                   probe_ok, adf_loaded, has_adf, expected):
-        """来源决策行为对照表：8 行必须同时成立。
+                                   probe_ok, adf_loaded, has_adf, caps_known,
+                                   expected):
+        """来源决策行为对照表：10 行必须同时成立。
 
         这是本次改造的验收契约——切到 probe_scanner_status 后，"探测失败"
-        与"设备合法上报 Unknown"必须仍然分得开。
+        与"设备合法上报 Unknown"必须仍然分得开；
+        并且"设备真的没有 ADF"与"我们没查到能力"必须分得开（F-3）。
         """
         scanner.has_adf = has_adf
+        if caps_known:
+            scan_coordinator.mark_capabilities_known(scanner)
         with mock.patch("scan_coordinator.probe_scanner_status",
                         return_value=(probe_ok,
                                       {"state": "Idle", "adf_loaded": adf_loaded})):

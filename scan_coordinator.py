@@ -17,6 +17,7 @@ from PIL import Image
 from PySide6.QtCore import QObject, QMutex, QMutexLocker, QRunnable, QThreadPool, Signal
 
 import cache_manager
+import config_io
 import history_manager
 import page_meta
 from escl_engine import (
@@ -43,6 +44,84 @@ SOURCE_MAP = {
 
 # 默认输出目录
 DEFAULT_OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
+
+# ── 用户可见提示文案（F-3）──
+WARN_CAPABILITY_UNKNOWN = (
+    "未能确认扫描仪的输稿器（ADF）能力（能力查询失败或超时），"
+    "已按您选择的「输稿器」继续扫描；若设备实际没有输稿器，扫描会直接报错。")
+WARN_NO_ADF = "该扫描仪不支持输稿器（ADF），已改为平板（Platen）扫描。"
+WARN_NO_PAPER = "输稿器（ADF）里没有纸，已改为平板（Platen）扫描。"
+WARN_PROBE_FAILED = "输稿器（ADF）状态探测失败，已按您选择的「输稿器」继续扫描。"
+
+# 参与"能力是否真的拿到"判定的字段（只看能力，不看身份字段）
+_CAPABILITY_FIELDS = ("has_adf", "has_duplex", "has_platen", "max_width",
+                      "max_height", "resolutions", "color_modes", "formats",
+                      "model", "serial")
+
+
+def capabilities_known(scanner) -> bool:
+    """
+    该扫描仪的 eSCL 能力是否**已经确认拿到**（F-3 临时判定）。
+
+    见 `mark_capabilities_known` 的说明。
+    """
+    return bool(getattr(scanner, "capabilities_known", False))
+
+
+def mark_capabilities_known(scanner, known: bool = True) -> None:
+    """
+    标记该扫描仪的 eSCL 能力是否已确认拿到。
+
+    ★ **临时方案**（F-3）：`escl_engine.ScannerInfo` 目前没有 capabilities_known
+    字段（`escl_engine.py` 不在本波次的文件所有权里），这里用**实例属性**承载。
+    —— escl_engine 将来补上同名字段后，本函数与 `capabilities_known()` 的语义
+    完全不变（同一个实例属性、同一个 True/False 含义），可直接平滑切换，
+    协调器侧不需要再改。
+    """
+    try:
+        setattr(scanner, "capabilities_known", bool(known))
+    except Exception as e:  # pragma: no cover - 极端情况：对象不允许加属性
+        logger.debug("标记扫描仪能力状态失败: %s", e)
+
+
+def _capability_fingerprint(scanner) -> tuple:
+    """能力字段指纹（list 转 tuple 便于比较）"""
+    values = []
+    for name in _CAPABILITY_FIELDS:
+        v = getattr(scanner, name, None)
+        if isinstance(v, list):
+            v = tuple(v)
+        values.append(v)
+    return tuple(values)
+
+
+def fetch_capabilities_tracked(scanner, timeout: float = 3.0):
+    """
+    调用 escl_engine.fetch_capabilities，并判定"能力是否真的拿到了"。
+
+    ★ **临时方案**（F-3）：`fetch_capabilities` 失败时只记 debug 日志并原样
+    返回 scanner，调用方无法区分「设备真的没有 ADF」与「我们没查到能力」。
+    这里用**能力字段指纹前后对比**判定：
+      - 查询成功 ⇒ 设备至少有一项能力字段与查询前不同（型号 / 序列号 /
+        分辨率 / 颜色模式 / 格式 / 最大尺寸 / 有无 ADF）⇒ 能力已知
+      - 查询失败（超时 / 连不上 / XML 解析失败）⇒ 字段原封不动 ⇒ 能力未知
+    判定只会"保守"地偏保守方向：能力未知时保留用户显式选择的来源，
+    绝不会静默把「输稿器」改成「平板」。
+
+    **终局方案**（推荐）：给 `ScannerInfo` 加 `capabilities_known: bool = False`
+    字段，由 `fetch_capabilities` 查询成功时置 True —— 那样所有调用方
+    （含 GUI / CLI / wsd_engine）自动拿到准确信号。
+    """
+    before = _capability_fingerprint(scanner)
+    try:
+        result = fetch_capabilities(scanner, timeout=timeout)
+    except Exception as e:
+        logger.debug("能力查询异常: %s", e)
+        result = scanner
+    after = _capability_fingerprint(result)
+    if after != before:
+        mark_capabilities_known(result, True)
+    return result
 
 
 class ScanCancelled(Exception):
@@ -104,13 +183,20 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    """原子写入 scan_config.json"""
+    """
+    原子写入 scan_config.json。
+
+    与 cache/history/profile 三家一致，收口到 config_io：
+      - atomic_write_json：mkstemp 唯一临时名 + 写后回读校验 + os.replace
+        （旧的固定临时名 `scan_config.json.tmp` 在并发写下会交错写，
+          产出**非法 JSON** 并被 os.replace 发布成正式配置 ⇒
+          下次 load_config 命中 JSONDecodeError 返回 {} ⇒ 用户设置整体丢失）
+      - config_lock：同目录 <name>.lock 跨进程排他锁
+    """
     path = os.path.join(_app_dir(), "scan_config.json")
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        with config_io.config_lock(path):
+            config_io.atomic_write_json(path, cfg)
     except Exception as e:
         logger.debug("配置保存失败: %s", e)
 
@@ -127,6 +213,9 @@ class ScanCoordinator(QObject):
     scan_finished = Signal(str, object)
     scan_failed = Signal(str, str)
     scan_cancelled = Signal(str)
+    # F-3：来源决策的**用户可见提示**（能力未确认 / 被回退到平板等）。
+    # GUI 侧接线：连到状态栏或 QMessageBox（接线点在片 3 修复波次）。
+    source_warning = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -194,7 +283,7 @@ class ScanCoordinator(QObject):
                 if url:
                     new_s = copy.copy(s)
                     new_s.escl_url = url
-                    new_s = fetch_capabilities(new_s, timeout=3.0)
+                    new_s = fetch_capabilities_tracked(new_s, timeout=3.0)
                     results[s.ip] = new_s
             on_complete(results)
         threading.Thread(target=_probe, daemon=True).start()
@@ -230,7 +319,7 @@ class ScanCoordinator(QObject):
                     d.escl_url = probe_escl(d.ip, timeout=2.0) or ""
                     logger.info(f"  probe_escl({d.ip}) -> {d.escl_url or '失败'}")
                     if d.escl_url:
-                        d = fetch_capabilities(d, timeout=2.0)
+                        d = fetch_capabilities_tracked(d, timeout=2.0)
                     return d
                 except Exception as e:
                     logger.error(f"  探活失败 {d.ip}: {e}")
@@ -280,11 +369,26 @@ class ScanCoordinator(QObject):
         """
         决定实际扫描来源，返回 (实际来源, 是否探测到输稿器有纸)。
 
+        契约不变（两元组）。需要同时拿到"提示信息"的调用方用
+        `resolve_source_detailed`。
+        """
+        source, adf_detected, _warning = self.resolve_source_detailed(scanner, requested)
+        return source, adf_detected
+
+    def resolve_source_detailed(self, scanner, requested: str) -> tuple:
+        """
+        决定实际扫描来源，返回 (实际来源, 是否探测到输稿器有纸, 提示信息或 None)。
+
         requested 为协议值："Platen" / "Feeder" / "Auto"
         - "Platen"：用户显式选了平板 → 保持 Platen，不探测也不覆盖
         - "Feeder"：用户选了输稿器 → 探测到有纸才用 Feeder，否则回退 Platen
         - "Auto"：探测决定，有纸用 Feeder 否则 Platen
-        设备没有 ADF 能力或没有 eSCL 地址时，任何请求都落到 Platen。
+
+        ★ F-3：必须区分「设备真的没有 ADF」与「我们没查到能力」。
+        能力查询失败/超时（`fetch_capabilities` 失败，has_adf 保持默认 False）
+        时，**保留用户显式选择的来源**并给出提示；绝不静默把「输稿器」
+        改成「平板」—— 用户选了输稿器却扫了平板且界面无任何提示，
+        正是本轮要消灭的失败模式。
 
         探测失败时**保留用户请求的来源**。probe_scanner_status 显式返回
         (探测是否成功, 状态字典)："探测失败"（连接失败 / 非 200 / XML 畸形，
@@ -296,16 +400,35 @@ class ScanCoordinator(QObject):
         是会失败报错的。保留来源后，扫描本身会去暴露问题（输稿器没纸时
         扫描失败），与改造前行为一致。
         """
-        has_adf = getattr(scanner, "has_adf", False)
         if requested == "Platen":
             # 用户显式选择平板：不探测、不覆盖。改造前的 GUI 也是
             # "选平板就是平板"，这里必须保持一致，否则是行为回归。
-            return "Platen", False
-        if not has_adf or not getattr(scanner, "escl_url", ""):
-            return "Platen", False
+            return "Platen", False, None
+
+        has_adf = bool(getattr(scanner, "has_adf", False))
+        escl_url = getattr(scanner, "escl_url", "")
+
+        if not has_adf:
+            if capabilities_known(scanner):
+                # 能力已确认（查询成功且解析结果里没有 Adf 段）
+                # ⇒ 设备真的没有 ADF ⇒ 强制平板。
+                if requested == "Feeder":
+                    return "Platen", False, WARN_NO_ADF
+                return "Platen", False, None
+            # 能力未知（查询失败/超时/解析不出 Adf 信息）
+            # ⇒ 按用户显式选择走，并把"能力未确认"提示给用户。
+            if requested == "Feeder":
+                return "Feeder", False, WARN_CAPABILITY_UNKNOWN
+            # Auto：机器决策，探测不出 ADF 能力就落平板（保持既有行为）
+            return "Platen", False, None
+
+        if not escl_url:
+            # 有 ADF 能力但没有 eSCL 地址：状态探测无从谈起
+            #（扫描本身也会以"未配置 eSCL URL"失败，错误是显性的）。
+            return "Platen", False, None
 
         try:
-            ok, st = probe_scanner_status(scanner.escl_url, timeout=5.0)
+            ok, st = probe_scanner_status(escl_url, timeout=5.0)
         except Exception as e:
             # 防御性：当前实现不抛异常，但接口契约上仍可能
             logger.debug("ADF 状态探测异常，保持原来源: %s", e)
@@ -316,14 +439,18 @@ class ScanCoordinator(QObject):
             # 注意：只看 ok，不看 state=="Unknown"——设备合法上报
             # <State>Unknown</State> 时 ok=True，不算探测失败。
             if requested == "Feeder":
-                return "Feeder", False
-            return "Platen", False
+                return "Feeder", False, WARN_PROBE_FAILED
+            return "Platen", False, None
 
         loaded = bool(st.get("adf_loaded"))
         if requested == "Feeder":
-            return ("Feeder", True) if loaded else ("Platen", False)
+            if loaded:
+                return "Feeder", True, None
+            return "Platen", False, WARN_NO_PAPER
         # requested == "Auto"
-        return ("Feeder", True) if loaded else ("Platen", False)
+        if loaded:
+            return "Feeder", True, None
+        return "Platen", False, None
 
     def run_scan_sync(self, scanner, params: dict, cancel_event=None,
                       job_id: str = None) -> ScanResult:
@@ -337,18 +464,28 @@ class ScanCoordinator(QObject):
         output_dir = params.get("output_dir") or DEFAULT_OUT_DIR
         requested = self._source_to_protocol(params.get("source", "平板"))
 
-        source, adf_detected = self.resolve_source(scanner, requested)
+        source, adf_detected, warning = self.resolve_source_detailed(scanner, requested)
+        if warning:
+            # F-3：能力未确认 / 来源被调整等**用户可见提示**（GUI 侧接线见报告）
+            logger.warning("来源提示 [%s]: %s", job_id, warning)
+            self.source_warning.emit(warning)
         color_mode = COLOR_MODE_MAP.get(color_mode_ui, "RGB24")
 
         if job_id is None:
             job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         cache_manager.register_job(job_id)
 
-        # try/finally 保证 job 一定被注销：注册过的 job 受 eviction 保护，
-        # 扫描失败（异常退出）时若不注销，它的缓存目录永远不会被清理，
-        # 缓存只增不减，上限机制形同虚设。
-        # 保存成功后 save_manager 会调 remove_job（内部同样 discard），
-        # discard 对不存在的 key 无副作用，重复注销是幂等安全的。
+        # job 的保护生命周期（F-4）：
+        #   扫描中      → register_job（_active_jobs，受 eviction 保护）
+        #   扫描成功    → register_pending_job（_pending_jobs，仍受保护）
+        #   扫描失败/取消 → unregister_job（完全注销，不留受保护条目）
+        #   落盘成功    → save_manager._finalize → remove_job（删目录 + 解除保护）
+        #   用户放弃    → cache_manager.unregister_pending_job（GUI 侧接线）
+        #
+        # 为什么"扫描成功"不能立刻注销：用户此时还在预览里没点保存，
+        # 可能挂几分钟；这段时间里另一条扫描把缓存顶过 95% 触发线时，
+        # FIFO 会把这个 job 目录删掉 ⇒ 用户预览里的页被静默跳过
+        # （产物少页 + 界面零提示）。⇒ "已扫描未保存"必须一直受保护。
         try:
             cached_paths = []
             ext = output_format
@@ -388,7 +525,7 @@ class ScanCoordinator(QObject):
                 output_dir,
                 f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}")
 
-            return ScanResult(
+            result = ScanResult(
                 job_id=job_id, ext=ext, page_count=len(cached_paths),
                 cached_paths=cached_paths, output_path=output_path,
                 source=source, adf_detected=adf_detected,
@@ -398,9 +535,15 @@ class ScanCoordinator(QObject):
             # 此时缓存目录可能还留着（孤儿清理按"目录已不存在"判定，
             # 兜不住这种情况），必须显式清掉，否则元数据永久残留。
             _discard_page_meta(job_id)
-            raise
-        finally:
+            # 失败/取消 ⇒ 完全注销：既不留受保护条目，也不让缓存目录
+            # 永久堆积（不注销的话它的缓存目录永远不会被清理）。
             cache_manager.unregister_job(job_id)
+            raise
+
+        # 扫描成功 ⇒ 转成"已扫描未保存"，继续受 eviction 保护，
+        # 直到落盘成功（remove_job）或用户放弃（unregister_pending_job）。
+        cache_manager.register_pending_job(job_id)
+        return result
 
     def start_scan(self, scanner, params: dict) -> str:
         """异步启动扫描，立即返回 job_id。结果通过信号通知。"""
@@ -441,24 +584,6 @@ class ScanCoordinator(QObject):
         if source_text in ("Platen", "Feeder", "Auto"):
             return source_text
         return "Platen"
-
-    def execute_wia_to_cache(self, resolution, color_mode_ui, output_format):
-        """WIA 降级扫描并写入缓存。返回 (job_id, ext, cache_path) 或 None。"""
-        from wia_engine import try_wia_scan
-        color_mode = COLOR_MODE_MAP.get(color_mode_ui, "RGB24")
-        result = try_wia_scan(
-            resolution=resolution,
-            color_mode_name=color_mode,
-            output_format=output_format,
-        )
-        if result:
-            data, ext = result
-            job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            cache_manager.register_job(job_id)
-            cache_path = cache_manager.write_page(job_id, 1, data, ext)
-            del data
-            return (job_id, ext, cache_path)
-        return None
 
     # ── 缓存清理 ──
 

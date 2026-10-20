@@ -50,8 +50,22 @@ _lock = threading.Lock()
 _CORRUPT_BACKED_UP = set()
 
 
+class _HistoryReadError(Exception):
+    """
+    历史文件**读不出来**（OSError：被杀毒/索引程序独占、PermissionError…）。
+
+    与"文件损坏"必须区分开：
+      - 损坏（JSON 解析失败 / 顶层不是数组）⇒ 原文已备份，可以从空开始写
+      - 读不出来 ⇒ 我们**根本不知道**文件里有什么 ⇒ 绝不能用空列表覆盖它
+    """
+
+
 def append(entry: dict):
-    """追加一条扫描记录。线程安全 + 跨进程安全（读-改-写全程持锁）。"""
+    """追加一条扫描记录。线程安全 + 跨进程安全（读-改-写全程持锁）。
+
+    读失败（OSError）时**放弃本次写入**并记 error 日志 ——
+    读不出来 ≠ 内容为空，用空列表覆盖会把用户的全部历史静默清空。
+    """
     entry.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
     with _lock:
         fpath = _history_file()
@@ -63,6 +77,8 @@ def append(entry: dict):
                 if len(records) > 500:
                     records = records[-500:]
                 _save(records)
+        except _HistoryReadError as e:
+            logger.error("扫描历史读取失败，本次追加已放弃（不覆盖原文件）: %s", e)
         except Exception as e:
             logger.error("追加扫描历史失败: %s", e)
 
@@ -70,7 +86,10 @@ def append(entry: dict):
 def list_records(limit: int = 50) -> list:
     """返回最近 limit 条记录，最新的在前。"""
     with _lock:
-        records = _load()
+        try:
+            records = _load()
+        except _HistoryReadError:
+            return []
     return list(reversed(records[-limit:]))
 
 
@@ -115,10 +134,13 @@ def _load() -> list:
     """
     读取扫描历史。
 
-    区分两种"读不到记录"：
+    区分三种"读不到记录"：
     - 文件不存在 → 正常首次运行，返回 []
     - 文件损坏（解析失败 / 编码乱码 / 顶层不是数组）→ 备份原文 + 记 error 日志，
       返回 []。原文不会丢：损坏内容留在 <name>.corrupt-<时间戳> 备份文件里。
+    - **读不出来**（OSError：被杀毒/索引程序独占、PermissionError…）→ 备份原文
+      （尽力而为）+ 抛 _HistoryReadError。调用方（append）据此**放弃写入**，
+      绝不能用空列表覆盖一个我们根本读不到的历史文件（F-7）。
     """
     fpath = _history_file()
     if not os.path.exists(fpath):
@@ -132,7 +154,9 @@ def _load() -> list:
         return []
     except OSError as e:
         logger.error("扫描历史文件读取失败: %s（%s）", fpath, e)
-        return []
+        # 读不出来也要尽力备份（文件被独占时备份可能失败，但不会抛）
+        _backup_corrupt(fpath)
+        raise _HistoryReadError(str(e)) from e
     if not isinstance(data, list):
         logger.error("扫描历史文件格式错误（期望数组）: %s", fpath)
         _backup_corrupt(fpath)

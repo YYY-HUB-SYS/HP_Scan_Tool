@@ -5,8 +5,14 @@
 
 PDF 路径（批次 2）：
 - 打印机只出图片，PDF 在本地合成（见 escl_engine.REQUEST_FORMAT）
-- 多页 PDF 两阶段流式合成，内存不随页数线性增长
+- 多页 PDF **两阶段**合成，内存特征分两段看：
+  * 阶段一（逐页转单页 PDF）：内存里同时只有一页 ⇒ **O(1)**
+  * 阶段二（pypdf 逐页 append 合并）：整份 PDF 读进内存 ⇒ **O(产物 PDF 体积)**
+    实测峰值 ≈ **2.1 × 最终 PDF 体积**（30 页 A4@300dpi：产物 100.0MB，
+    峰值 204.4MB），**随页数线性增长**
+  ⇒ 合并前用 `estimate_pdf_peak_bytes` 做体积预检（门禁 1.5GB）
 - 单页与多页 PDF 共用 _a4_canvas，页面尺寸必然一致
+- 最终 PDF 先写同目录临时文件、成功后再 os.replace（不留半截文件）
 """
 
 import io
@@ -14,6 +20,8 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from PIL import Image, UnidentifiedImageError
 
@@ -29,7 +37,101 @@ except ImportError:  # pragma: no cover - 缺依赖时给明确报错，而不�
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_output_name", "copy_to_extra_dirs", "save_pages", "save_single"]
+__all__ = [
+    "build_output_name", "copy_to_extra_dirs", "save_pages", "save_single",
+    "estimate_pdf_peak_bytes", "run_save_job",
+    "SaveRequest", "SaveResult", "SaveAborted",
+    "PDF_PEAK_FACTOR", "PDF_PEAK_LIMIT_BYTES",
+]
+
+# PDF 合成的内存峰值系数：实测阶段二峰值 ≈ 2.1 × 最终 PDF 体积
+PDF_PEAK_FACTOR = 2.1
+# PDF 合成的内存峰值门禁（与批次 4 门禁一致）：1.5GB
+PDF_PEAK_LIMIT_BYTES = int(1.5 * 1024 ** 3)
+
+
+class SaveAborted(RuntimeError):
+    """用户主动放弃保存（例如体积预检弹窗里选了「取消」）。"""
+
+
+class SaveResult(list):
+    """
+    save_pages 的返回值。
+
+    **行为与 list 完全一致**（现有调用方的 `if not saved_files` /
+    `saved_files[0]` / 迭代都不受影响），额外携带失败页信息 ——
+    让"产物少页"这件事能被调用方看到，而不是只累加一个局部计数。
+    """
+
+    def __init__(self, saved_files=(), failed_pages: int = 0,
+                 skipped_pages=None, warnings=None, saved_page_count: int = 0):
+        super().__init__(saved_files)
+        self.failed_pages = int(failed_pages)
+        # 被跳过的页在 page_specs 里的下标（0 基）
+        self.skipped_pages = list(skipped_pages or [])
+        self.warnings = list(warnings or [])
+        # 实际写出的**页数**（PDF 一个文件多页；图片一个文件一页）
+        self.saved_page_count = int(saved_page_count) if saved_page_count else len(self)
+
+    @property
+    def ok(self) -> bool:
+        return len(self) > 0
+
+
+@dataclass
+class SaveRequest:
+    """
+    后台保存任务的一次性入参（供 QThreadPool / QRunnable 使用）。
+
+    只装数据，不带任何 GUI 对象 —— 可以安全地跨线程传递。
+    """
+    job_id: str
+    ext: str
+    output_path: str
+    page_specs: list
+    groups: list
+    extra_dirs: list | None = None
+    device_name: str = ""
+    device_ip: str = ""
+    exposure: dict | None = None
+    # 体积预检的确认回调：收到提示文案，返回 False 表示用户放弃保存
+    confirm: Callable | None = field(default=None)
+
+
+def run_save_job(req: SaveRequest) -> SaveResult:
+    """
+    **后台保存入口**（纯函数，无 Qt 依赖，可直接放进 QRunnable 里跑）。
+
+    与 save_pages 等价，只是把入参打包成 SaveRequest，方便跨线程传递。
+    返回 SaveResult（list 子类），调用方从 `.failed_pages` /
+    `.skipped_pages` / `.warnings` 取失败页与提示。
+    """
+    return save_pages(req.job_id, req.ext, req.output_path, req.page_specs,
+                      req.groups, extra_dirs=req.extra_dirs,
+                      device_name=req.device_name, device_ip=req.device_ip,
+                      exposure=req.exposure, confirm=req.confirm)
+
+
+def estimate_pdf_peak_bytes(page_specs) -> int:
+    """
+    估算 PDF 合成的内存峰值（字节）。
+
+    依据：阶段二峰值 ≈ PDF_PEAK_FACTOR × 产物 PDF 体积；而产物体积与
+    **缓存页字节总量**同量级（同一批扫描内容的两种编码），所以用
+    "实际读到的缓存页文件大小求和"比猜 DPI 更准。
+
+    估算不出来（文件已被清理 / 读不到）时按 0 计 —— 宁可低估，
+    也不要把一次正常保存误判成超限。
+    """
+    total = 0
+    for item in page_specs or []:
+        path = item[0] if isinstance(item, (tuple, list)) else item
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            continue
+    return int(total * PDF_PEAK_FACTOR)
+
 
 
 def build_output_name(base: str, ext: str, group_count: int,
@@ -122,7 +224,14 @@ def _expose_and_rotate(img: Image.Image, rotation: int, exposure) -> Image.Image
 
 def _a4_canvas(img, dpi: int = 300) -> Image.Image:
     """
-    把图片居中放到 A4 画布上（不拉伸；超出画布的部分被裁掉）。
+    把图片居中放到 A4 画布上。
+
+    ★ **永不裁切内容**（E-1）：
+    画布固定按 300 DPI 计算（2480×3508），与扫描分辨率无关。
+    旧实现直接 `paste`，当源图比画布大时偏移为负 ⇒ PIL **裁切**而不是缩放：
+    600 DPI 扫描件（4960×7015）只剩中央 50%×50%，**页面 75% 的内容被切掉**。
+    现在源图大于画布时先**等比缩放**到能放进去再居中贴；
+    源图小于画布时保持"留白居中"。
 
     返回值**可能是入参本身**（入参已是 RGB 且尺寸恰好等于 A4 画布时），
     调用方必须用 `canvas is not img` 判断所有权，不能无条件 close() 入参。
@@ -136,7 +245,19 @@ def _a4_canvas(img, dpi: int = 300) -> Image.Image:
         if w == a4_w and h == a4_h:
             return rgb
         canvas = Image.new("RGB", (a4_w, a4_h), "white")
-        canvas.paste(rgb, ((a4_w - w) // 2, (a4_h - h) // 2))
+        if w > a4_w or h > a4_h:
+            # 源图大于画布 ⇒ 等比缩小后居中（绝不裁切）
+            scale = min(a4_w / w, a4_h / h)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            resized = rgb.resize((new_w, new_h), Image.LANCZOS)
+            try:
+                canvas.paste(resized, ((a4_w - new_w) // 2, (a4_h - new_h) // 2))
+            finally:
+                resized.close()
+        else:
+            # 源图小于画布 ⇒ 留白居中
+            canvas.paste(rgb, ((a4_w - w) // 2, (a4_h - h) // 2))
         return canvas
     finally:
         if rgb is not img:
@@ -201,18 +322,23 @@ def _open_page_image(cache_file: str, rotation: int = 0, exposure=None) -> Image
     return _expose_and_rotate(img, rotation, exposure)
 
 
-def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int, int]:
+def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int, int, list]:
     """
-    流式合成 PDF（单页/多页同一份代码）。返回 (成功页数, 失败页数)。
+    合成 PDF（单页/多页同一份代码）。返回 (成功页数, 失败页数, 失败页下标列表)。
 
     两阶段：
       阶段一（逐页，内存里同时只有一页）：
         缓存页 → 曝光 → 旋转 → A4 画布归一 → 写成单页 PDF 临时文件
       阶段二（逐页 append，不再载入图片像素）：
         PdfWriter.append(临时文件) → 写出最终 PDF
+        ⚠ 阶段二会把整份 PDF 读进内存 ⇒ 峰值 ≈ 2.1 × 产物 PDF 体积，
+          随页数线性增长（合并前用 estimate_pdf_peak_bytes 做体积预检）。
 
     临时文件放在系统临时目录（tempfile.mkdtemp），用完即删；
     不落缓存目录（会被 eviction 清掉，也会污染缓存大小统计）。
+
+    ★ 最终 PDF **先写同目录临时文件、成功后再 os.replace**（E-2）：
+    磁盘满 / MemoryError 中途失败时，最终路径上不会留下半截文件。
     """
     if PdfWriter is None:
         raise RuntimeError("缺少 pypdf 依赖，无法合成 PDF（请 pip install pypdf）")
@@ -220,6 +346,7 @@ def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int
     tmp_dir = tempfile.mkdtemp(prefix="hp_scan_pdf_")
     tmp_files = []
     failed = 0
+    failed_idx: list[int] = []
     try:
         for idx, (cache_file, rotation) in enumerate(pages, 1):
             tmp_pdf = os.path.join(tmp_dir, f"page_{idx:04d}.pdf")
@@ -235,19 +362,44 @@ def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int
                 tmp_files.append(tmp_pdf)
             except Exception as e:
                 failed += 1
+                failed_idx.append(idx - 1)
                 logger.warning("PDF 页面转换失败，已跳过 [%s]: %s", cache_file, e)
 
         if not tmp_files:
-            return 0, failed
+            return 0, failed, failed_idx
 
         writer = PdfWriter()
         for tmp in tmp_files:
             writer.append(tmp)          # 逐页 append，不是一次性传列表
-        with open(out_path, "wb") as f:
-            writer.write(f)
-        return len(tmp_files), failed
+        _write_pdf_atomically(writer, out_path)
+        return len(tmp_files), failed, failed_idx
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _write_pdf_atomically(writer, out_path: str) -> None:
+    """
+    把合并好的 PDF 写到最终路径：先写同目录临时文件，成功后 os.replace。
+
+    失败（磁盘满 / MemoryError）时最终路径**不出现**半截文件，
+    临时文件被清理掉。
+    """
+    directory = os.path.dirname(os.path.abspath(out_path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(out_path) + ".", suffix=".tmp")
+    os.close(fd)
+    try:
+        with open(tmp_path, "wb") as f:
+            writer.write(f)
+        os.replace(tmp_path, out_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def copy_to_extra_dirs(saved_files, extra_dirs) -> None:
@@ -273,7 +425,12 @@ def _remove_page_meta(job_id: str) -> None:
 
 def _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
               page_count, ext, exposure=None):
-    """额外目录复制 + 清缓存 + 清页元数据 + 写历史"""
+    """额外目录复制 + 清缓存 + 清页元数据 + 写历史
+
+    page_count 必须是**实际写出的页数**（不是请求的页数）：
+    有页被跳过时，历史里的页数必须与产物一致，否则"历史显示 30 页、
+    实际 PDF 只有 25 页"这种不一致会一直误导用户（F-4）。
+    """
     copy_to_extra_dirs(saved_files, extra_dirs)
     if job_id:
         cache_manager.remove_job(job_id)
@@ -315,7 +472,8 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
 
     if ext == "pdf":
         # PDF 走本地合成，和多页 PDF 同一份代码 → 页面尺寸必然一致
-        ok, _failed = _write_pdf([(cache_path, rotation)], final, exposure=exposure)
+        ok, _failed, _failed_idx = _write_pdf([(cache_path, rotation)], final,
+                                              exposure=exposure)
         if not ok:
             raise RuntimeError(f"PDF 生成失败（缓存页无法转换为图片）: {cache_path}")
     else:
@@ -331,31 +489,73 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
     return final
 
 
+def _precheck_pdf_volume(page_specs, confirm, warnings) -> None:
+    """
+    PDF 合并前的**体积预检**（F-5）。
+
+    阶段二峰值 ≈ 2.1 × 产物 PDF 体积，随页数线性增长。估算峰值超过
+    门禁（1.5GB）时，在**开始合并前**提示用户，并给"仍然继续"的选项 ——
+    绝不静默截断（少页比失败更糟）。
+
+    confirm 为 None（无 GUI 回调）时：只记 warning 并继续，
+    提示文案进 warnings，交给调用方展示。
+    """
+    peak = estimate_pdf_peak_bytes(page_specs)
+    if peak < PDF_PEAK_LIMIT_BYTES:
+        return
+    msg = (f"预计 PDF 合成内存峰值约 {peak / 1024 / 1024:.0f}MB，"
+           f"超过 {PDF_PEAK_LIMIT_BYTES / 1024 / 1024:.0f}MB 门禁，"
+           f"可能耗尽内存导致保存失败。仍要继续吗？")
+    if confirm is None:
+        logger.warning("%s", msg)
+        warnings.append(msg)
+        return
+    if not confirm(msg):
+        raise SaveAborted(msg)
+
+
 def save_pages(job_id: str, ext: str, output_path: str,
                page_specs: list[tuple[str, int]], groups: list[list[int]],
                extra_dirs=None,
                device_name: str = "", device_ip: str = "",
-               exposure=None) -> list[str]:
+               exposure=None,
+               confirm: Callable | None = None) -> SaveResult:
     """
     多页保存（可分组）。
 
     page_specs: [(缓存文件路径, 旋转角度), ...]，按页序
     groups:     对 page_specs 的索引分组，list[list[int]]
     exposure:   曝光参数（文档级，所有页同一份），语义同 save_single。
-    返回实际落盘的文件路径列表
+    confirm:    体积预检的确认回调（收到提示文案，返回 False 表示放弃保存）。
+                None ⇒ 只记 warning 并继续（提示进返回值的 .warnings）。
+
+    返回 **SaveResult**（list 子类）：
+      - 迭代 / len / [0] 与普通 list 完全一致（现有调用方不受影响）
+      - `.failed_pages`   失败页数
+      - `.skipped_pages`  被跳过的页在 page_specs 里的下标（0 基）
+      - `.saved_page_count` 实际写出的页数
+      - `.warnings`       提示文案（如体积预检提示）
     """
     base = output_path.rsplit(".", 1)[0]
     group_count = len(groups)
     saved_files = []
     failed_pages = 0
+    skipped_pages: list[int] = []
+    warnings: list[str] = []
+    saved_page_count = 0
     exposure_active = _exposure_params(exposure) is not None
 
     for gi, group_indices in enumerate(groups, 1):
         if ext == "pdf":
             pages = [page_specs[page_idx] for page_idx in group_indices]
             pdf_path = build_output_name(base, ext, group_count, gi, 1)
-            ok, failed = _write_pdf(pages, pdf_path, exposure=exposure)
+            # 体积预检：在开始合并**之前**提示（不静默截断）
+            _precheck_pdf_volume(pages, confirm, warnings)
+            ok, failed, failed_idx = _write_pdf(pages, pdf_path, exposure=exposure)
             failed_pages += failed
+            # failed_idx 是组内下标 ⇒ 映射回 page_specs 的全局下标
+            skipped_pages.extend(group_indices[i] for i in failed_idx)
+            saved_page_count += ok
             if not ok:
                 logger.warning("PDF 分组 %d 没有任何页面转换成功，跳过: %s", gi, pdf_path)
                 continue
@@ -375,8 +575,10 @@ def save_pages(job_id: str, ext: str, output_path: str,
                         finally:
                             img.close()
                     saved_files.append(fpath)
+                    saved_page_count += 1
                 except Exception as e:
                     failed_pages += 1
+                    skipped_pages.append(page_idx)
                     logger.warning("保存页失败 [%s]: %s", cache_file, e)
 
     # 一页都没存下来时必须报错：否则调用方（GUI）会"提示成功但产出 0 个文件"
@@ -384,6 +586,9 @@ def save_pages(job_id: str, ext: str, output_path: str,
         raise RuntimeError(
             f"没有成功保存任何页面（共 {len(page_specs)} 页，失败 {failed_pages} 页）")
 
+    # 历史里的页数必须是**实际写出的页数**，不能是请求的页数
     _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
-              len(page_specs), ext, exposure=exposure)
-    return saved_files
+              saved_page_count or len(saved_files), ext, exposure=exposure)
+    return SaveResult(saved_files, failed_pages=failed_pages,
+                       skipped_pages=skipped_pages, warnings=warnings,
+                       saved_page_count=saved_page_count)

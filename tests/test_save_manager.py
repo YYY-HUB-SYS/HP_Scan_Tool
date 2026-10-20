@@ -34,6 +34,8 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(cache_manager, "_config_cache", None)
     monkeypatch.setattr(cache_manager, "_config_cache_time", 0)
     monkeypatch.setattr(cache_manager, "_active_jobs", set())
+    monkeypatch.setattr(cache_manager, "_pending_jobs", set())
+    monkeypatch.setattr(cache_manager, "_cache_size_cache", None)
     hist = str(tmp_path / "history.json")
     monkeypatch.setattr(history_manager, "_history_file", lambda: hist)
     monkeypatch.setattr(history_manager, "HISTORY_FILE", None)

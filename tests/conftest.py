@@ -66,5 +66,8 @@ def isolated_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(cache_manager, "_config_cache", None)
     monkeypatch.setattr(cache_manager, "_config_cache_time", 0)
     monkeypatch.setattr(cache_manager, "_active_jobs", set())
+    # 重置"已扫描未保存"保护集合与缓存大小增量计数（换根目录后旧计数无效）
+    monkeypatch.setattr(cache_manager, "_pending_jobs", set())
+    monkeypatch.setattr(cache_manager, "_cache_size_cache", None)
 
     return cache_root
