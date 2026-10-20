@@ -29,10 +29,15 @@ import scan_coordinator  # noqa: E402
 
 
 @pytest.fixture(scope="module")
-def qapp():
-    from PySide6.QtWidgets import QApplication
-    app = QApplication.instance() or QApplication([])
-    yield app
+def qapp(qt_app):
+    """整个模块共用**会话级** QApplication（offscreen，不显示窗口）。
+
+    ★ 复用 `tests/conftest.py` 的会话级实例 —— 自己写
+      `QApplication.instance() or QApplication([])` 正是 0xC0000409 那个崩溃的
+      成因（`instance()` 会把 QCoreApplication 当成 QApplication 返回）。
+      `tests/test_qt_app_singularity.py` 有一条守护测试专门盯着这个。
+    """
+    return qt_app
 
 
 class _FakeMessageBox:
