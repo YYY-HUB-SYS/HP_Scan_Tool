@@ -1270,19 +1270,18 @@ QRadioButton::indicator:checked {
 
 
 def _page_no_from_path(path) -> int:
-    """从缓存文件名解析页号（`page_003.jpg` → 3）；解析不出来返回 0"""
-    name = os.path.basename(str(path))
-    if not name.startswith("page_"):
-        return 0
-    digits = ""
-    for ch in name[5:]:
-        if not ch.isdigit():
-            break
-        digits += ch
-    try:
-        return int(digits) if digits else 0
-    except ValueError:
-        return 0
+    """从缓存文件名解析页号（`page_003.jpg` / `crop_page_003.jpg` → 3）；解析不出来返回 0
+
+    ★ 与 `save_manager.page_no_from_path` **同一套口径**（终审 Important I-1）：
+      本函数此前只认 `page_` 前缀（`crop_page_003.jpg` → **0**），而
+      `save_manager` 用正则 `page_(\\d+)\\.`（同一文件 → **3**）
+      ⇒ 同一文件两处解析出**不同页号** ⇒ 多个解析不出的页会**全是 0**
+      ⇒ 产生**重复的合并键** `(job_id, page_no, side)`
+      ⇒ 落盘时三方合并用 dict 覆盖 ⇒ **静默丢页、且没有任何报错**。
+      ⇒ 现在**只有 save_manager 一处实现**，这里转发过去。
+    """
+    no = save_manager.page_no_from_path(path)
+    return int(no) if no is not None else 0
 
 
 def session_merged_pages(session) -> list:

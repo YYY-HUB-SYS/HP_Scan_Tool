@@ -252,6 +252,12 @@ class DocumentSession:
 
         - `page_nos` 缺省时按该 job 内已有页号续编（从 1 开始）；
           调用方已知真实页号时应显式传入（缓存文件名是 page_NNN.ext）。
+        - ★ **重复的合并键会被自动改号**（终审 Important I-1）：
+          合并键是 `(job_id, page_no, side)`；若两页键相同，落盘时的三方合并
+          要把页列表建成 `dict` ⇒ **后者覆盖前者** ⇒ **静默丢页、没有任何报错**
+          （终审实测：3 页 → 2 页）。
+          ⇒ 这里在**入口**就把重复键改掉：不抛异常（GUI 槽里抛异常会打断流程）、
+            不丢页、并记 warning。
         - 返回新建的 PageRef 列表。
         """
         if side not in SIDES:
@@ -262,9 +268,18 @@ class DocumentSession:
             if len(page_nos) != len(paths):
                 raise ValueError("page_nos 长度必须与 page_paths 一致")
         next_no = self._next_page_no(job_id)
+        used = {(p.job_id, p.page_no, p.side) for p in self.pages}
         created = []
         for i, path in enumerate(paths):
             page_no = int(page_nos[i]) if page_nos is not None else next_no
+            key = (str(job_id), page_no, side)
+            if key in used:
+                # ★ 合并键重复 ⇒ 落盘时会**静默丢页** ⇒ 这里改成不冲突的页号
+                page_no = self._next_free_page_no(job_id, side, used)
+                logger.warning(
+                    "页号重复：%s 的第 %d 页（%s）已存在 ⇒ 改用第 %d 页，"
+                    "避免落盘时静默丢页", job_id, key[1], side, page_no)
+            used.add((str(job_id), page_no, side))
             created.append(PageRef(
                 cache_path=str(path),
                 job_id=str(job_id),
@@ -275,6 +290,13 @@ class DocumentSession:
         self.pages.extend(created)
         self.updated_at = time.time()
         return created
+
+    def _next_free_page_no(self, job_id: str, side: str, used: set) -> int:
+        """该 job 该 side 内第一个**未被占用**的页号（合并键不得重复）。"""
+        n = self._next_page_no(job_id)
+        while (str(job_id), n, side) in used:
+            n += 1
+        return n
 
     def remove_pages_from(self, job_id: str, page_no: int,
                           drop_cache: bool = True) -> list:

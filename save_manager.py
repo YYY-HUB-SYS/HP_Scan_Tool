@@ -213,6 +213,21 @@ def _page_no_from_path(path) -> int | None:
         return None
 
 
+def page_no_from_path(path) -> int | None:
+    """
+    ★ **公开** API：从缓存页文件名里认页号（`page_003.jpg` / `crop_page_003.jpg` 都认）。
+
+    ★ 为什么必须是公开的、且只有这一处实现（终审 Important I-1）：
+      GUI 的 `_page_no_from_path` 与本模块的 `_page_no_from_path` 曾经**各写各的**：
+      GUI 只认 `page_` 前缀（`crop_page_003.jpg` → **0**），
+      本模块用正则 `page_(\\d+)\\.`（同一文件 → **3**）⇒ 同一文件两处解析出
+      **不同页号** ⇒ 多个解析不出的页会**全是 0** ⇒ 产生**重复的合并键**
+      `(job_id, page_no, side)` ⇒ 落盘时三方合并用 dict 覆盖 ⇒ **静默丢页**。
+      ⇒ 页号解析**只保留这一处实现**，GUI 侧转发到这里。
+    """
+    return _page_no_from_path(path)
+
+
 def load_job_deskew_angles(job_id: str) -> tuple[dict, dict]:
     """
     读某 job 的页元数据 ⇒ (按页号, 按缓存路径) 的纠偏角表。
