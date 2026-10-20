@@ -54,25 +54,6 @@ def _auto_enhance(img: Image.Image) -> Image.Image:
     return result_channels[0]
 
 
-def _stretch_channel(ch_img, lo_pct=0.01, hi_pct=0.99):
-    """对单通道做直方图拉伸。lo_pct/hi_pct 为裁剪比例（0~1），越小拉伸越激进。"""
-    hist = ch_img.histogram()
-    total = sum(hist)
-    lo, hi, acc = 0, 255, 0
-    for i, count in enumerate(hist):
-        acc += count
-        if acc >= total * lo_pct and lo == 0 and i > 0:
-            lo = i - 1
-        if acc >= total * hi_pct:
-            hi = i
-            break
-    if hi <= lo:
-        return ch_img
-    scale = 255.0 / (hi - lo)
-    lut = [max(0, min(255, int((v - lo) * scale))) for v in range(256)]
-    return ch_img.point(lut)
-
-
 def _gamma_lut(gamma: float) -> list:
     """生成 gamma 校正 LUT。gamma > 1 变亮，< 1 变暗。"""
     inv = 1.0 / gamma

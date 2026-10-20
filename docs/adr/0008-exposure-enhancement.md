@@ -20,8 +20,21 @@
 ### 预设系统
 - 内置预设：「文字增强」「照片还原」「去灰底」「旧文件修复」
 - 用户可自定义预设，保存当前所有曝光参数为命名预设
-- 预设存储为 JSON 文件（`presets.json`，与 scan_config.json 同级）
-- 预设数据结构：`{name, mode, brightness, contrast, gamma, shadows, highlights, r_gain, g_gain, b_gain}`
+- 预设存储为 JSON 文件（`%APPDATA%\HP_Scan_Tool\presets.json`，与 scan_config.json 同级）
+- 预设数据结构：`{name, mode, brightness, contrast, gamma, shadows, highlights, channel_gains: [r, g, b], builtin: bool}`
+
+> 2026-10-20 订正：实现采用 `channel_gains` 三元素数组 + `builtin` 标记。
+>
+> 本节原先写的 `{..., r_gain, g_gain, b_gain}` 是设计稿，与实际实现不符；
+> 代码（`preset_manager.py` / `exposure.apply_exposure`）一直用的是
+> `channel_gains` 三元素数组，且 `builtin` 字段用于区分「内置不可删」与用户自定义。
+> 以代码为准订正本 ADR —— 为迁就文档去改能跑的代码不划算。
+>
+> - `channel_gains`: 三元素数组 `[r, g, b]`，默认 `[1.0, 1.0, 1.0]`；
+>   落盘为 JSON 时是数组，传入 `apply_exposure` 时规范化为 tuple `(1.0, 1.0, 1.0)`
+>   （列表与元组比较不相等，不规范化会误触发通道增益分支）。
+> - `builtin`: bool，`True` = 内置预设（不可删除），`False` = 用户自定义。
+>   `preset_manager.load_presets()` 会把用户预设强制置为 `builtin=False`。
 
 ### apply_exposure 扩展
 统一入口 apply_exposure 扩展参数：

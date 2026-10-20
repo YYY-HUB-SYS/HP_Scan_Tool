@@ -17,8 +17,10 @@ from PIL import Image
 
 import cache_manager
 import history_manager
+import preset_manager
 import profile_manager
 import save_manager
+from exposure import apply_exposure
 from scan_coordinator import (
     ScanCoordinator, ScannerInfo, save_config, load_config,
     _label_for, _ip_label_for, DEFAULT_OUT_DIR,
@@ -79,6 +81,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
     QTabWidget, QTextEdit, QSplitter, QToolBar, QToolButton,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect,
+    QSlider, QInputDialog,
 )
 
 # ────────── 设计系统常量 ──────────
@@ -195,6 +198,27 @@ def add_fade_animation(widget, duration=ANIM["normal"]):
     anim.setEasingCurve(QEasingCurve.OutCubic)
     anim.start()
     return anim
+
+
+# ────────── 跨线程 UI 投递 ──────────
+class _UiPostMixin:
+    """
+    跨线程 UI 投递：工作线程 → 主线程。
+
+    QTimer.singleShot 在工作线程里不会触发（批次 3 已修的 Critical），
+    统一走 Signal(object) 队列连接：worker 线程 emit → 主线程槽里执行。
+
+    ScanApp 与两个预览对话框共用这一份实现。
+    """
+    _ui_post = Signal(object)
+
+    def _run_ui_post(self, fn):
+        """在主线程执行投递过来的可调用对象"""
+        fn()
+
+    def _post_ui(self, fn):
+        """从任意线程安全地把 fn 投递到主线程执行"""
+        self._ui_post.emit(fn)
 
 
 # ────────── 自定义 Widget ──────────
@@ -702,14 +726,14 @@ def apply_cache_settings(config: dict, limit_mb: int, trigger_percent: int,
 
 
 # ────────── 主窗口 ──────────
-class ScanApp(QMainWindow):
+class ScanApp(QMainWindow, _UiPostMixin):
     """主窗口（UI 优化版）"""
 
     # 跨线程信号：发现完成
     discover_finished = Signal()
 
-    # 工作线程 → 主线程的通用 UI 投递（QTimer.singleShot 在工作线程里不会触发）
-    _ui_post = Signal(object)
+    # 预览里设置的曝光参数 —— 直接保存模式沿用（跳过预览时没有别的来源）
+    _exposure_state = None
 
     def __init__(self):
         super().__init__()
@@ -743,6 +767,8 @@ class ScanApp(QMainWindow):
         self.extra_dirs = self.cfg.get("extra_dirs", [])
         self.disabled_ips = set(self.cfg.get("disabled_ips", []))
         self.cards = []
+        # 预览里设置的曝光参数 —— 直接保存模式沿用（跳过预览时没有别的来源）
+        self._exposure_state = None
 
         # 先构建界面（隐藏状态）
         self._setup_ui()
@@ -770,14 +796,6 @@ class ScanApp(QMainWindow):
 
         # 延迟 100ms 确保加载界面渲染后再开始设备探测
         QTimer.singleShot(100, self._do_startup_scan)
-
-    def _run_ui_post(self, fn):
-        """在主线程执行投递过来的可调用对象"""
-        fn()
-
-    def _post_ui(self, fn):
-        """从任意线程安全地把 fn 投递到主线程执行"""
-        self._ui_post.emit(fn)
 
     def _setup_ui(self):
         self.setWindowTitle("HP Scan Tool v4.0")
@@ -1546,17 +1564,21 @@ class ScanApp(QMainWindow):
 
         save_pages 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
         设备名/IP 取自当前选中设备；未选中设备时留空，不报错。
+        曝光参数沿用最近一次预览里设置的（跳过预览时没有别的来源）。
         """
         scanner = self.selected
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = (scanner.ip or "") if scanner else ""
         page_specs = [(path, 0) for path in result.cached_paths]
         groups = [list(range(len(page_specs)))]
+        # 曝光参数沿用最近一次预览里设置的（跳过预览时没有别的来源）。
+        # getattr：ScanApp 的最小替身（只借用方法）可能没有这个属性。
+        exposure = getattr(self, "_exposure_state", None)
         try:
             saved_files = save_manager.save_pages(
                 result.job_id, result.ext, result.output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs or [], device_name=dev_name,
-                device_ip=dev_ip)
+                device_ip=dev_ip, exposure=exposure)
         except Exception as e:
             logger.error("直接保存失败: %s", e, exc_info=True)
             QMessageBox.critical(self, "保存失败", f"直接保存失败: {e}")
@@ -1602,14 +1624,20 @@ class ScanApp(QMainWindow):
         self.status_bar.showMessage(f"扫描失败: {msg[:50]}")
 
     # ────────── 预览对话框 ──────────
+    def set_exposure_state(self, exposure):
+        """记住预览里设置的曝光参数（直接保存模式沿用同一份参数）。"""
+        self._exposure_state = dict(exposure) if exposure else None
+
     def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         """显示单页预览"""
         self._reset_scan_ui()
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
+        exposure = getattr(self, "_exposure_state", None)
         dialog = PreviewDialog(self, cache_path, ext, output_path, job_id,
                                device_name=dev_name, device_ip=dev_ip,
-                               extra_dirs=self.extra_dirs)
+                               extra_dirs=self.extra_dirs,
+                               exposure=exposure)
         dialog.exec()
 
     def _show_multi_preview(self, job_id, ext, output_path, page_count, scanner=None):
@@ -1617,9 +1645,11 @@ class ScanApp(QMainWindow):
         self._reset_scan_ui()
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = scanner.ip if scanner else ""
+        exposure = getattr(self, "_exposure_state", None)
         dialog = MultiPagePreviewDialog(self, job_id, ext, output_path, page_count,
                                         device_name=dev_name, device_ip=dev_ip,
-                                        extra_dirs=self.extra_dirs)
+                                        extra_dirs=self.extra_dirs,
+                                        exposure=exposure)
         dialog.exec()
 
     # ────────── 监听模式 ──────────
@@ -2102,12 +2132,378 @@ class ScanApp(QMainWindow):
         dialog.exec()
 
 
+# ────────── 曝光工具条 ──────────
+class ExposurePanel(QWidget):
+    """
+    曝光工具条 —— 预览时实时调参。
+
+    面板只管「参数状态 + 控件」，不管图像怎么渲染：
+    参数变化时发 params_changed，由预览对话框负责重算并刷新 QPixmap。
+    工具条可折叠，默认收起（不挤占预览空间）。
+    """
+
+    params_changed = Signal()      # 参数变化 → 需要重算预览
+    mode_changed = Signal(str)     # 模式变化（"off" / "auto" / "manual"）
+
+    MODE_OFF = "off"
+    MODE_AUTO = "auto"
+    MODE_MANUAL = "manual"
+
+    DEBOUNCE_MS = 200              # 拖滑块防抖：连续拖动不连续重算
+
+    # key, 标签, 滑块最小, 滑块最大, 默认, 缩放系数（滑块值 × 缩放 = 参数值）
+    # gamma 的参数域是 0.1~3.0 ⇒ 滑块 10~300、缩放 0.01（默认 100 ⇒ 1.00）
+    _SLIDER_SPECS = (
+        ("brightness", "明暗", -100, 100, 0, 1),
+        ("contrast", "对比度", -100, 100, 0, 1),
+        ("gamma", "伽马", 10, 300, 100, 0.01),
+        ("shadows", "阴影", -100, 100, 0, 1),
+        ("highlights", "高光", -100, 100, 0, 1),
+        ("r_gain", "R", 50, 150, 100, 0.01),
+        ("g_gain", "G", 50, 150, 100, 0.01),
+        ("b_gain", "B", 50, 150, 100, 0.01),
+    )
+
+    def __init__(self, parent=None, exposure=None):
+        super().__init__(parent)
+        self._mode = self.MODE_OFF
+        self._params = {
+            "brightness": 0, "contrast": 0, "gamma": 1.0,
+            "shadows": 0, "highlights": 0,
+            "channel_gains": [1.0, 1.0, 1.0],
+        }
+        self._suppress = False
+        self._sliders = {}        # key -> (QSlider, 缩放系数)
+        self._value_labels = {}   # key -> QLabel
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(self.DEBOUNCE_MS)
+        self._debounce.timeout.connect(self._emit_params_changed)
+
+        self._setup_ui()
+        self.set_exposure(exposure)
+        self.reload_presets()
+
+    # ────────── 构建 ──────────
+    def _setup_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(SPACING["sm"])
+
+        # 折叠头（默认收起）
+        self.header_btn = QToolButton()
+        self.header_btn.setText("曝光")
+        self.header_btn.setCheckable(True)
+        self.header_btn.setChecked(False)
+        self.header_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.header_btn.setArrowType(Qt.RightArrow)
+        self.header_btn.setStyleSheet(
+            f"QToolButton {{ border: none; color: {COLORS['text_secondary']}; "
+            f"font-weight: 600; }}")
+        self.header_btn.toggled.connect(self._on_header_toggled)
+        root.addWidget(self.header_btn)
+
+        # 折叠体
+        self.body = QFrame()
+        self.body.setStyleSheet(
+            f"QFrame {{ background: {COLORS['surface']}; "
+            f"border: 1px solid {COLORS['border']}; border-radius: {RADIUS['md']}px; }}")
+        body = QVBoxLayout(self.body)
+        body.setContentsMargins(SPACING["sm"], SPACING["sm"],
+                               SPACING["sm"], SPACING["sm"])
+        body.setSpacing(SPACING["sm"])
+
+        # 第 1 行：模式 + 预设 + 保存/删除
+        row = QHBoxLayout()
+        row.setSpacing(SPACING["sm"])
+
+        row.addWidget(QLabel("模式"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("关闭", self.MODE_OFF)
+        self.mode_combo.addItem("自动（去灰底）", self.MODE_AUTO)
+        self.mode_combo.addItem("手动", self.MODE_MANUAL)
+        self.mode_combo.setFixedWidth(130)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        row.addWidget(self.mode_combo)
+
+        row.addWidget(QLabel("预设"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(130)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        row.addWidget(self.preset_combo)
+
+        self.save_preset_btn = QPushButton("保存当前为预设")
+        self.save_preset_btn.clicked.connect(self._save_current_preset)
+        row.addWidget(self.save_preset_btn)
+
+        self.delete_preset_btn = QPushButton("删除预设")
+        self.delete_preset_btn.clicked.connect(self._delete_current_preset)
+        row.addWidget(self.delete_preset_btn)
+
+        row.addStretch()
+        body.addLayout(row)
+
+        # 第 2 行起：手动参数滑块
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(SPACING["md"])
+        grid.setVerticalSpacing(SPACING["xs"])
+        for idx, spec in enumerate(self._SLIDER_SPECS):
+            grid.addWidget(self._make_slider(*spec), idx // 3, idx % 3)
+        grid.setColumnStretch(3, 1)
+        body.addLayout(grid)
+
+        root.addWidget(self.body)
+        self.body.setVisible(False)
+
+    def _make_slider(self, key, label, lo, hi, default, scale):
+        """一个带标签和数值显示的滑块。返回容器 widget。"""
+        box = QWidget()
+        lay = QHBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(SPACING["xs"])
+
+        lbl = QLabel(label)
+        lbl.setFixedWidth(36)
+        lay.addWidget(lbl)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(lo, hi)
+        slider.setValue(default)
+        slider.setMinimumWidth(90)
+        slider.valueChanged.connect(self._on_slider_changed)
+        lay.addWidget(slider, 1)
+
+        val = QLabel("")
+        val.setFixedWidth(44)
+        val.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        lay.addWidget(val)
+
+        self._sliders[key] = (slider, scale)
+        self._value_labels[key] = val
+        return box
+
+    # ────────── 状态读写 ──────────
+    def exposure_dict(self):
+        """
+        当前曝光参数。关闭时返回 None（save_manager 收到 None ⇒ 与改造前完全一致）。
+
+        channel_gains 统一成 tuple —— 列表与元组比较不相等，
+        不规范化会让 apply_exposure 误判「通道增益有改动」。
+        """
+        if self._mode == self.MODE_OFF:
+            return None
+        gains = tuple(round(float(g), 3) for g in self._params["channel_gains"])
+        return {
+            "mode": self._mode,
+            "brightness": int(self._params["brightness"]),
+            "contrast": int(self._params["contrast"]),
+            "gamma": float(self._params["gamma"]),
+            "shadows": int(self._params["shadows"]),
+            "highlights": int(self._params["highlights"]),
+            "channel_gains": gains,
+        }
+
+    def set_exposure(self, exposure):
+        """回填曝光参数（不触发重算 —— 回填后由调用方决定要不要重算）。"""
+        prev = self._suppress
+        self._suppress = True
+        try:
+            if not exposure:
+                self._mode = self.MODE_OFF
+                self._params = {
+                    "brightness": 0, "contrast": 0, "gamma": 1.0,
+                    "shadows": 0, "highlights": 0,
+                    "channel_gains": [1.0, 1.0, 1.0],
+                }
+            else:
+                self._mode = str(exposure.get("mode") or self.MODE_OFF)
+                gains = list(exposure.get("channel_gains") or (1.0, 1.0, 1.0))
+                if len(gains) != 3:
+                    gains = [1.0, 1.0, 1.0]
+                self._params = {
+                    "brightness": int(exposure.get("brightness") or 0),
+                    "contrast": int(exposure.get("contrast") or 0),
+                    "gamma": float(exposure.get("gamma") or 1.0),
+                    "shadows": int(exposure.get("shadows") or 0),
+                    "highlights": int(exposure.get("highlights") or 0),
+                    "channel_gains": [float(g) for g in gains],
+                }
+
+            idx = self.mode_combo.findData(self._mode)
+            if idx >= 0:
+                self.mode_combo.setCurrentIndex(idx)
+            self._sync_sliders()
+            self._update_value_labels()
+            self._update_manual_enabled()
+        finally:
+            self._suppress = prev
+
+    def _sync_sliders(self):
+        """把参数状态写回滑块。"""
+        prev = self._suppress
+        self._suppress = True
+        try:
+            for key, (slider, scale) in self._sliders.items():
+                if key == "r_gain":
+                    value = self._params["channel_gains"][0]
+                elif key == "g_gain":
+                    value = self._params["channel_gains"][1]
+                elif key == "b_gain":
+                    value = self._params["channel_gains"][2]
+                else:
+                    value = self._params[key]
+                slider.setValue(int(round(value / scale)))
+        finally:
+            self._suppress = prev
+
+    def _read_sliders(self):
+        """把滑块当前值写回参数状态。"""
+        for key, (slider, scale) in self._sliders.items():
+            value = slider.value() * scale
+            if key == "r_gain":
+                self._params["channel_gains"][0] = round(value, 3)
+            elif key == "g_gain":
+                self._params["channel_gains"][1] = round(value, 3)
+            elif key == "b_gain":
+                self._params["channel_gains"][2] = round(value, 3)
+            elif key == "gamma":
+                self._params["gamma"] = round(value, 2)
+            else:
+                self._params[key] = int(round(value))
+
+    def _update_value_labels(self):
+        for key, (slider, scale) in self._sliders.items():
+            value = slider.value() * scale
+            if key in ("r_gain", "g_gain", "b_gain"):
+                text = f"{value:.2f}"
+            elif key == "gamma":
+                text = f"{value:.2f}"
+            else:
+                text = f"{int(round(value)):+d}" if value else "0"
+            self._value_labels[key].setText(text)
+
+    def _update_manual_enabled(self):
+        """只有「手动」模式才允许调参数。"""
+        enabled = self._mode == self.MODE_MANUAL
+        for slider, _scale in self._sliders.values():
+            slider.setEnabled(enabled)
+
+    # ────────── 交互 ──────────
+    def _on_header_toggled(self, checked):
+        self.body.setVisible(checked)
+        self.header_btn.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+    def _on_mode_changed(self, _index):
+        if self._suppress:
+            return
+        self._mode = self.mode_combo.currentData() or self.MODE_OFF
+        self._debounce.stop()
+        self._update_manual_enabled()
+        self.mode_changed.emit(self._mode)
+        self.params_changed.emit()
+
+    def _on_slider_changed(self, _value):
+        if self._suppress:
+            return
+        self._read_sliders()
+        self._update_value_labels()
+        self._update_manual_enabled()
+        # 拖滑块防抖：连续拖动时不连续重算
+        self._debounce.start()
+
+    def _emit_params_changed(self):
+        self.params_changed.emit()
+
+    # ────────── 预设 ──────────
+    def reload_presets(self):
+        """刷新预设下拉（内置 + 用户自定义）。"""
+        current = self.preset_combo.currentData()
+        prev = self._suppress
+        self._suppress = True
+        try:
+            self.preset_combo.clear()
+            self.preset_combo.addItem("（不使用预设）", None)
+            for p in preset_manager.load_presets():
+                self.preset_combo.addItem(p.get("name", ""), p.get("name"))
+            idx = self.preset_combo.findData(current)
+            self.preset_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self._suppress = prev
+        self._update_delete_enabled()
+
+    def _find_preset(self, name):
+        for p in preset_manager.load_presets():
+            if p.get("name") == name:
+                return p
+        return None
+
+    def _on_preset_selected(self, _index):
+        if self._suppress:
+            return
+        name = self.preset_combo.currentData()
+        if not name:
+            return
+        preset = self._find_preset(name)
+        if not preset:
+            return
+        self.set_exposure(preset)          # 回填模式与全部参数
+        self._update_delete_enabled()
+        self.params_changed.emit()         # 套用后立即重算
+
+    def _save_current_preset(self):
+        name, ok = QInputDialog.getText(self, "保存预设", "预设名称：")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+        preset = {
+            "name": name,
+            "mode": self._mode,
+            "brightness": int(self._params["brightness"]),
+            "contrast": int(self._params["contrast"]),
+            "gamma": float(self._params["gamma"]),
+            "shadows": int(self._params["shadows"]),
+            "highlights": int(self._params["highlights"]),
+            "channel_gains": [round(float(g), 3)
+                              for g in self._params["channel_gains"]],
+        }
+        preset_manager.save_user_preset(preset)
+        self.reload_presets()
+        idx = self.preset_combo.findData(name)
+        if idx >= 0:
+            self.preset_combo.setCurrentIndex(idx)
+
+    def _delete_current_preset(self):
+        name = self.preset_combo.currentData()
+        if not name:
+            return
+        preset = self._find_preset(name)
+        if preset is None:
+            return
+        if preset.get("builtin"):
+            QMessageBox.information(self, "提示", "内置预设不可删除")
+            return
+        preset_manager.delete_user_preset(name)
+        self.reload_presets()
+
+    def _update_delete_enabled(self):
+        name = self.preset_combo.currentData()
+        builtin = False
+        if name:
+            preset = self._find_preset(name)
+            builtin = bool(preset and preset.get("builtin"))
+        self.delete_preset_btn.setEnabled(bool(name) and not builtin)
+        self.delete_preset_btn.setToolTip("内置预设不可删除" if builtin else "")
+
+
 # ────────── 预览对话框 ──────────
-class PreviewDialog(QDialog):
+class PreviewDialog(QDialog, _UiPostMixin):
     """单页预览对话框（UI 优化版）"""
 
     def __init__(self, parent, cache_path, ext, output_path, job_id,
-                 device_name="", device_ip="", extra_dirs=None):
+                 device_name="", device_ip="", extra_dirs=None, exposure=None):
         super().__init__(parent)
         self.cache_path = cache_path
         self.ext = ext
@@ -2118,11 +2514,15 @@ class PreviewDialog(QDialog):
         self.extra_dirs = extra_dirs or []
         self._rotation = 0
         self._cropped = False
+        # 递增 token：auto 重算完成后用它判断结果是否已过期
+        self._exposure_token = 0
+        self._initial_exposure = exposure
 
         self.setWindowTitle("扫描预览")
         self.setMinimumSize(520, 420)
         self.resize(620, 520)
 
+        self._ui_post.connect(self._run_ui_post)
         self._setup_ui()
         self._show_image()
         add_fade_animation(self, ANIM["normal"])
@@ -2140,6 +2540,11 @@ class PreviewDialog(QDialog):
         self.info_label.setAlignment(Qt.AlignCenter)
         self.info_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
         layout.addWidget(self.info_label)
+
+        # 曝光工具条（可折叠，默认收起）
+        self.exposure_panel = ExposurePanel(self, exposure=self._initial_exposure)
+        self.exposure_panel.params_changed.connect(self._on_exposure_changed)
+        layout.addWidget(self.exposure_panel)
 
         # 按钮
         btn_layout = QHBoxLayout()
@@ -2169,26 +2574,90 @@ class PreviewDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-    def _show_image(self):
+    # ────────── 曝光 ──────────
+    def _on_exposure_changed(self):
+        """曝光参数变化 → 重算预览。"""
+        self._recompute_preview()
+
+    def _recompute_preview(self):
+        """
+        按当前曝光参数重算预览。
+
+        性能（300dpi A4 实测）：manual 约 0.022s ⇒ 同步重算无感；
+        auto 约 0.37s/页 ⇒ 放工作线程算，完了经 _post_ui 回主线程刷新 QPixmap。
+        """
+        self._exposure_token += 1
+        token = self._exposure_token
+        params = self.exposure_panel.exposure_dict()
+        if not params or params.get("mode") != ExposurePanel.MODE_AUTO:
+            self._show_image()
+            return
+        rotation = self._rotation
+        threading.Thread(target=self._auto_worker,
+                         args=(token, params, rotation), daemon=True).start()
+
+    def _auto_worker(self, token, params, rotation):
+        """工作线程：全分辨率 auto 曝光（约 0.37s/页），不碰任何控件。"""
+        img = None
+        err = None
         try:
-            img = Image.open(self.cache_path)
+            img = self._load_and_expose(params)
+            if rotation:
+                img = img.rotate(rotation, expand=True)
+        except Exception as e:
+            err = e
+            img = None
+        self._post_ui(lambda: self._on_auto_result(token, img, err))
+
+    def _on_auto_result(self, token, img, err):
+        """主线程：接收 auto 重算结果。过期结果直接丢弃（否则旧结果会盖掉新结果）。"""
+        if token != self._exposure_token:
+            return
+        if img is None:
+            self.info_label.setText(f"预览失败: {err}")
+            return
+        self._set_preview(img)
+
+    def _load_and_expose(self, params):
+        """读缓存页并应用曝光（顺序固定：曝光 → 旋转）。"""
+        with Image.open(self.cache_path) as src:
+            img = src.copy()
+        return apply_exposure(img, **params)
+
+    # ────────── 渲染 ──────────
+    def _show_image(self):
+        """同步渲染预览（曝光 → 旋转）。"""
+        try:
+            params = self.exposure_panel.exposure_dict()
+            with Image.open(self.cache_path) as src:
+                img = src.copy()
+            if params:
+                img = apply_exposure(img, **params)
             if self._rotation:
                 img = img.rotate(self._rotation, expand=True)
+        except Exception as e:
+            self.info_label.setText(f"预览失败: {e}")
+            return
+        self._set_preview(img)
+
+    def _set_preview(self, img):
+        """把 PIL 图像刷到预览区（PIL 已旋转，不重复旋转）。"""
+        try:
             pixmap = pil_to_qpixmap(img)
             self.image_viewer.set_image(pixmap, rotation=0)  # PIL已旋转，不重复
             w, h = img.size
             rot_text = f" (旋转 {self._rotation}°)" if self._rotation else ""
             self.info_label.setText(f"{w} × {h}{rot_text}")
-        except Exception as e:
-            self.info_label.setText(f"预览失败: {e}")
+        finally:
+            img.close()
 
     def _rotate_left(self):
         self._rotation = (self._rotation - 90) % 360
-        self._show_image()
+        self._recompute_preview()
 
     def _rotate_right(self):
         self._rotation = (self._rotation + 90) % 360
-        self._show_image()
+        self._recompute_preview()
 
     def _auto_crop(self):
         cache = self.cache_path
@@ -2208,18 +2677,23 @@ class PreviewDialog(QDialog):
                     f.write(buf.getvalue())
                 self._cropped = True
                 self._rotation = 0
-                self._show_image()
+                self._recompute_preview()
         except Exception as e:
             self.info_label.setText(f"裁边失败: {type(e).__name__}")
 
     def _confirm(self):
         """保存"""
+        exposure = self.exposure_panel.exposure_dict()
         try:
             saved = save_manager.save_single(
                 self.cache_path, self.ext, self.output_path,
                 rotation=self._rotation, extra_dirs=self.extra_dirs,
                 job_id=self.job_id, device_name=self.device_name,
-                device_ip=self.device_ip)
+                device_ip=self.device_ip, exposure=exposure)
+            # 曝光设置回写给主窗口 —— 直接保存模式沿用同一份参数
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "set_exposure_state"):
+                parent.set_exposure_state(exposure)
             self.accept()
             try:
                 os.startfile(os.path.dirname(saved))
@@ -2249,13 +2723,13 @@ def adjust_splits_after_delete(splits, page_idx: int):
     return new_splits
 
 
-class MultiPagePreviewDialog(QDialog):
+class MultiPagePreviewDialog(QDialog, _UiPostMixin):
     """多页预览对话框（UI 优化版）"""
 
     TW, TH = 80, 100
 
     def __init__(self, parent, job_id, ext, output_path, page_count,
-                 device_name="", device_ip="", extra_dirs=None):
+                 device_name="", device_ip="", extra_dirs=None, exposure=None):
         super().__init__(parent)
         self.job_id = job_id
         self.ext = ext
@@ -2270,11 +2744,15 @@ class MultiPagePreviewDialog(QDialog):
         self.group_names = {}
         self._rotations = {}
         self._cropped = set()
+        # 递增 token：auto 重算完成后用它判断结果是否已过期
+        self._exposure_token = 0
+        self._initial_exposure = exposure
 
         self.setWindowTitle("多页预览")
         self.setMinimumSize(720, 520)
         self.resize(820, 620)
 
+        self._ui_post.connect(self._run_ui_post)
         self._setup_ui()
         self._update_preview()
         self._refresh_thumbs()
@@ -2320,6 +2798,11 @@ class MultiPagePreviewDialog(QDialog):
 
         layout.addWidget(splitter)
 
+        # 曝光工具条（文档级参数：作用于全部页；可折叠，默认收起）
+        self.exposure_panel = ExposurePanel(self, exposure=self._initial_exposure)
+        self.exposure_panel.params_changed.connect(self._on_exposure_changed)
+        layout.addWidget(self.exposure_panel)
+
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(SPACING["sm"])
 
@@ -2361,21 +2844,89 @@ class MultiPagePreviewDialog(QDialog):
     def _get_rotation(self, page_num):
         return self._rotations.get(page_num, 0)
 
-    def _update_preview(self):
+    # ────────── 曝光 ──────────
+    def _on_exposure_changed(self):
+        """曝光参数变化 → 重算预览（文档级参数，作用于全部页）。"""
+        self._recompute_preview()
+
+    def _recompute_preview(self):
+        """
+        按当前曝光参数重算当前页预览。
+
+        manual（约 0.022s）同步重算；auto（约 0.37s/页）放工作线程算，
+        完了经 _post_ui 回主线程刷新 QPixmap。
+        """
+        self._exposure_token += 1
+        token = self._exposure_token
+        params = self.exposure_panel.exposure_dict()
+        if not params or params.get("mode") != ExposurePanel.MODE_AUTO:
+            self._update_preview()
+            return
+        page_num = self.pages[self.selected_idx]
+        rotation = self._get_rotation(page_num)
+        threading.Thread(target=self._auto_worker,
+                         args=(token, params, page_num, rotation), daemon=True).start()
+
+    def _auto_worker(self, token, params, page_num, rotation):
+        """工作线程：全分辨率 auto 曝光（约 0.37s/页），不碰任何控件。"""
+        img = None
+        err = None
         try:
+            img = self._load_and_expose(params, page_num)
+            if rotation:
+                img = img.rotate(rotation, expand=True)
+        except Exception as e:
+            err = e
+            img = None
+        self._post_ui(lambda: self._on_auto_result(token, img, err))
+
+    def _on_auto_result(self, token, img, err):
+        """主线程：接收 auto 重算结果。过期结果直接丢弃（否则旧结果会盖掉新结果）。"""
+        if token != self._exposure_token:
+            return
+        if img is None:
+            self.page_info_label.setText(f"预览失败: {err}")
+            return
+        self._set_preview(img)
+
+    def _load_and_expose(self, params, page_num):
+        """读缓存页并应用曝光（顺序固定：曝光 → 旋转）。"""
+        with Image.open(self._cache_path(page_num)) as src:
+            img = src.copy()
+        return apply_exposure(img, **params)
+
+    # ────────── 渲染 ──────────
+    def _update_preview(self):
+        """同步渲染当前页（曝光 → 旋转）。"""
+        try:
+            params = self.exposure_panel.exposure_dict()
             page_num = self.pages[self.selected_idx]
-            img = Image.open(self._cache_path(page_num))
+            with Image.open(self._cache_path(page_num)) as src:
+                img = src.copy()
+            if params:
+                img = apply_exposure(img, **params)
             rotation = self._get_rotation(page_num)
             if rotation:
                 img = img.rotate(rotation, expand=True)
+        except Exception as e:
+            self.page_info_label.setText(f"预览失败: {e}")
+            return
+        self._set_preview(img)
+
+    def _set_preview(self, img):
+        """把 PIL 图像刷到预览区（PIL 已旋转，不重复旋转）。"""
+        try:
             pixmap = pil_to_qpixmap(img)
             self.image_viewer.set_image(pixmap, rotation=0)  # PIL已旋转
             w, h = img.size
+            rotation = 0
+            if 0 <= self.selected_idx < len(self.pages):
+                rotation = self._get_rotation(self.pages[self.selected_idx])
             rot_text = f" (旋转 {rotation}°)" if rotation else ""
             self.page_info_label.setText(
                 f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页{rot_text}")
-        except Exception as e:
-            self.page_info_label.setText(f"预览失败: {e}")
+        finally:
+            img.close()
 
     def _refresh_thumbs(self):
         for i in reversed(range(self.thumbs_layout.count())):
@@ -2412,19 +2963,19 @@ class MultiPagePreviewDialog(QDialog):
 
     def _on_thumb_clicked(self, idx):
         self.selected_idx = idx
-        self._update_preview()
+        self._recompute_preview()
         self._refresh_thumbs()
 
     def _rotate_left(self):
         page_num = self.pages[self.selected_idx]
         self._rotations[page_num] = (self._get_rotation(page_num) - 90) % 360
-        self._update_preview()
+        self._recompute_preview()
         self._refresh_thumbs()
 
     def _rotate_right(self):
         page_num = self.pages[self.selected_idx]
         self._rotations[page_num] = (self._get_rotation(page_num) + 90) % 360
-        self._update_preview()
+        self._recompute_preview()
         self._refresh_thumbs()
 
     def _auto_crop(self):
@@ -2437,7 +2988,7 @@ class MultiPagePreviewDialog(QDialog):
                 cropped.save(orig_path, quality=95)
                 self._cropped.add(page_num)
                 self._rotations.pop(page_num, None)
-                self._update_preview()
+                self._recompute_preview()
                 self._refresh_thumbs()
         except Exception as e:
             self.page_info_label.setText(f"裁边失败: {e}")
@@ -2454,7 +3005,7 @@ class MultiPagePreviewDialog(QDialog):
                     self._rotations.pop(page_num, None)
             except Exception:
                 pass
-        self._update_preview()
+        self._recompute_preview()
         self._refresh_thumbs()
 
     def _delete_current_page(self):
@@ -2491,11 +3042,12 @@ class MultiPagePreviewDialog(QDialog):
         if self.selected_idx >= len(self.pages):
             self.selected_idx = len(self.pages) - 1
 
-        self._update_preview()
+        self._recompute_preview()
         self._refresh_thumbs()
 
     def _confirm(self):
         """保存全部"""
+        exposure = self.exposure_panel.exposure_dict()
         try:
             page_specs = [(self._cache_path(page_num), self._get_rotation(page_num))
                           for page_num in self.pages]
@@ -2503,7 +3055,11 @@ class MultiPagePreviewDialog(QDialog):
             saved_files = save_manager.save_pages(
                 self.job_id, self.ext, self.output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs, device_name=self.device_name,
-                device_ip=self.device_ip)
+                device_ip=self.device_ip, exposure=exposure)
+            # 曝光设置回写给主窗口 —— 直接保存模式沿用同一份参数
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "set_exposure_state"):
+                parent.set_exposure_state(exposure)
             self.accept()
             if saved_files:
                 try:

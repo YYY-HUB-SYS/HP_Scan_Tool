@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 import cache_manager
 import history_manager
 import page_meta
+from exposure import apply_exposure
 
 try:
     from pypdf import PdfWriter
@@ -50,6 +51,73 @@ def build_output_name(base: str, ext: str, group_count: int,
     if group_count <= 1:
         return f"{base}_{in_group_seq:03d}.{ext}"
     return f"{base}_{group_index:03d}_{in_group_seq:03d}.{ext}"
+
+
+def _exposure_params(exposure) -> dict | None:
+    """
+    把曝光参数字典规范化成 apply_exposure 的 kwargs。
+
+    返回 None 表示「曝光不生效」——此时调用方必须走与改造前完全一致的路径，
+    保证 exposure=None / mode="off" 时产物逐字节不变（向后兼容）。
+    """
+    if not exposure:
+        return None
+    mode = str(exposure.get("mode") or "off").strip().lower()
+    if mode not in ("auto", "manual"):
+        return None
+
+    gains = exposure.get("channel_gains") or (1.0, 1.0, 1.0)
+    try:
+        gains = tuple(float(g) for g in gains)
+    except (TypeError, ValueError):
+        gains = (1.0, 1.0, 1.0)
+    if len(gains) != 3:
+        gains = (1.0, 1.0, 1.0)
+
+    return {
+        "mode": mode,
+        "brightness": int(exposure.get("brightness") or 0),
+        "contrast": int(exposure.get("contrast") or 0),
+        "gamma": float(exposure.get("gamma") or 1.0),
+        "shadows": int(exposure.get("shadows") or 0),
+        "highlights": int(exposure.get("highlights") or 0),
+        "channel_gains": gains,
+    }
+
+
+def _apply_exposure(img: Image.Image, exposure) -> Image.Image:
+    """
+    对图像应用曝光参数。**未生效时原样返回入参对象**（同一对象），
+    调用方据此判断是否需要 close()。
+    """
+    params = _exposure_params(exposure)
+    if params is None:
+        return img
+    return apply_exposure(img, **params)
+
+
+def _read_cache_image(cache_file: str) -> Image.Image:
+    """把缓存页读进内存（脱离文件句柄）。返回**新**图像，调用方负责 close()。"""
+    with Image.open(cache_file) as src:
+        return src.copy()
+
+
+def _expose_and_rotate(img: Image.Image, rotation: int, exposure) -> Image.Image:
+    """
+    按固定顺序 **曝光 → 旋转** 处理图像。
+
+    **接管 img 的所有权**：返回的图像由调用方负责 close（可能就是 img 本身）。
+    顺序是硬约定：曝光作用于原始像素，旋转只是几何变换，不能颠倒。
+    """
+    exposed = _apply_exposure(img, exposure)
+    if exposed is not img:
+        img.close()
+        img = exposed
+    if rotation:
+        rotated = img.rotate(rotation, expand=True)
+        img.close()
+        img = rotated
+    return img
 
 
 def _a4_canvas(img, dpi: int = 300) -> Image.Image:
@@ -119,25 +187,27 @@ def _extract_pdf_image(cache_file: str, rotation: int = 0) -> Image.Image:
         return src.rotate(rotation, expand=True) if rotation else src.copy()
 
 
-def _open_page_image(cache_file: str, rotation: int = 0) -> Image.Image:
+def _open_page_image(cache_file: str, rotation: int = 0, exposure=None) -> Image.Image:
     """
-    打开一页缓存图片（必要时应用旋转）。返回**新**图像，调用方负责 close()。
+    打开一页缓存图片（必要时应用曝光与旋转）。返回**新**图像，调用方负责 close()。
+
+    处理顺序固定为 **曝光 → 旋转**；A4 画布归一由调用方在其后完成。
     """
     try:
-        with Image.open(cache_file) as src:
-            return src.rotate(rotation, expand=True) if rotation else src.copy()
+        img = _read_cache_image(cache_file)
     except UnidentifiedImageError:
         # 不是图片字节 → 当作 PDF 缓存页处理
-        return _extract_pdf_image(cache_file, rotation)
+        img = _extract_pdf_image(cache_file, 0)
+    return _expose_and_rotate(img, rotation, exposure)
 
 
-def _write_pdf(pages, out_path: str, dpi: int = 300) -> tuple[int, int]:
+def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None) -> tuple[int, int]:
     """
     流式合成 PDF（单页/多页同一份代码）。返回 (成功页数, 失败页数)。
 
     两阶段：
       阶段一（逐页，内存里同时只有一页）：
-        缓存页 → A4 画布归一 → 写成单页 PDF 临时文件
+        缓存页 → 曝光 → 旋转 → A4 画布归一 → 写成单页 PDF 临时文件
       阶段二（逐页 append，不再载入图片像素）：
         PdfWriter.append(临时文件) → 写出最终 PDF
 
@@ -154,7 +224,7 @@ def _write_pdf(pages, out_path: str, dpi: int = 300) -> tuple[int, int]:
         for idx, (cache_file, rotation) in enumerate(pages, 1):
             tmp_pdf = os.path.join(tmp_dir, f"page_{idx:04d}.pdf")
             try:
-                img = _open_page_image(cache_file, rotation)
+                img = _open_page_image(cache_file, rotation, exposure)
                 canvas = _a4_canvas(img, dpi)
                 if canvas is not img:
                     img.close()
@@ -202,7 +272,7 @@ def _remove_page_meta(job_id: str) -> None:
 
 
 def _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
-              page_count, ext):
+              page_count, ext, exposure=None):
     """额外目录复制 + 清缓存 + 清页元数据 + 写历史"""
     copy_to_extra_dirs(saved_files, extra_dirs)
     if job_id:
@@ -216,15 +286,25 @@ def _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
             "format": ext,
             "file_path": saved_files[0],
             "file_count": len(saved_files),
+            "exposure": exposure,
         })
     return saved_files
 
 
 def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
                 extra_dirs=None, job_id: str = None,
-                device_name: str = "", device_ip: str = "") -> str:
+                device_name: str = "", device_ip: str = "",
+                exposure=None) -> str:
     """
     单页保存。返回实际落盘路径。
+
+    exposure: dict | None，形如
+        {"mode": "auto" | "manual",
+         "brightness": int, "contrast": int, "gamma": float,
+         "shadows": int, "highlights": int,
+         "channel_gains": (r, g, b)}
+    曝光在 **旋转之前、A4 画布归一之前** 应用（顺序固定：曝光 → 旋转 → A4 归一）。
+    exposure=None 或 mode="off" ⇒ 行为与改造前完全一致（向后兼容）。
 
     一律用 with 打开图片：显式管理文件句柄，不依赖 Pillow 内部
     「读取后自动关句柄」的实现细节（该细节随版本变化）。
@@ -235,40 +315,46 @@ def save_single(cache_path: str, ext: str, output_path: str, rotation: int = 0,
 
     if ext == "pdf":
         # PDF 走本地合成，和多页 PDF 同一份代码 → 页面尺寸必然一致
-        ok, _failed = _write_pdf([(cache_path, rotation)], final)
+        ok, _failed = _write_pdf([(cache_path, rotation)], final, exposure=exposure)
         if not ok:
             raise RuntimeError(f"PDF 生成失败（缓存页无法转换为图片）: {cache_path}")
     else:
-        with Image.open(cache_path) as src:
-            img = src.rotate(rotation, expand=True) if rotation else src.copy()
+        img = _read_cache_image(cache_path)
+        img = _expose_and_rotate(img, rotation, exposure)
+        try:
             _write_image(img, final, ext)
+        finally:
             img.close()
 
-    _finalize([final], job_id, extra_dirs, device_name, device_ip, 1, ext)
+    _finalize([final], job_id, extra_dirs, device_name, device_ip, 1, ext,
+              exposure=exposure)
     return final
 
 
 def save_pages(job_id: str, ext: str, output_path: str,
                page_specs: list[tuple[str, int]], groups: list[list[int]],
                extra_dirs=None,
-               device_name: str = "", device_ip: str = "") -> list[str]:
+               device_name: str = "", device_ip: str = "",
+               exposure=None) -> list[str]:
     """
     多页保存（可分组）。
 
     page_specs: [(缓存文件路径, 旋转角度), ...]，按页序
     groups:     对 page_specs 的索引分组，list[list[int]]
+    exposure:   曝光参数（文档级，所有页同一份），语义同 save_single。
     返回实际落盘的文件路径列表
     """
     base = output_path.rsplit(".", 1)[0]
     group_count = len(groups)
     saved_files = []
     failed_pages = 0
+    exposure_active = _exposure_params(exposure) is not None
 
     for gi, group_indices in enumerate(groups, 1):
         if ext == "pdf":
             pages = [page_specs[page_idx] for page_idx in group_indices]
             pdf_path = build_output_name(base, ext, group_count, gi, 1)
-            ok, failed = _write_pdf(pages, pdf_path)
+            ok, failed = _write_pdf(pages, pdf_path, exposure=exposure)
             failed_pages += failed
             if not ok:
                 logger.warning("PDF 分组 %d 没有任何页面转换成功，跳过: %s", gi, pdf_path)
@@ -279,13 +365,15 @@ def save_pages(job_id: str, ext: str, output_path: str,
                 cache_file, rotation = page_specs[page_idx]
                 try:
                     fpath = build_output_name(base, ext, group_count, gi, seq)
-                    if ext in ("jpg", "jpeg") and not rotation:
+                    if ext in ("jpg", "jpeg") and not rotation and not exposure_active:
+                        # 无曝光且无旋转 ⇒ 直接复制原始字节（快路径，逐字节一致）
                         shutil.copy2(cache_file, fpath)
                     else:
-                        with Image.open(cache_file) as src:
-                            img = src.rotate(rotation, expand=True) if rotation else src.copy()
-                        _write_image(img, fpath, ext)
-                        img.close()
+                        img = _open_page_image(cache_file, rotation, exposure)
+                        try:
+                            _write_image(img, fpath, ext)
+                        finally:
+                            img.close()
                     saved_files.append(fpath)
                 except Exception as e:
                     failed_pages += 1
@@ -297,5 +385,5 @@ def save_pages(job_id: str, ext: str, output_path: str,
             f"没有成功保存任何页面（共 {len(page_specs)} 页，失败 {failed_pages} 页）")
 
     _finalize(saved_files, job_id, extra_dirs, device_name, device_ip,
-              len(page_specs), ext)
+              len(page_specs), ext, exposure=exposure)
     return saved_files
