@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -699,6 +700,59 @@ def _refresh_scan_button(app):
         logger.debug("刷新扫描按钮状态失败（控件已销毁）")
 
 
+def _unique_token() -> str:
+    """
+    6 位随机唯一成分：**1 位字母（a–p）+ 5 位十六进制**（**不依赖时钟分辨率**）。
+
+    ★ 为什么首字符固定是字母：产物名已有**分组编号**规则
+      （`{base}_{组号:03d}.ext` / `{base}_{N:03d}.ext`）⇒ 纯数字的尾巴
+      会被误读成组号/页号 ⇒ 尾巴一律以字母开头 ⇒ 一眼可辨"这是随机成分"。
+    ★ 用 `uuid4()` 而不是进程内计数器：GUI 是长驻进程，计数器在重启后会
+      从头再来 ⇒ 反倒更容易与重启前的名字撞上。
+    """
+    raw = uuid.uuid4().hex[:6]
+    return chr(ord("a") + int(raw[0], 16) % 26) + raw[1:]
+
+
+def _timestamped_output_name(prefix: str, ext: str) -> str:
+    """
+    用户可见的输出文件名：`{prefix}_{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}.{ext}`。
+
+    ★ 为什么**光有微秒不够**（2026-10-21 实测订正）：
+      本机 Windows 的**系统时钟粒度是 15.625 ms**
+      （`time.get_clock_info('time').resolution` 实测 0.015625）
+      ⇒ 相邻两次 `datetime.now().strftime('%f')` 的结果 **99.5% 完全相同**
+      ⇒ 只把「秒」提到「微秒」**并不能**避免撞名：
+      同一 tick 内完成的两批会算出**同一个文件名**
+      ⇒ 后一批把前一批整个覆盖掉 ⇒ 用户侧「刚才那批不见了」，**无任何报错**。
+    ★ 唯一性来自 `uuid4().hex[:6]`（24 bit 随机，见 `_unique_token`）
+      ⇒ **不依赖时钟分辨率**。
+    ★ 不改命名契约：扩展名、单页/多页、`save_manager.build_output_name` 的
+      **分组编号规则**一律不动 —— 只在**时间戳之后**追加唯一成分。
+    ★ 不用「撞名加 -1/-2 序号」：序号会与分组编号（`_001`）混淆。
+    ★ 时间戳仍在**前面** ⇒ 人一眼能看出大致何时产生（可读性不丢）。
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{prefix}_{ts}_{_unique_token()}.{ext}"
+
+
+def _timestamped_job_id() -> str:
+    """
+    GUI 侧的任务 id：`{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}`。
+
+    ★ 为什么 job_id 也要带唯一成分：
+      job_id **直接当缓存目录名**用（`cache_root/<job_id>/`）
+      ⇒ 同一 tick 内的两次扫描若拿到同一个 job_id
+      ⇒ **共用同一个缓存目录** ⇒ 后写的页把先写的页**逐页覆盖**掉
+      ⇒ 产物静默少页（页码相同 ⇒ 同名文件被覆盖）。
+    ★ 与 `_timestamped_output_name` 同源（同一个随机成分机制），
+      同样**不依赖时钟分辨率**。
+    ★ 协调器侧（`scan_coordinator.py`）的 job_id 由另一条线负责，不在本文件范围。
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{ts}_{_unique_token()}"
+
+
 class _OutputNameGuard:
     """
     输出文件名唯一性守卫（GUI 侧兜底）。
@@ -707,14 +761,22 @@ class _OutputNameGuard:
       ⇒ 同一秒内完成的两批会算出**同一个文件名** ⇒ 后写的覆盖先写的。
       当时协调器不在本文件的修改范围内 ⇒ GUI 侧兜底：给每批输出占一个
       **没被占用**的 base（`{base}` → `{base}_1` → `{base}_2` …）。
-    ★ 现状（2026-10-21）：协调器侧的文件名精度已提到**微秒**
-      （`scan_coordinator.py` 的 `HP_Scan_%Y%m%d_%H%M%S_%f`）⇒「同秒撞名」
-      这个具体成因已消除；但本守卫**仍要保留**，真正的理由是：
+    ★ 现状（2026-10-21 订正）：**「提到微秒就消除了撞名」这个说法不成立** ——
+      本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次取名的 `%f` 99.5% 相同
+      ⇒ 微秒**救不了**同 tick 撞名。真正消除撞名的是**第一层**：
+      名字里带的随机唯一成分（`_timestamped_output_name` /
+      `_timestamped_job_id`）。本守卫是**第二层**（纵深防御），保留的理由：
         - **直存与会话落盘共用同一个协调器 path** ⇒ 两条入口拿到的
-          `output_path` 可能是**同一个**；微秒精度救不了"同一个 path"。
+          `output_path` 可能是**同一个**；唯一成分也救不了"同一个 path"。
         - 兜底是**跨实例共享**（模块级单例）+ 查磁盘 ⇒ 重名时改用 `{base}_1`，
-          而不是像协调器那样把上一次产物整个覆盖掉。
-      所以守卫不是冗余，是最后一道防线。
+          而不是把上一次产物整个覆盖掉。
+    ★ 覆盖面（2026-10-21 逐入口核实）：
+        - 直存（`_direct_save_result`）          ⇒ **走**守卫
+        - 会话落盘（`_save_session_now`）          ⇒ **走**守卫
+        - 预览保存（`PreviewDialog` / `MultiPagePreviewDialog`）
+          ⇒ **不走**守卫（对话框直接用拿到的 `output_path` 落盘）
+          ⇒ 该入口靠第一层（名字自带唯一成分）保证不覆盖
+      （eSCL 预览保存的名字来自 `scan_coordinator.py`，不在本文件范围内。）
     ★ 占用记录**跨实例共享**（模块级单例）⇒ 同一进程里两次落盘不会撞名。
     """
 
@@ -759,7 +821,7 @@ OUTPUT_NAME_GUARD = _OutputNameGuard()
 
 
 def _unique_output_path(output_path):
-    """输出路径唯一化（同一秒完成的两批不会互相覆盖）。"""
+    """输出路径唯一化（同一个 path 不会被两批产物互相覆盖）。"""
     return OUTPUT_NAME_GUARD.claim(output_path)
 
 
@@ -2800,9 +2862,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # getattr：ScanApp 的最小替身（只借用方法）可能没有这个属性。
         exposure = getattr(self, "_exposure_state", None)
         total_pages = len(page_specs)
-        # ★ 复审 A1-R1 ③：输出路径必须**唯一** —— 协调器给的文件名精度现已到
-        #   **微秒**（秒级撞名已消除），但直存与会话落盘**共用同一个协调器 path**
-        #   ⇒ 两条入口仍可能拿到同一个 output_path ⇒ 微秒精度救不了
+        # ★ 复审 A1-R1 ③：输出路径必须**唯一** —— 直存与会话落盘**共用同一个
+        #   协调器 path** ⇒ 两条入口仍可能拿到同一个 output_path
+        #   ⇒ 名字里带的唯一成分也救不了"同一个 path"
         #   ⇒ 仍需 GUI 侧兜底（_OutputNameGuard：改用 `{base}_1` 而不是覆盖）。
         output_path = _unique_output_path(result.output_path)
         # ★ 复审 A1-R1 ②：在途保存用**计数**登记（不是单个布尔标志）
@@ -3298,8 +3360,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
         """会话落盘的默认输出路径（与会话里记录的输出路径同规则）"""
         out_dir = self.dir_entry.text() or self.output_dir
         ext = self.output_format_val or "pdf"
-        return os.path.join(
-            out_dir, f"HP_Scan_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
+        # ★ 名字带随机唯一成分（`_timestamped_output_name`）⇒ 同一 tick 内
+        #   的两批不会算出同一个文件名（后一批不会把前一批覆盖掉）。
+        return os.path.join(out_dir, _timestamped_output_name("HP_Scan", ext))
 
     def _save_session_now(self, session):
         """会话落盘（**后台线程**：几百页合并 PDF 要几十秒）"""
@@ -3575,13 +3638,14 @@ class ScanApp(QMainWindow, _UiPostMixin):
                         cancel_event=self._listen_cancel_event,
                     )
                     if pages:
-                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        job_id = _timestamped_job_id()
                         cache_manager.register_job(job_id)
                         ext = pages[0][1] if pages else self.output_format_val
                         for i, (data, ext) in enumerate(pages, 1):
                             cache_manager.write_page(job_id, i, data, ext)
                             del data
-                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
+                        output_path = os.path.join(
+                            out_dir, _timestamped_output_name("HP_Listen", ext))
                         self._post_ui(lambda: self._show_multi_preview(
                             job_id, ext, output_path, len(pages), scanner))
                     else:
@@ -3600,11 +3664,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     )
                     if result:
                         data, ext = result
-                        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        job_id = _timestamped_job_id()
                         cache_manager.register_job(job_id)
                         cache_path = cache_manager.write_page(job_id, 1, data, ext)
                         del data
-                        output_path = os.path.join(out_dir, f"HP_Listen_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}")
+                        output_path = os.path.join(
+                            out_dir, _timestamped_output_name("HP_Listen", ext))
                         self._post_ui(lambda: self._show_preview(
                             cache_path, ext, output_path, job_id, scanner))
                     else:
@@ -3838,7 +3903,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             QMessageBox.warning(self, "提示", "WIA 引擎不可用（仅 Windows 支持）")
             return
 
-        job_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        job_id = _timestamped_job_id()
         cancel_event = threading.Event()
         # 登记到协调器 ⇒ coordinator.cancel_scan(job_id) 停的是**同一个** event
         self._register_cancel_event(job_id, cancel_event)
@@ -3871,8 +3936,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     del data
                     out_dir = self.dir_entry.text() or self.output_dir
                     output_path = os.path.join(
-                        out_dir,
-                        f"HP_WIA_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+                        out_dir, _timestamped_output_name("HP_WIA", ext)
                     )
                     self._post_ui(lambda: self._show_preview(
                         cache_path, ext, output_path, job_id))

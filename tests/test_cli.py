@@ -364,18 +364,31 @@ class TestOutputFilenamePrecision:
       CLI 之前只到秒 ⇒ 同一秒内完成的两批算出**同一个文件名**
       ⇒ 后写的把先写的整个覆盖掉 ⇒ 先写的那批产物**静默消失**
       （用户看不到，也没有任何报错）。
+
+    ★ 2026-10-21 订正：**只到微秒仍然不够** ——
+      本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次取名的 `%f` 99.5% 相同
+      ⇒ 契约扩成 `YYYYMMDD_HHMMSS_ffffff_<6 位随机>`（随机成分不依赖时钟）。
+      本类下面那条**精确形状**断言（"时间戳正好 22 字符、三段"）随之改成
+      **四段**（时间戳三段 + 唯一成分一段）—— 意图不变：微秒段必须还在、
+      且必须还是 6 位数字。
     """
 
     def test_filename_carries_microseconds(self):
         name = cli._timestamped_name("HP_CLI", "jpg")
         assert name.startswith("HP_CLI_") and name.endswith(".jpg")
         ts = name[len("HP_CLI_"):-len(".jpg")]
-        # 期望格式：YYYYMMDD_HHMMSS_ffffff
-        assert len(ts) == 22, f"时间戳应到微秒（22 字符），实际 {ts!r}"
-        date, clock, micro = ts.split("_")
+        # 期望格式：YYYYMMDD_HHMMSS_ffffff_<6 位随机唯一成分>
+        parts = ts.split("_")
+        assert len(parts) == 4, (
+            "应为「日期_时分秒_微秒_唯一成分」四段，实际 %r" % (ts,))
+        date, clock, micro, token = parts
         assert date.isdigit() and len(date) == 8, date
         assert clock.isdigit() and len(clock) == 6, clock
         assert micro.isdigit() and len(micro) == 6, micro
+        assert len(token) == 6 and all(c in "0123456789abcdef" for c in token[1:]), (
+            "唯一成分必须是「1 位字母 + 5 位十六进制」，实际 %r" % (token,))
+        assert token[0] in "abcdefghijklmnop", (
+            "唯一成分首字符必须是字母 ⇒ 不会被误读成组号/页号，实际 %r" % (token,))
 
     def test_two_batches_in_the_same_second_get_different_names(self, monkeypatch):
         """★ 关键行为断言：**同一秒内**的两批 ⇒ 名字必须不同。

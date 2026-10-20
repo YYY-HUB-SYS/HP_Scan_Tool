@@ -417,10 +417,19 @@ class TestTimestampPrecisionIsMicroseconds:
         assert "微秒" in doc, "docstring 必须写明「微秒」：%r" % doc
 
     def test_generated_name_carries_six_digit_microseconds(self):
-        """事实锚点：文件名里的时间戳尾巴是 **6 位**小数秒（微秒）。"""
+        """事实锚点：文件名里的时间戳**微秒段**是 **6 位**小数秒（微秒）。
+
+        ★ 2026-10-21 订正：产物名契约扩成
+          `{前缀}_{YYYYmmdd}_{HHMMSS}_{ffffff}_{6 位随机唯一成分}.{ext}`
+          ⇒ 微秒段从"最后一段"挪到**倒数第二段**（最后一段是随机唯一成分）。
+          本断言的**意图不变**：微秒段必须还在、且必须还是 6 位数字。
+        """
         name = cli._timestamped_name("HP_CLI", "pdf")
         stem = name[len("HP_CLI_"):-len(".pdf")]
-        micros = stem.split("_")[-1]
-        assert micros.isdigit(), "时间戳尾巴不是数字：%r" % name
+        parts = stem.split("_")
+        assert len(parts) == 4, (
+            "应为「日期_时分秒_微秒_唯一成分」四段，实际 %r" % (name,))
+        micros = parts[2]
+        assert micros.isdigit(), "时间戳里的微秒段不是数字：%r" % name
         assert len(micros) == 6, (
             "%f 是 6 位微秒，实际 %r（%d 位）" % (name, micros, len(micros)))

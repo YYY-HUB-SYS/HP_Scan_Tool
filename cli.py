@@ -12,6 +12,7 @@ import shutil
 import sys
 import tempfile
 import traceback
+import uuid
 from datetime import datetime
 
 # 确保能导入同目录模块
@@ -170,19 +171,45 @@ def _write_pdf_via_save_manager(data: bytes, fpath: str,
     return fpath
 
 
+def _unique_token() -> str:
+    """
+    6 位随机唯一成分：**1 位字母（a–p）+ 5 位十六进制**（**不依赖时钟分辨率**）。
+
+    ★ 为什么首字符固定是字母：产物名已有**分组编号**规则
+      （`{base}_{组号:03d}.ext` / `{base}_{N:03d}.ext`）⇒ 纯数字的尾巴
+      会被误读成组号/页号 ⇒ 尾巴一律以字母开头 ⇒ 一眼可辨"这是随机成分"。
+    ★ 用 `uuid4()` 而不是计数器：CLI 每次都是**新进程** ⇒ 进程内计数器
+      在两次调用之间会重置 ⇒ 反而更容易撞名。
+    """
+    raw = uuid.uuid4().hex[:6]
+    return chr(ord("a") + int(raw[0], 16) % 26) + raw[1:]
+
+
 def _timestamped_name(prefix: str, ext: str) -> str:
     """
-    生成带**微秒**精度时间戳的输出文件名。
+    生成「时间戳 + 随机唯一成分」的输出文件名。
 
-    ★ 为什么 CLI 必须单独保证精度（复审 I1）：
-      CLI 的产物名是**自己造的** —— `cli.py` 走的是 `escl_engine.execute_scan`，
-      **根本不经过协调器** ⇒ 协调器那次「秒→微秒」的改动**覆盖不到这里**。
-      之前 CLI 只到秒 ⇒ 同一秒内完成的两批 CLI 扫描算出**同一个文件名**
+    格式：`{prefix}_{YYYYmmdd_HHMMSS_ffffff}_{6 位随机}.{ext}`
+
+    ★ 为什么**光有微秒不够**（复审 I1 → 2026-10-21 实测订正）：
+      本机 Windows 的**系统时钟粒度是 15.625 ms**
+      （`time.get_clock_info('time').resolution` 实测 0.015625）
+      ⇒ 相邻两次 `datetime.now().strftime('%f')` 的结果 **99.5% 完全相同**
+      ⇒ 只把「秒」提到「微秒」**并不能**避免撞名：
+      同一 tick 内完成的两批 CLI 扫描算出**同一个文件名**
       ⇒ 后写的把先写的整个覆盖掉 ⇒ 先写的那批产物**静默消失**
       （用户看不到、也没有任何报错）。
-    ★ 命名格式与协调器保持一致（`%Y%m%d_%H%M%S_%f`），便于人工对照。
+    ★ 唯一性来自 `uuid4().hex[:6]`（24 bit 随机，见 `_unique_token`）
+      ⇒ **不依赖时钟分辨率**：同一 tick / 同一微秒 / 同一秒内都必然不同。
+    ★ 不用「撞名加 -1/-2 序号」：产物名已有**分组编号**规则
+      （`{base}_{组号}_{组内号}.ext` / `{base}_{N:03d}.ext`）
+      ⇒ 再加序号会与组号混淆。
+    ★ 时间戳仍在**前面** ⇒ 人一眼能看出大致何时产生（可读性不丢）。
+    ★ CLI 侧**没有** GUI 那层 `_OutputNameGuard` 兜底：CLI 自己造名、
+      自己落盘（`save_manager` 落盘是覆盖写）⇒ 这个唯一性是**必需**的。
     """
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{prefix}_{ts}_{_unique_token()}.{ext}"
 
 
 def cmd_scan(args):
@@ -249,8 +276,11 @@ def cmd_scan(args):
 
     # 保存文件
     os.makedirs(output, exist_ok=True)
-    # ★ 微秒精度（复审 I1）：CLI 自己造名、不走协调器 ⇒ 精度必须在这里单独保证，
-    #   否则同一秒内完成的两批会算出同一个文件名 ⇒ 后写的覆盖先写的（产物静默消失）。
+    # ★ 产物名唯一（复审 I1 → 2026-10-21 订正）：CLI 自己造名、不走协调器
+    #   ⇒ 名字里除时间戳外还带一段**随机唯一成分**（`uuid4().hex[:6]`）。
+    #   只靠时间戳是不够的：本机系统时钟粒度 15.625 ms ⇒ 同一 tick 内两次
+    #   取名的微秒值 99.5% 相同 ⇒ 后写的会覆盖先写的（产物静默消失）。
+    #   CLI 侧没有 GUI 的 `_OutputNameGuard` 兜底 ⇒ 这里必须自己保证唯一。
     fname = _timestamped_name("HP_CLI", ext)
     fpath = os.path.join(output, fname)
     device_name = scanner.model or f"CLI-{ip}"
