@@ -17,6 +17,7 @@ from PIL import Image
 
 import cache_manager
 import history_manager
+import page_meta
 import preset_manager
 import profile_manager
 import save_manager
@@ -64,7 +65,7 @@ logger.info(f"cwd={os.getcwd()}")
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QSize, QRectF, QPointF,
     QPropertyAnimation, QEasingCurve, QParallelAnimationGroup,
-    QAbstractAnimation, QPoint, QRect,
+    QAbstractAnimation, QPoint, QRect, QObject,
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
@@ -219,6 +220,242 @@ class _UiPostMixin:
     def _post_ui(self, fn):
         """从任意线程安全地把 fn 投递到主线程执行"""
         self._ui_post.emit(fn)
+
+
+# ────────── 图片落盘 / 裁边 / 保存（GUI 层共用） ──────────
+def _ext_format(ext):
+    """扩展名 → PIL 格式名。未知扩展名退回 PNG（无损、不撒谎）。"""
+    e = (ext or "").lower().lstrip(".")
+    if e in ("jpg", "jpeg"):
+        return "JPEG"
+    if e == "png":
+        return "PNG"
+    if e in ("tif", "tiff"):
+        return "TIFF"
+    if e == "bmp":
+        return "BMP"
+    if e == "webp":
+        return "WEBP"
+    return "PNG"
+
+
+def _encode_for_format(img, fmt):
+    """
+    按目标格式挑一个**能存**的模式，尽量不丢信息。
+
+    - PNG/TIFF/BMP/WEBP：原样保存（alpha、调色板、灰度都保住）
+    - JPEG：只支持 L / RGB / CMYK ⇒ 其余模式（RGBA、P、LA…）才转 RGB
+    """
+    if fmt == "JPEG":
+        if img.mode in ("L", "RGB", "CMYK"):
+            return img
+        return img.convert("RGB")
+    return img
+
+
+def _write_image_atomic(img, path, ext):
+    """
+    原子写一张图：先写同目录临时文件，再 os.replace 覆盖目标。
+
+    - 格式由**扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG），不再一律 JPEG
+    - JPEG 固定 quality=95（与多页保存路径一致）
+    - 中途异常不会毁掉已存在的目标文件（非原子覆盖的老问题）
+    """
+    fmt = _ext_format(ext)
+    out = _encode_for_format(img, fmt)
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        if fmt == "JPEG":
+            out.save(tmp, "JPEG", quality=95)
+        else:
+            out.save(tmp, fmt)
+        os.replace(tmp, path)
+    finally:
+        if out is not img:
+            out.close()
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _detect_crop_rect(img, threshold=240, padding=5):
+    """
+    算出 `escl_engine.auto_crop` 实际使用的裁剪框。
+
+    auto_crop 只返回图像、不返回框，而 page_meta 需要 crop_rect。
+    这里的算法与 auto_crop 同源：把「灰度 < threshold」看作有内容，
+    取有内容像素的最小外接框，再按同样的 padding 外扩。
+    返回 (left, top, right, bottom)（right/bottom 为**开区间**），无内容时返回 None。
+    """
+    try:
+        gray = img.convert("L")
+        mask = gray.point(lambda v: 255 if v < threshold else 0, mode="L")
+        bbox = mask.getbbox()
+    except Exception:
+        return None
+    if not bbox:
+        return None
+    left, top, right, bottom = bbox          # right/bottom 开区间
+    width, height = img.size
+    return (
+        max(0, left - padding),
+        max(0, top - padding),
+        min(width, right + padding),
+        min(height, bottom + padding),
+    )
+
+
+def _save_page_specs(job_id, ext, output_path, page_specs, groups, **kwargs):
+    """
+    统一保存入口 —— 直接保存与预览保存**必须走同一个函数**，否则文件名会分叉。
+
+    命名规则（与 review F-2 的建议一致）：
+      - 单页单组 ⇒ `save_single` ⇒ `{base}.{ext}`（不加序号，与改造前一致）
+      - 多页 / 多组 ⇒ `save_pages` ⇒ `{base}_001.{ext}`… / `{base}_{组号}_{组内号}.{ext}`
+
+    返回 **SaveResult**（list 子类）：额外带 `.failed_pages`（失败页数），
+    GUI 靠它把"部分页没存下来"摆到用户面前。
+    """
+    if len(page_specs) == 1 and len(groups) == 1:
+        cache_file, rotation = page_specs[0]
+        path = save_manager.save_single(
+            cache_file, ext, output_path, rotation=rotation, job_id=job_id, **kwargs)
+        return save_manager.SaveResult([path], failed_pages=0, saved_page_count=1)
+    return save_manager.save_pages(
+        job_id, ext, output_path, page_specs, groups, **kwargs)
+
+
+def _format_save_summary(saved_files, total_pages, failed_pages,
+                         warnings=None):
+    """
+    拼"保存完成"提示文案。
+
+    必须同时说清三件事：存到哪、存了几个文件、有没有页失败。
+    （此前只报第 1 个路径 ⇒ 用户以为只存了 1 个）
+    """
+    saved_files = list(saved_files or [])
+    count = len(saved_files)
+    lines = []
+    if count == 1:
+        lines.append(f"已保存到: {saved_files[0]}")
+    else:
+        directory = os.path.dirname(saved_files[0]) if saved_files else ""
+        lines.append(f"已保存到: {directory}")
+        lines.append(f"共 {count} 个文件:")
+        for f in saved_files[:10]:
+            lines.append(f"  {f}")
+        if count > 10:
+            lines.append(f"  …… 其余 {count - 10} 个见输出目录")
+    if count > 1:
+        lines.append(f"（共 {count} 个文件）")
+    if failed_pages > 0:
+        lines.append("")
+        lines.append(f"⚠ 部分页面保存失败（{failed_pages}/{total_pages} 页），详见日志。")
+    for w in (warnings or []):
+        lines.append("")
+        lines.append(f"⚠ {w}")
+    return "\n".join(lines)
+
+
+def _release_job_protection(job_id):
+    """
+    解除 job 的缓存保护（幂等）。
+
+    落盘成功 → save_manager.remove_job 已经清过；
+    用户放弃（关闭预览且不保存）→ 这里清，否则 job 永远留在受保护集合里，
+    它的缓存目录永远不被 eviction 回收 ⇒ 缓存上限机制被架空。
+
+    监听 / WIA 路径用的是 register_job，协调器路径用的是 register_pending_job，
+    两个集合都要清。
+    """
+    if not job_id:
+        return
+    try:
+        cache_manager.unregister_job(job_id)
+        cache_manager.unregister_pending_job(job_id)
+    except Exception as e:
+        logger.debug("注销 job 失败: %s", e)
+
+
+class _UiDispatcher(QObject):
+    """
+    模块级 UI 投递器：后台线程 → 主线程。
+
+    为什么不用对话框自己的 `_ui_post`：后台保存还在跑的时候，对话框可能已经被
+    销毁（用户关窗 / 测试里 deleteLater）⇒ 往已销毁的 QObject 上 emit 会踩到
+    use-after-free，进程直接 heap corruption。这个对象是模块级的，永远不死。
+    """
+
+    _post = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._post.connect(self._run)
+
+    def _run(self, fn):
+        try:
+            fn()
+        except RuntimeError as e:
+            # 目标控件已被销毁（正常情况：用户提前关窗）
+            logger.debug("UI 回调目标已销毁: %s", e)
+
+    def post(self, fn):
+        self._post.emit(fn)
+
+
+_UI_DISPATCHER = None
+
+
+def _ensure_ui_dispatcher():
+    """
+    取（并在主线程首次创建）模块级投递器。
+
+    ★ QObject 的线程亲和性 = 创建它的线程 ⇒ 必须在**主线程**创建。
+      万一第一次调用发生在工作线程，就把它 moveToThread 主线程
+      （signal 的槽在接收端所在线程执行 ⇒ 仍是主线程）。
+    """
+    global _UI_DISPATCHER
+    if _UI_DISPATCHER is None:
+        _UI_DISPATCHER = _UiDispatcher()
+        app = QApplication.instance()
+        if app is not None and _UI_DISPATCHER.thread() is not app.thread():
+            try:
+                _UI_DISPATCHER.moveToThread(app.thread())
+            except Exception as e:
+                logger.debug("投递器移入主线程失败: %s", e)
+    return _UI_DISPATCHER
+
+
+def _post_to_ui(fn):
+    """从任意线程把 fn 投递到主线程执行（模块级，不随对话框销毁）。"""
+    _ensure_ui_dispatcher().post(fn)
+
+
+def _run_in_background(work, on_done, on_error):
+    """
+    把 work 丢到后台线程跑；完成/失败都回**主线程**回调。
+
+    用普通的 threading.Thread（和本文件里曝光重算的工作线程同一套写法），
+    不用 QThreadPool/QRunnable：autoDelete 的 QRunnable 被 Qt 回收后，
+    Python 包装对象再被 GC 会二次释放 ⇒ 进程 heap corruption。
+    """
+    def _runner():
+        try:
+            result = work()
+        except Exception as exc:                   # noqa: BLE001 - 交给主线程提示
+            # ★ 必须先赋给另一个名字：except 的 `as e` 在 except 块结束时会被
+            #   删除，lambda 捕获到的是那个已删除的名字 ⇒ NameError
+            err = exc
+            logger.error("后台保存失败: %s", err, exc_info=True)
+            _post_to_ui(lambda: on_error(err))
+        else:
+            _post_to_ui(lambda: on_done(result))
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    return thread
 
 
 # ────────── 自定义 Widget ──────────
@@ -744,6 +981,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.coordinator.scan_finished.connect(self._on_scan_finished)
         self.coordinator.scan_failed.connect(self._on_scan_failed)
         self.coordinator.scan_cancelled.connect(self._on_scan_cancelled)
+        # F-3：协调器因为「设备能力未确认」而按用户显式选择走时给的用户可见提示
+        # （不接 ⇒ 用户不知道"你选的输稿器可能用不了"）
+        try:
+            self.coordinator.source_warning.connect(self._on_source_warning)
+        except Exception as e:            # pragma: no cover - 旧版协调器没这个信号
+            logger.debug("协调器没有 source_warning 信号: %s", e)
+        _ensure_ui_dispatcher()
         self._current_job_id = None
         self.coordinator.load_config()
         self.cfg = self.coordinator.cfg
@@ -1496,6 +1740,10 @@ class ScanApp(QMainWindow, _UiPostMixin):
             QMessageBox.warning(self, "提示", "请先选择一台打印机")
             return
 
+        # 每次扫描都是新文档 ⇒ 清掉上一份文档残留的曝光参数（I-6）。
+        # 曝光是「预览里的临时调整」，跨文档静默套用会让用户扫出来的图被改过。
+        self._reset_exposure_state()
+
         out_dir = self.dir_entry.text() or self.output_dir
         try:
             out_dir = os.path.abspath(out_dir)
@@ -1541,6 +1789,21 @@ class ScanApp(QMainWindow, _UiPostMixin):
     def _on_scan_progress(self, job_id, message, page):
         self.status_bar.showMessage(message)
 
+    def _on_source_warning(self, warning):
+        """
+        协调器的来源提示（能力未确认 / 来源被回退等）—— 必须让用户看见。
+
+        信号签名：`source_warning = Signal(str)`（只有提示文本，没有 job_id）。
+        """
+        if not warning:
+            return
+        logger.info("来源提示: %s", warning)
+        try:
+            self.status_bar.showMessage(f"提示: {warning}")
+            QMessageBox.warning(self, "扫描提示", warning)
+        except RuntimeError:
+            logger.debug("来源提示时主窗口已销毁")
+
     def _on_scan_finished(self, job_id, result):
         self._reset_scan_ui()
         if not result.cached_paths:
@@ -1551,6 +1814,14 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if self.direct_save_val:
             self._direct_save_result(result)
             return
+        # 扫描结束、结果交给用户预览之前：把 job 登记为「已扫描未保存」，
+        # 让它的缓存目录在用户预览期间不受 eviction / stale 清理影响。
+        # 注销时机：落盘成功（save_manager.remove_job）或预览关闭未保存
+        # （PreviewDialog/MultiPagePreviewDialog._release_job）。
+        try:
+            cache_manager.register_pending_job(result.job_id)
+        except Exception as e:
+            logger.debug("登记待保存 job 失败: %s", e)
         if result.page_count > 1:
             self._show_multi_preview(result.job_id, result.ext, result.output_path,
                                     result.page_count, scanner)
@@ -1562,20 +1833,22 @@ class ScanApp(QMainWindow, _UiPostMixin):
         """
         「直接保存」模式：跳过预览，直接把缓存页落盘。
 
-        save_pages 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
+        save_manager 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
         设备名/IP 取自当前选中设备；未选中设备时留空，不报错。
-        曝光参数沿用最近一次预览里设置的（跳过预览时没有别的来源）。
+
+        曝光参数：只在**本次扫描内**沿用（扫描开始时已清空残留），
+        提示里会写明"沿用了曝光"，避免用户不知道图被动过。
         """
         scanner = self.selected
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = (scanner.ip or "") if scanner else ""
         page_specs = [(path, 0) for path in result.cached_paths]
         groups = [list(range(len(page_specs)))]
-        # 曝光参数沿用最近一次预览里设置的（跳过预览时没有别的来源）。
         # getattr：ScanApp 的最小替身（只借用方法）可能没有这个属性。
         exposure = getattr(self, "_exposure_state", None)
+        total_pages = len(page_specs)
         try:
-            saved_files = save_manager.save_pages(
+            saved_files = _save_page_specs(
                 result.job_id, result.ext, result.output_path, page_specs, groups,
                 extra_dirs=self.extra_dirs or [], device_name=dev_name,
                 device_ip=dev_ip, exposure=exposure)
@@ -1583,13 +1856,32 @@ class ScanApp(QMainWindow, _UiPostMixin):
             logger.error("直接保存失败: %s", e, exc_info=True)
             QMessageBox.critical(self, "保存失败", f"直接保存失败: {e}")
             self.status_bar.showMessage("直接保存失败")
+            _release_job_protection(result.job_id)
             return
         if not saved_files:
             self.status_bar.showMessage("直接保存未产生文件")
+            _release_job_protection(result.job_id)
             return
-        saved = saved_files[0]
-        self.status_bar.showMessage(f"已保存到 {saved}")
-        QMessageBox.information(self, "保存完成", f"已保存到:\n{saved}")
+        # 部分页保存失败：save_manager 现在把失败页数放进 SaveResult.failed_pages
+        # （此前只写日志 ⇒ 用户拿到少了页的文件却不知道）
+        failed_pages = int(getattr(saved_files, "failed_pages", 0) or 0)
+        warnings = list(getattr(saved_files, "warnings", []) or [])
+        summary = _format_save_summary(saved_files, total_pages, failed_pages,
+                                       warnings)
+        if exposure:
+            summary += f"\n（沿用曝光参数：{exposure.get('mode')}）"
+        if failed_pages > 0:
+            self.status_bar.showMessage(
+                f"已保存 {len(saved_files)} 个文件，但有 {failed_pages} 页保存失败")
+        else:
+            self.status_bar.showMessage(f"已保存 {len(saved_files)} 个文件")
+        QMessageBox.information(
+            self, "保存完成" if not failed_pages else "保存部分失败", summary)
+
+    def _release_job(self, job_id):
+        """解除 job 的缓存保护（幂等）—— 见模块级 _release_job_protection。"""
+        _release_job_protection(job_id)
+
 
     def _on_scan_failed(self, job_id, error):
         self._reset_scan_ui()
@@ -1625,8 +1917,17 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
     # ────────── 预览对话框 ──────────
     def set_exposure_state(self, exposure):
-        """记住预览里设置的曝光参数（直接保存模式沿用同一份参数）。"""
+        """
+        记住预览里设置的曝光参数。
+
+        这是**本次扫描内**的临时状态：每次开始新扫描都会被 `_reset_exposure_state`
+        清掉 ⇒ 不会把上一份文档的曝光静默套到下一份文档上（I-6）。
+        """
         self._exposure_state = dict(exposure) if exposure else None
+
+    def _reset_exposure_state(self):
+        """清掉残留的曝光参数（新扫描开始时调用）"""
+        self._exposure_state = None
 
     def _show_preview(self, cache_path, ext, output_path, job_id, scanner=None):
         """显示单页预览"""
@@ -1660,6 +1961,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
             return
 
         from listen_engine import listen_for_scan, listen_for_multipage_scan
+
+        # 新的一次监听 = 新文档 ⇒ 清掉残留曝光（I-6）
+        self._reset_exposure_state()
 
         out_dir = self.dir_entry.text() or self.output_dir
         try:
@@ -1699,6 +2003,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self._post_ui(lambda: self.status_bar.showMessage(f"监听模式：{msg}"))
 
         def _listen_thread():
+            job_id = None
             try:
                 if use_adf:
                     pages = listen_for_multipage_scan(
@@ -1749,6 +2054,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
                         self._post_ui(lambda: self.status_bar.showMessage("监听模式：超时或已取消"))
             except Exception as e:
                 self._post_ui(lambda: self._scan_error(f"监听模式错误: {e}"))
+                # 预览没能开起来 ⇒ 没人替我们注销 job，必须在这里清掉，
+                # 否则它永远留在受保护集合里，缓存目录永远不被 eviction 回收。
+                self._release_job(job_id)
             finally:
                 self._post_ui(self._reset_scan_ui)
 
@@ -1953,8 +2261,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
             device = wia_scanners[idx]
             self.status_bar.showMessage("正在通过 WIA 扫描...")
+            # 新的一次扫描 = 新文档 ⇒ 清掉残留曝光（I-6）
+            self._reset_exposure_state()
 
             def _wia_thread():
+                job_id = None
                 try:
                     data, ext = wia_scan(
                         device_id=device.get("id"),
@@ -1978,6 +2289,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
                         self._post_ui(lambda: self.status_bar.showMessage("WIA 扫描失败"))
                 except Exception as e:
                     self._post_ui(lambda: self._scan_error(f"WIA 错误: {e}"))
+                    # 预览没开起来 ⇒ 没人替我们注销 job（否则缓存目录永不被回收）
+                    self._release_job(job_id)
 
             threading.Thread(target=_wia_thread, daemon=True).start()
 
@@ -2514,6 +2827,9 @@ class PreviewDialog(QDialog, _UiPostMixin):
         self.extra_dirs = extra_dirs or []
         self._rotation = 0
         self._cropped = False
+        # 裁边结果文件（不覆盖缓存原件）；裁边框（左上右下，右/下为开区间）
+        self._crop_path = None
+        self._crop_rect = None
         # 递增 token：auto 重算完成后用它判断结果是否已过期
         self._exposure_token = 0
         self._initial_exposure = exposure
@@ -2522,10 +2838,29 @@ class PreviewDialog(QDialog, _UiPostMixin):
         self.setMinimumSize(520, 420)
         self.resize(620, 520)
 
-        self._ui_post.connect(self._run_ui_post)
+        # C++ 对象是否还活着（destroyed 信号是唯一可靠的判据：
+        # shiboken6.isValid 对已 deleteLater 的对象仍返回 True）
+        self._alive = True
+        self.destroyed.connect(self._mark_destroyed)
+        _ensure_ui_dispatcher()
         self._setup_ui()
         self._show_image()
         add_fade_animation(self, ANIM["normal"])
+
+    # ────────── 线程 / 生命周期 ──────────
+    def _post_ui(self, fn):
+        """
+        投递到主线程。
+
+        ★ 走**模块级**投递器，不用本对话框自己的 `_ui_post` 信号：
+          后台线程（曝光重算 / 后台保存）可能在对话框已被销毁之后才投递，
+          往已销毁的 QObject 上 emit 会踩野指针 ⇒ 进程堆损坏（0xc0000374）。
+        """
+        _post_to_ui(fn)
+
+    def _mark_destroyed(self, *args):
+        """C++ 对象已析构 ⇒ 之后不能再碰它的任何控件。"""
+        self._alive = False
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -2583,7 +2918,9 @@ class PreviewDialog(QDialog, _UiPostMixin):
         """
         按当前曝光参数重算预览。
 
-        性能（300dpi A4 实测）：manual 约 0.022s ⇒ 同步重算无感；
+        性能（300dpi A4 实测，主线程）：manual 约 **0.130s/页**
+        （decode 0.026s + apply_exposure 0.065s + QPixmap 0.039s）
+        ⇒ 手动模式仍在主线程同步算（量级可接受，不卡死）；
         auto 约 0.37s/页 ⇒ 放工作线程算，完了经 _post_ui 回主线程刷新 QPixmap。
         """
         self._exposure_token += 1
@@ -2619,8 +2956,8 @@ class PreviewDialog(QDialog, _UiPostMixin):
         self._set_preview(img)
 
     def _load_and_expose(self, params):
-        """读缓存页并应用曝光（顺序固定：曝光 → 旋转）。"""
-        with Image.open(self.cache_path) as src:
+        """读当前页（裁边后读裁边件）并应用曝光（顺序固定：曝光 → 旋转）。"""
+        with Image.open(self._source_path()) as src:
             img = src.copy()
         return apply_exposure(img, **params)
 
@@ -2629,7 +2966,7 @@ class PreviewDialog(QDialog, _UiPostMixin):
         """同步渲染预览（曝光 → 旋转）。"""
         try:
             params = self.exposure_panel.exposure_dict()
-            with Image.open(self.cache_path) as src:
+            with Image.open(self._source_path()) as src:
                 img = src.copy()
             if params:
                 img = apply_exposure(img, **params)
@@ -2653,13 +2990,40 @@ class PreviewDialog(QDialog, _UiPostMixin):
 
     def _rotate_left(self):
         self._rotation = (self._rotation - 90) % 360
+        self._sync_page_meta()
         self._recompute_preview()
 
     def _rotate_right(self):
         self._rotation = (self._rotation + 90) % 360
+        self._sync_page_meta()
         self._recompute_preview()
 
+    # ────────── 裁边 / 元数据 ──────────
+    def _source_path(self):
+        """当前真正使用的页文件：裁边后用裁边件，否则用缓存原件。"""
+        if self._crop_path and os.path.exists(self._crop_path):
+            return self._crop_path
+        return self.cache_path
+
+    def _crop_path_for(self, source_path):
+        """
+        裁边结果落盘路径：与原件同目录、同扩展名，文件名加 `crop_` 前缀。
+
+        ★ 绝不覆盖缓存原件（page_meta 的契约：cache_path 指向永不修改的原始扫描件）
+        ★ 文件名不以 `page_` 开头 ⇒ 不会被 cache_manager.list_pages 当成缓存页
+        """
+        d = os.path.dirname(source_path)
+        stem = os.path.splitext(os.path.basename(source_path))[0]
+        return os.path.join(d, f"crop_{stem}.{self.ext}")
+
     def _auto_crop(self):
+        """
+        自动裁边。
+
+        ★ 不再覆盖缓存原件：结果写到 crop_ 前缀的新文件，原件保持只读
+        ★ 格式按**原扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG quality=95），不再一律 JPEG
+        ★ 写盘用临时文件 + os.replace（原子），中途失败不会毁掉已有文件
+        """
         cache = self.cache_path
         try:
             if not cache or not os.path.exists(cache):
@@ -2667,40 +3031,105 @@ class PreviewDialog(QDialog, _UiPostMixin):
                 return
             with open(cache, "rb") as f:
                 raw = f.read()
-            img = Image.open(io.BytesIO(raw))
-            cropped = auto_crop(img)
-            if cropped is not img:
-                buf = io.BytesIO()
-                cropped = cropped.convert("RGB")
-                cropped.save(buf, format="JPEG")
-                with open(cache, "wb") as f:
-                    f.write(buf.getvalue())
-                self._cropped = True
-                self._rotation = 0
-                self._recompute_preview()
+            with Image.open(io.BytesIO(raw)) as src:
+                img = src.copy()
+            cropped = None
+            try:
+                cropped = auto_crop(img)
+                if cropped is img:
+                    self.info_label.setText("无需裁边")
+                    return
+                rect = _detect_crop_rect(img)
+                if rect is not None:
+                    rw, rh = rect[2] - rect[0], rect[3] - rect[1]
+                    if (rw, rh) != cropped.size:
+                        rect = None          # 算不准就不写，别写错
+                crop_path = self._crop_path_for(cache)
+                _write_image_atomic(cropped, crop_path, self.ext)
+            finally:
+                if cropped is not None and cropped is not img:
+                    cropped.close()
+                img.close()
+            self._crop_path = crop_path
+            self._crop_rect = rect
+            self._cropped = True
+            self._rotation = 0
+            self._sync_page_meta()
+            self._recompute_preview()
         except Exception as e:
+            logger.debug("自动裁边失败: %s", e, exc_info=True)
             self.info_label.setText(f"裁边失败: {type(e).__name__}")
+
+    def _sync_page_meta(self):
+        """
+        把当前几何信息写回 page_meta。
+
+        裁边改了图像尺寸、旋转改了朝向 ⇒ 元数据必须跟上，
+        否则 page_meta 记的还是扫描时的原图尺寸，纠偏/续扫的回溯链就断了。
+        （page_meta 只**调用**，不改它的实现）
+        """
+        try:
+            source = self._source_path()
+            with Image.open(source) as im:
+                width, height = im.size
+            store = page_meta.PageMetaStore(cache_manager._cache_root())
+            existing = {}
+            try:
+                existing = store.get_job(self.job_id).get("1", {}) or {}
+            except Exception:
+                existing = {}
+            store.set_page(self.job_id, 1, page_meta.PageMeta(
+                cache_path=self.cache_path,
+                width=int(width), height=int(height),
+                manual_rotation=int(self._rotation),
+                deskew_angle=float(existing.get("deskew_angle") or 0.0),
+                a4_normalized=bool(existing.get("a4_normalized", False)),
+                crop_rect=tuple(self._crop_rect) if self._crop_rect else None,
+            ))
+        except Exception as e:
+            logger.debug("写页元数据失败 [%s]: %s", self.job_id, e)
 
     def _confirm(self):
         """保存"""
         exposure = self.exposure_panel.exposure_dict()
+        source = self._source_path()
         try:
-            saved = save_manager.save_single(
-                self.cache_path, self.ext, self.output_path,
-                rotation=self._rotation, extra_dirs=self.extra_dirs,
-                job_id=self.job_id, device_name=self.device_name,
+            saved_files = _save_page_specs(
+                self.job_id, self.ext, self.output_path,
+                [(source, self._rotation)], [[0]],
+                extra_dirs=self.extra_dirs, device_name=self.device_name,
                 device_ip=self.device_ip, exposure=exposure)
-            # 曝光设置回写给主窗口 —— 直接保存模式沿用同一份参数
+            # 曝光设置回写给主窗口 —— 仅本次扫描内有效（下一次扫描开始时清空）
             parent = self.parent()
             if parent is not None and hasattr(parent, "set_exposure_state"):
                 parent.set_exposure_state(exposure)
             self.accept()
-            try:
-                os.startfile(os.path.dirname(saved))
-            except Exception:
-                pass
+            if saved_files:
+                try:
+                    os.startfile(os.path.dirname(saved_files[0]))
+                except Exception:
+                    pass
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
+
+    # ────────── 关闭时的 job 注销 ──────────
+    def _release_job(self):
+        """
+        解除 job 的缓存保护（幂等）。
+
+        落盘成功 → save_manager.remove_job 已经清过；
+        用户放弃（重新扫描 / 关窗）→ 这里清，否则 job 永远受保护，
+        缓存目录永远不被 eviction 回收 ⇒ 缓存上限机制被架空。
+        """
+        _release_job_protection(self.job_id)
+
+    def accept(self):
+        self._release_job()
+        super().accept()
+
+    def reject(self):
+        self._release_job()
+        super().reject()
 
 
 def adjust_splits_after_delete(splits, page_idx: int):
@@ -2744,6 +3173,15 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self.group_names = {}
         self._rotations = {}
         self._cropped = set()
+        # 裁边结果：页号 → 文件路径（不覆盖缓存原件）
+        self._crop_paths = {}
+        self._crop_rects = {}
+        # 保存中（后台线程落盘期间禁止重复提交）
+        self._saving = False
+        self._save_finished = False
+        self._save_exposure = None
+        self._save_total_pages = 0
+        self._save_group_count = 1
         # 递增 token：auto 重算完成后用它判断结果是否已过期
         self._exposure_token = 0
         self._initial_exposure = exposure
@@ -2752,11 +3190,29 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self.setMinimumSize(720, 520)
         self.resize(820, 620)
 
-        self._ui_post.connect(self._run_ui_post)
+        # C++ 对象是否还活着（destroyed 信号是唯一可靠的判据）
+        self._alive = True
+        self.destroyed.connect(self._mark_destroyed)
+        _ensure_ui_dispatcher()
         self._setup_ui()
         self._update_preview()
         self._refresh_thumbs()
         add_fade_animation(self, ANIM["normal"])
+
+    # ────────── 线程 / 生命周期 ──────────
+    def _post_ui(self, fn):
+        """
+        投递到主线程。
+
+        ★ 走**模块级**投递器，不用本对话框自己的 `_ui_post` 信号：
+          后台线程（曝光重算 / 后台保存）可能在对话框已被销毁之后才投递，
+          往已销毁的 QObject 上 emit 会踩野指针 ⇒ 进程堆损坏（0xc0000374）。
+        """
+        _post_to_ui(fn)
+
+    def _mark_destroyed(self, *args):
+        """C++ 对象已析构 ⇒ 之后不能再碰它的任何控件。"""
+        self._alive = False
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -2826,6 +3282,12 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         delete_btn.clicked.connect(self._delete_current_page)
         btn_layout.addWidget(delete_btn)
 
+        # 分组线入口（I-5）：在此页开始新组 / 取消分组
+        self.split_btn = AnimatedButton("＋分组线", button_type="secondary")
+        self.split_btn.setToolTip("从当前页开始新的一组（再点一次取消）")
+        self.split_btn.clicked.connect(self._toggle_split)
+        btn_layout.addWidget(self.split_btn)
+
         btn_layout.addStretch()
 
         cancel_btn = AnimatedButton("重新扫描", button_type="secondary")
@@ -2835,14 +3297,74 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         save_btn = AnimatedButton("保存全部", button_type="primary")
         save_btn.clicked.connect(self._confirm)
         btn_layout.addWidget(save_btn)
+        self.save_btn = save_btn
 
         layout.addLayout(btn_layout)
 
     def _cache_path(self, page_num):
         return os.path.join(cache_manager._job_dir(self.job_id), f"page_{page_num:03d}.{self.ext}")
 
+    def _source_path(self, page_num):
+        """当前真正使用的页文件：裁边后用裁边件，否则用缓存原件。"""
+        cropped = self._crop_paths.get(page_num)
+        if cropped and os.path.exists(cropped):
+            return cropped
+        return self._cache_path(page_num)
+
+    def _crop_path_for(self, page_num):
+        """
+        裁边结果落盘路径：与原件同目录、同扩展名，文件名加 `crop_` 前缀。
+
+        ★ 绝不覆盖缓存原件（page_meta 的契约：cache_path 指向永不修改的原始扫描件）
+        ★ 文件名不以 `page_` 开头 ⇒ 不会被 cache_manager.list_pages 当成缓存页
+        """
+        d = os.path.dirname(self._cache_path(page_num))
+        return os.path.join(d, f"crop_page_{page_num:03d}.{self.ext}")
+
     def _get_rotation(self, page_num):
         return self._rotations.get(page_num, 0)
+
+    # ────────── 分组（I-5） ──────────
+    def _toggle_split(self):
+        """
+        在当前页处切换"分组线"。
+
+        splits 的语义：**新一组的第一页在页列表里的下标**（0 基）。
+        ⇒ 第 1 页（下标 0）不能作为分割点（它本来就是第一组的开头）。
+        """
+        if not self.pages:
+            return
+        idx = self.selected_idx
+        if idx <= 0:
+            self.page_info_label.setText("第 1 页不能作为分组起点")
+            return
+        if idx in self.splits:
+            self.splits.discard(idx)
+        else:
+            self.splits.add(idx)
+        self._refresh_thumbs()
+        self._update_split_button()
+
+    def _update_split_button(self):
+        """分组按钮的文案跟着当前页走（有分割线 ⇒ 显示取消）。"""
+        if not hasattr(self, "split_btn"):
+            return
+        if self.selected_idx in self.splits and self.selected_idx > 0:
+            self.split_btn.setText("－分组线")
+            self.split_btn.setToolTip("取消当前页处的分组线")
+        else:
+            self.split_btn.setText("＋分组线")
+            self.split_btn.setToolTip("从当前页开始新的一组（再点一次取消）")
+
+    def _group_index_of(self, idx):
+        """当前页属于第几组（从 1 起）。"""
+        group = 1
+        for sp in sorted(self.splits):
+            if sp <= idx:
+                group += 1
+            else:
+                break
+        return group
 
     # ────────── 曝光 ──────────
     def _on_exposure_changed(self):
@@ -2853,8 +3375,9 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         """
         按当前曝光参数重算当前页预览。
 
-        manual（约 0.022s）同步重算；auto（约 0.37s/页）放工作线程算，
-        完了经 _post_ui 回主线程刷新 QPixmap。
+        manual 约 **0.130s/页**（300dpi A4 主线程实测：decode 0.026s
+        + apply_exposure 0.065s + QPixmap 0.039s）⇒ 同步重算，量级可接受；
+        auto（约 0.37s/页）放工作线程算，完了经 _post_ui 回主线程刷新 QPixmap。
         """
         self._exposure_token += 1
         token = self._exposure_token
@@ -2890,8 +3413,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self._set_preview(img)
 
     def _load_and_expose(self, params, page_num):
-        """读缓存页并应用曝光（顺序固定：曝光 → 旋转）。"""
-        with Image.open(self._cache_path(page_num)) as src:
+        """读当前页（裁边后读裁边件）并应用曝光（顺序固定：曝光 → 旋转）。"""
+        with Image.open(self._source_path(page_num)) as src:
             img = src.copy()
         return apply_exposure(img, **params)
 
@@ -2901,7 +3424,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         try:
             params = self.exposure_panel.exposure_dict()
             page_num = self.pages[self.selected_idx]
-            with Image.open(self._cache_path(page_num)) as src:
+            with Image.open(self._source_path(page_num)) as src:
                 img = src.copy()
             if params:
                 img = apply_exposure(img, **params)
@@ -2923,8 +3446,12 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             if 0 <= self.selected_idx < len(self.pages):
                 rotation = self._get_rotation(self.pages[self.selected_idx])
             rot_text = f" (旋转 {rotation}°)" if rotation else ""
+            group_text = ""
+            if self.splits:
+                group_text = f" · 第 {self._group_index_of(self.selected_idx)} 组"
             self.page_info_label.setText(
-                f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页{rot_text}")
+                f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页"
+                f"{group_text}{rot_text}")
         finally:
             img.close()
 
@@ -2935,8 +3462,15 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                 widget.deleteLater()
 
         for idx, page_num in enumerate(self.pages):
+            # 分组线：在该页缩略图上方画一条分隔线（用户要看得见分组真的存在）
+            if idx in self.splits:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.HLine)
+                sep.setFixedHeight(3)
+                sep.setStyleSheet(f"background: {COLORS['primary']}; border: none;")
+                self.thumbs_layout.addWidget(sep)
             try:
-                img = Image.open(self._cache_path(page_num))
+                img = Image.open(self._source_path(page_num))
                 rotation = self._get_rotation(page_num)
                 if rotation:
                     img = img.rotate(rotation, expand=True)
@@ -2960,6 +3494,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                 pass
 
         self.thumbs_layout.addStretch(1)
+        self._update_split_button()
 
     def _on_thumb_clicked(self, idx):
         self.selected_idx = idx
@@ -2969,40 +3504,97 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
     def _rotate_left(self):
         page_num = self.pages[self.selected_idx]
         self._rotations[page_num] = (self._get_rotation(page_num) - 90) % 360
+        self._sync_page_meta(page_num)
         self._recompute_preview()
         self._refresh_thumbs()
 
     def _rotate_right(self):
         page_num = self.pages[self.selected_idx]
         self._rotations[page_num] = (self._get_rotation(page_num) + 90) % 360
+        self._sync_page_meta(page_num)
         self._recompute_preview()
         self._refresh_thumbs()
+
+    # ────────── 裁边 / 元数据 ──────────
+    def _crop_page(self, page_num):
+        """
+        对一页做自动裁边。
+
+        ★ 不再覆盖缓存原件：结果写到 crop_ 前缀的新文件，原件保持只读
+        ★ 格式按**原扩展名**决定（.png ⇒ PNG，.jpg ⇒ JPEG quality=95）
+        ★ 写盘用临时文件 + os.replace（原子）
+        返回 True 表示确实裁了。
+        """
+        source = self._cache_path(page_num)
+        with open(source, "rb") as f:
+            raw = f.read()
+        with Image.open(io.BytesIO(raw)) as src:
+            img = src.copy()
+        cropped = None
+        try:
+            cropped = auto_crop(img)
+            if cropped is img:
+                return False
+            rect = _detect_crop_rect(img)
+            if rect is not None:
+                rw, rh = rect[2] - rect[0], rect[3] - rect[1]
+                if (rw, rh) != cropped.size:
+                    rect = None              # 算不准就不写，别写错
+            crop_path = self._crop_path_for(page_num)
+            _write_image_atomic(cropped, crop_path, self.ext)
+        finally:
+            if cropped is not None and cropped is not img:
+                cropped.close()
+            img.close()
+        self._crop_paths[page_num] = crop_path
+        self._crop_rects[page_num] = rect
+        self._cropped.add(page_num)
+        self._rotations.pop(page_num, None)
+        return True
+
+    def _sync_page_meta(self, page_num):
+        """
+        把裁边/旋转后的几何信息写回 page_meta（原始件不动，元数据要跟上）。
+        （page_meta 只**调用**，不改它的实现）
+        """
+        try:
+            source = self._source_path(page_num)
+            with Image.open(source) as im:
+                width, height = im.size
+            store = page_meta.PageMetaStore(cache_manager._cache_root())
+            existing = {}
+            try:
+                existing = store.get_job(self.job_id).get(str(page_num), {}) or {}
+            except Exception:
+                existing = {}
+            crop_rect = self._crop_rects.get(page_num)
+            store.set_page(self.job_id, page_num, page_meta.PageMeta(
+                cache_path=self._cache_path(page_num),
+                width=int(width), height=int(height),
+                manual_rotation=int(self._get_rotation(page_num)),
+                deskew_angle=float(existing.get("deskew_angle") or 0.0),
+                a4_normalized=bool(existing.get("a4_normalized", False)),
+                crop_rect=tuple(crop_rect) if crop_rect else None,
+            ))
+        except Exception as e:
+            logger.debug("写页元数据失败 [%s]: %s", self.job_id, e)
 
     def _auto_crop(self):
         page_num = self.pages[self.selected_idx]
         try:
-            img = Image.open(self._cache_path(page_num))
-            cropped = auto_crop(img)
-            if cropped is not img:
-                orig_path = self._cache_path(page_num)
-                cropped.save(orig_path, quality=95)
-                self._cropped.add(page_num)
-                self._rotations.pop(page_num, None)
+            if self._crop_page(page_num):
+                self._sync_page_meta(page_num)
                 self._recompute_preview()
                 self._refresh_thumbs()
         except Exception as e:
+            logger.debug("自动裁边失败: %s", e, exc_info=True)
             self.page_info_label.setText(f"裁边失败: {e}")
 
     def _auto_crop_all(self):
         for page_num in self.pages:
             try:
-                img = Image.open(self._cache_path(page_num))
-                cropped = auto_crop(img)
-                if cropped is not img:
-                    orig_path = self._cache_path(page_num)
-                    cropped.save(orig_path, quality=95)
-                    self._cropped.add(page_num)
-                    self._rotations.pop(page_num, None)
+                if self._crop_page(page_num):
+                    self._sync_page_meta(page_num)
             except Exception:
                 pass
         self._recompute_preview()
@@ -3026,6 +3618,11 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             cache_path = self._cache_path(page_num)
             if os.path.exists(cache_path):
                 os.remove(cache_path)
+            # 裁边件也一并删掉（它是这页的衍生物）
+            crop_path = self._crop_paths.pop(page_num, None)
+            self._crop_rects.pop(page_num, None)
+            if crop_path and os.path.exists(crop_path):
+                os.remove(crop_path)
         except Exception:
             pass
 
@@ -3046,28 +3643,168 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self._refresh_thumbs()
 
     def _confirm(self):
-        """保存全部"""
+        """
+        保存全部。
+
+        ★ 落盘挪到后台线程（F-5）：几百页合并要几十秒，在主线程做会把界面卡死。
+          完成/失败都回主线程再提示（模块级投递器，不依赖本对话框的信号）。
+        ★ 用 save_manager.run_save_job（纯函数入口，无 Qt 依赖）
+        ★ 裁过边的页用裁边件（原件保持只读）
+        ★ 分组由 splits 决定，命名走 save_manager.build_output_name 的多组规则
+        """
+        if getattr(self, "_saving", False):
+            return
         exposure = self.exposure_panel.exposure_dict()
+        page_specs = [(self._source_path(page_num), self._get_rotation(page_num))
+                      for page_num in self.pages]
+        groups = self._build_groups()
+        total_pages = len(page_specs)
+        self._saving = True
+        self._save_exposure = exposure
+        self._save_total_pages = total_pages
+        self._save_group_count = len(groups)
+        if hasattr(self, "save_btn"):
+            self.save_btn.setEnabled(False)
+            self.save_btn.setText("保存中...")
+
+        # SaveRequest 只装数据，不带 GUI 对象 ⇒ 可以安全跨线程传递
+        request = save_manager.SaveRequest(
+            job_id=self.job_id,
+            ext=self.ext,
+            output_path=self.output_path,
+            page_specs=page_specs,
+            groups=groups,
+            extra_dirs=self.extra_dirs,
+            device_name=self.device_name,
+            device_ip=self.device_ip,
+            exposure=exposure,
+            confirm=self._make_confirm_callback(),
+        )
+
+        def _work():
+            return save_manager.run_save_job(request)
+
+        # 投递器在主线程创建（跨线程 emit 的接收端必须活在主线程）
+        _ensure_ui_dispatcher()
+        _run_in_background(
+            _work,
+            lambda files: self._on_save_done(files),
+            lambda err: self._on_save_error(err),
+        )
+
+    def _make_confirm_callback(self):
+        """
+        PDF 体积预检的确认回调（save_manager 在**后台线程**里调它）。
+
+        ★ 弹窗必须在主线程 ⇒ 回主线程弹，并阻塞等待用户回答。
+        ★ 不拿本对话框当 parent（它可能已被销毁 ⇒ 野指针 ⇒ 堆损坏）。
+        """
+        def _confirm(msg):
+            answer = {"ok": True}
+            done = threading.Event()
+
+            def _ask():
+                try:
+                    reply = QMessageBox.question(
+                        None, "保存确认", msg,
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                    answer["ok"] = (reply == QMessageBox.Yes)
+                except Exception as e:
+                    logger.debug("体积预检确认失败: %s", e)
+                    answer["ok"] = True
+                finally:
+                    done.set()
+
+            _post_to_ui(_ask)
+            done.wait(timeout=300)
+            return answer.get("ok", True)
+
+        return _confirm
+
+    def _on_save_done(self, saved_files):
+        """主线程：保存完成。"""
+        if not getattr(self, "_alive", True):
+            # 对话框已被销毁（用户提前关窗）—— 不能再碰它的任何控件
+            logger.debug("保存完成时对话框已销毁，忽略提示")
+            return
         try:
-            page_specs = [(self._cache_path(page_num), self._get_rotation(page_num))
-                          for page_num in self.pages]
-            groups = self._build_groups()
-            saved_files = save_manager.save_pages(
-                self.job_id, self.ext, self.output_path, page_specs, groups,
-                extra_dirs=self.extra_dirs, device_name=self.device_name,
-                device_ip=self.device_ip, exposure=exposure)
-            # 曝光设置回写给主窗口 —— 直接保存模式沿用同一份参数
+            self._saving = False
+            if hasattr(self, "save_btn"):
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("保存全部")
+            if not saved_files:
+                self.page_info_label.setText("保存未产生文件")
+                self._save_finished = True
+                return
+            failed_pages = int(getattr(saved_files, "failed_pages", 0) or 0)
+            warnings = list(getattr(saved_files, "warnings", []) or [])
+            total_pages = getattr(self, "_save_total_pages", len(saved_files))
+            summary = _format_save_summary(saved_files, total_pages,
+                                           failed_pages, warnings)
+            # 曝光设置回写给主窗口 —— 仅本次扫描内有效
             parent = self.parent()
             if parent is not None and hasattr(parent, "set_exposure_state"):
-                parent.set_exposure_state(exposure)
-            self.accept()
-            if saved_files:
+                parent.set_exposure_state(getattr(self, "_save_exposure", None))
+            # ★ 正常完成只写状态栏（不弹窗，免得打断操作）；
+            #   只有"有页没存下来 / 有警告"才弹窗 —— 那才是必须让用户看见的。
+            status = f"已保存 {len(saved_files)} 个文件"
+            if failed_pages:
+                status += f"，{failed_pages} 页保存失败"
+            if parent is not None and hasattr(parent, "status_bar"):
                 try:
-                    os.startfile(os.path.dirname(saved_files[0]))
+                    parent.status_bar.showMessage(status)
                 except Exception:
                     pass
-        except Exception as e:
-            QMessageBox.critical(self, "保存失败", str(e))
+            if failed_pages or warnings:
+                # ★ 不拿本对话框当 parent（它可能已被销毁 ⇒ 野指针 ⇒ 堆损坏）
+                QMessageBox.warning(
+                    None, "保存部分失败" if failed_pages else "保存提示", summary)
+            self.accept()
+            try:
+                os.startfile(os.path.dirname(saved_files[0]))
+            except Exception:
+                pass
+        except RuntimeError:
+            # 对话框已被销毁（用户提前关窗）—— 不用再提示
+            logger.debug("保存完成时对话框已销毁")
+        finally:
+            self._save_finished = True
+
+    def _on_save_error(self, err):
+        """主线程：保存失败。"""
+        if not getattr(self, "_alive", True):
+            logger.debug("保存失败时对话框已销毁，忽略提示")
+            return
+        try:
+            self._saving = False
+            if hasattr(self, "save_btn"):
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("保存全部")
+            # ★ 不拿本对话框当 parent（它可能已被销毁 ⇒ 野指针 ⇒ 堆损坏）
+            QMessageBox.critical(None, "保存失败", str(err))
+        except RuntimeError:
+            logger.debug("保存失败时对话框已销毁")
+        finally:
+            self._save_finished = True
+
+    # ────────── 关闭时的 job 注销 ──────────
+    def _release_job(self):
+        """
+        解除 job 的缓存保护（幂等）。
+
+        落盘成功 → save_manager.remove_job 已经清过；
+        用户放弃（重新扫描 / 关窗）→ 这里清，否则 job 永远受保护，
+        缓存目录永远不被 eviction 回收 ⇒ 缓存上限机制被架空。
+        """
+        _release_job_protection(self.job_id)
+
+    def accept(self):
+        self._release_job()
+        super().accept()
+
+    def reject(self):
+        self._release_job()
+        super().reject()
 
     def _build_groups(self):
         if not self.splits:

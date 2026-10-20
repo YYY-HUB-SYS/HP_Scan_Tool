@@ -570,7 +570,11 @@ class TestPreviewDialogExposure:
 class TestMultiPagePreviewExposure:
     def test_exposure_passed_to_save_pages(self, qapp, tmp_path, isolated_cache,
                                            monkeypatch, no_popups):
-        """多页预览：曝光参数传到 save_pages（文档级，作用于全部页）。"""
+        """
+        多页预览：曝光参数传到 save_pages（文档级，作用于全部页）。
+
+        F-5 之后落盘已挪到后台线程 ⇒ 必须等它真的跑完再断言。
+        """
         captured = {}
         real_save_pages = save_manager.save_pages
 
@@ -598,7 +602,10 @@ class TestMultiPagePreviewExposure:
             dlg.exposure_panel._sliders["contrast"][0].setValue(25)
             dlg._confirm()
 
-            assert "exposure" in captured, "save_pages 没收到 exposure 参数"
+            # 落盘在后台线程 ⇒ 等它真的发生（含回主线程的完成回调，
+            # 否则回调会漏到下一个测试里弹窗）
+            assert _wait_for(lambda: "exposure" in captured and dlg._save_finished,
+                             qapp=qapp), "save_pages 没收到 exposure 参数"
             assert captured["exposure"]["mode"] == "manual"
             assert captured["exposure"]["contrast"] == 25
         finally:
@@ -643,16 +650,28 @@ class TestMultiPagePreviewExposure:
 class TestDirectSaveExposure:
     def test_direct_save_applies_exposure(self, tmp_path, tmp_config_dir,
                                            monkeypatch, no_popups):
-        """直接保存模式（跳过预览）也要应用曝光。"""
+        """
+        直接保存模式（跳过预览）也要应用曝光。
+
+        I-2 之后单页直存走 save_single（文件名不带序号），多页走 save_pages ——
+        两条入口都要把 exposure 传下去，所以这里同时挂两个钩子，
+        断言的是**语义**（曝光参数传到了落盘层），不是具体走哪个函数。
+        """
         captured = {}
+        real_save_single = save_manager.save_single
         real_save_pages = save_manager.save_pages
 
-        def _capture(job_id, ext, output_path, page_specs, groups, **kwargs):
+        def _capture_single(cache_path, ext, output_path, **kwargs):
+            captured.update(kwargs)
+            return real_save_single(cache_path, ext, output_path, **kwargs)
+
+        def _capture_pages(job_id, ext, output_path, page_specs, groups, **kwargs):
             captured.update(kwargs)
             return real_save_pages(job_id, ext, output_path, page_specs, groups,
                                    **kwargs)
 
-        monkeypatch.setattr(save_manager, "save_pages", _capture)
+        monkeypatch.setattr(save_manager, "save_single", _capture_single)
+        monkeypatch.setattr(save_manager, "save_pages", _capture_pages)
 
         import types
         src = tmp_path / "src.png"
@@ -683,7 +702,13 @@ class TestDirectSaveExposure:
 
     def test_direct_save_without_exposure_is_unchanged(self, tmp_path, tmp_config_dir,
                                                         monkeypatch, no_popups):
-        """没设曝光时，直接保存的产物与不加曝光完全一致。"""
+        """
+        没设曝光时，直接保存的产物与不加曝光完全一致。
+
+        I-2 之后**单页单组**的文件名不带序号（`{base}.{ext}`）——
+        与预览保存、与改造前（73c18f3）完全一致；多页才是 `{base}_001.ext`。
+        「无曝光 ⇒ 产物不变」这条语义与命名无关，任何方案下都必须成立。
+        """
         import types
 
         src = tmp_path / "src.png"
@@ -705,6 +730,9 @@ class TestDirectSaveExposure:
             cached_paths=[str(src)])
 
         gui.ScanApp._direct_save_result(stub, result)
-        # save_pages 的单组图片命名是 {base}_{组内序号:03d}.{ext}
-        assert (tmp_path / "direct_none_001.png").exists(), \
-            f"直接保存没产出文件：{os.listdir(tmp_path)}"
+        # 单页单组 ⇒ 不加序号（与预览保存同一条命名规则）
+        out = tmp_path / "direct_none.png"
+        assert out.exists(), f"直接保存没产出文件：{os.listdir(tmp_path)}"
+        with Image.open(src) as a, Image.open(out) as b:
+            assert a.convert("RGB").tobytes() == b.convert("RGB").tobytes(), \
+                "无曝光时产物必须与原图逐像素一致"
