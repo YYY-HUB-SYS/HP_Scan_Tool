@@ -15,8 +15,6 @@ capabilities_known 终局方案 + probe_escl port 形参 + wsd 去重合并 — 
 """
 
 import contextlib
-import http.server
-import threading
 from unittest import mock
 from urllib.parse import urlparse
 
@@ -27,6 +25,8 @@ import escl_engine
 import scan_coordinator
 import wsd_engine
 from escl_engine import ScannerInfo
+
+from fake_http_server import fake_http_server
 
 
 # ── 假的 eSCL 设备（真 HTTP server，监听 127.0.0.1 的随机高位端口）────────
@@ -60,33 +60,19 @@ MALFORMED_XML = "<not-valid-xml"
 
 @contextlib.contextmanager
 def _fake_escl_server(body=CAPS_NO_ADF_XML, status=200, delay=0.0):
-    """起一个真的本地 HTTP server；返回 base url（形如 http://127.0.0.1:54321）"""
-    payload = body.encode("utf-8")
+    """起一个真的本地 HTTP server；返回 base url（形如 http://127.0.0.1:54321）
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
+    ★ 走 `tests/fake_http_server.py` 的**加固**实现（端口独占 + 服务端 I/O
+    超时 + 吞掉客户端断开异常 + teardown 不 join 卡死线程）。
 
-        def do_GET(self):
-            if delay:
-                import time
-                time.sleep(delay)
-            self.send_response(status)
-            self.send_header("Content-Type", "application/xml")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *args):  # 静音
-            pass
-
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}"
-    finally:
-        srv.shutdown()
-        srv.server_close()
+    原先直接用 `http.server.ThreadingHTTPServer` 时，本文件在**全量上下文**里
+    会**必现**地把整个 pytest 进程干掉：Windows 上 `SO_REUSEADDR` 允许两个
+    假 server 绑同一端口 ⇒ 连接被投递到其中一个 ⇒ 客户端等 status line、
+    另一个 server 的 handler 卡在 sendall ⇒ 双向阻塞 ⇒ 进程 abort / 挂死。
+    根因与实测数据见 `tests/fake_http_server.py` 顶部说明。
+    """
+    with fake_http_server(body, status=status, delay=delay) as base:
+        yield base
 
 
 @pytest.fixture

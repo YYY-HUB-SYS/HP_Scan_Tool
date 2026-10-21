@@ -7,6 +7,7 @@ eSCL (AirScan) 扫描引擎 — 合并版
 """
 
 import logging
+import threading
 import time
 import xml.etree.ElementTree as ET
 
@@ -35,6 +36,70 @@ def _strip_ns(el) -> str:
     """剥离 XML 元素的 namespace 前缀，返回本地标签名。"""
     t = el.tag if hasattr(el, "tag") else str(el)
     return t.split("}")[-1] if "}" in t else t
+
+
+# ==================== HTTP 墙钟看门狗 ====================
+
+#: 墙钟上限相对 socket 超时的**余量**（秒）。
+_WALL_CLOCK_MARGIN = 3.0
+
+
+def _wall_clock_for(timeout) -> float:
+    """把 requests 的 `timeout` 参数换算成**墙钟上限**（秒）。
+
+    - `timeout=3.0` ⇒ 连接+读共 3 秒
+    - `timeout=(2.0, 3.0)` ⇒ 连接 2 秒 + 读 3 秒
+    再加 `_WALL_CLOCK_MARGIN` 的余量。
+    """
+    if isinstance(timeout, tuple):
+        total = 0.0
+        for part in timeout:
+            try:
+                total += float(part)
+            except (TypeError, ValueError):
+                total += 0.0
+    else:
+        try:
+            total = float(timeout)
+        except (TypeError, ValueError):
+            total = 0.0
+    return total + _WALL_CLOCK_MARGIN
+
+
+def _http_call_bounded(call, wall_clock: float, what: str):
+    """
+    执行一次 HTTP 调用，并在**墙钟**上限内返回。
+
+    ★ 为什么必须有这道墙钟（实测，2026-10-21）
+    ------------------------------------------------------------------
+    `requests` 的 read timeout 是 **socket 层**的。实测在「对端接受 TCP
+    连接但迟迟不回数据」的状态下，这个超时**可能长时间不触发**：
+    本轮排查抓到过真实样本 —— socket 读超时 3 秒，**9 分钟都没有报错**，
+    调用方与对端互相阻塞（客户端在等 status line、服务端卡在 sendall）。
+
+    ⇒ 只靠 socket 超时不够：一台"半死不活"的扫描仪就能把 GUI 的扫描线程
+    **永久卡死**（用户只能杀进程）。墙钟到期后按"设备无响应"处理。
+
+    ★ 正常路径的行为**完全不变**：socket 超时先触发 ⇒ 抛同样的异常，
+    上层（`_transport_error_to_device_error` 等）看到的错误类型与文案不变。
+    """
+    box = {}
+
+    def _worker():
+        try:
+            box["r"] = call()
+        except BaseException as exc:      # noqa: BLE001 —— 原样转交调用方
+            box["e"] = exc
+
+    th = threading.Thread(target=_worker, name="hp-escl-http", daemon=True)
+    th.start()
+    th.join(wall_clock)
+    if th.is_alive():
+        raise requests.exceptions.ReadTimeout(
+            "%s 在 %.1f 秒内没有返回（已放弃等待）" % (what, wall_clock))
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
 
 
 # 注（2026-10-21）：这里**曾经**有一个 `_fix_jpeg_header()`
@@ -210,7 +275,11 @@ def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0,
         for base in bases:
             for path in paths:
                 try:
-                    r = requests.get(f"{base}{path}", timeout=timeout, verify=False)
+                    r = _http_call_bounded(
+                        lambda b=base, p=path: requests.get(
+                            f"{b}{p}", timeout=timeout, verify=False),
+                        _wall_clock_for(timeout),
+                        "探测 %s" % f"{base}{path}")
                     if r.status_code == 200:
                         return f"{base}/eSCL/" if "/eSCL" in path else f"{base}/", None
                 except requests.ConnectionError:
@@ -248,7 +317,11 @@ def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0,
 def _probe_adf_from_status(scanner: ScannerInfo, base: str, timeout: float):
     """ScannerCapabilities 不可用时，从 ScannerStatus 回退检测 ADF"""
     try:
-        r = requests.get(f"{base}/ScannerStatus", timeout=(2.0, timeout), verify=False)
+        r = _http_call_bounded(
+            lambda: requests.get(f"{base}/ScannerStatus",
+                                 timeout=(2.0, timeout), verify=False),
+            _wall_clock_for((2.0, timeout)),
+            "ScannerStatus 探测")
         if r.status_code == 200 and "AdfState" in r.text:
             scanner.has_adf = True
             logger.info("从 ScannerStatus 检测到 ADF: %s", scanner.ip)
@@ -311,8 +384,11 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
         location = ""
 
         try:
-            r = requests.get(url, timeout=(2.0, timeout), verify=False,
-                             allow_redirects=False)
+            r = _http_call_bounded(
+                lambda: requests.get(url, timeout=(2.0, timeout), verify=False,
+                                     allow_redirects=False),
+                _wall_clock_for((2.0, timeout)),
+                "能力查询")
             status = r.status_code
             text = r.text
             location = r.headers.get("Location", "")
@@ -330,8 +406,11 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
         if status in (301, 302, 307, 308):
             # (a) 重定向目标是同协议的 http 路径 → 直接跟
             if location.lower().startswith("http://"):
-                r2 = requests.get(location, timeout=(2.0, timeout), verify=False,
-                                  allow_redirects=False)
+                r2 = _http_call_bounded(
+                    lambda: requests.get(location, timeout=(2.0, timeout),
+                                         verify=False, allow_redirects=False),
+                    _wall_clock_for((2.0, timeout)),
+                    "能力查询（跟随重定向）")
                 status = r2.status_code
                 text = r2.text
                 location = r2.headers.get("Location", "")
@@ -486,9 +565,13 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
     try:
         url = escl_url.rstrip("/") + "/ScannerStatus"
         if session is not None:
-            r = session.get(url, timeout=timeout, verify=False)
+            r = _http_call_bounded(
+                lambda: session.get(url, timeout=timeout, verify=False),
+                _wall_clock_for(timeout), "状态查询")
         else:
-            r = requests.get(url, timeout=timeout, verify=False)
+            r = _http_call_bounded(
+                lambda: requests.get(url, timeout=timeout, verify=False),
+                _wall_clock_for(timeout), "状态查询")
         if r.status_code != 200:
             return False, status
         root = ET.fromstring(r.text)
@@ -940,8 +1023,10 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     def _post():
         """POST ScanJobs。传输层异常 → 中文可操作错误（根因链在 __cause__）。"""
         try:
-            return session.post(job_url, data=xml_body, headers=headers,
-                                 timeout=30)
+            return _http_call_bounded(
+                lambda: session.post(job_url, data=xml_body, headers=headers,
+                                     timeout=30),
+                _wall_clock_for(30), "创建扫描任务")
         except requests.RequestException as e:
             raise _transport_error_to_device_error(e) from e
 
@@ -1087,7 +1172,9 @@ def execute_scan(
                 return None, ext
 
             try:
-                r = session.get(nd_url, timeout=15)
+                r = _http_call_bounded(
+                    lambda: session.get(nd_url, timeout=15),
+                    _wall_clock_for(15), "取扫描数据")
                 if r.status_code == 200:
                     return r.content, ext
                 elif r.status_code == 503:
@@ -1164,7 +1251,9 @@ def execute_multipage_scan(
                     return pages if pages else []
 
                 try:
-                    r = session.get(nd_url, timeout=15)
+                    r = _http_call_bounded(
+                    lambda: session.get(nd_url, timeout=15),
+                    _wall_clock_for(15), "取扫描数据")
                     if r.status_code == 200:
                         pages.append((r.content, ext))
                         if progress_callback:

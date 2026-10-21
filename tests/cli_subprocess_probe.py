@@ -25,14 +25,14 @@ pytest 在每个测试期给 root logger 挂 `LogCaptureHandler`
 绝不碰真实的 `%APPDATA%\\HP_Scan_Tool`。
 """
 
-import http.server
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
+
+from fake_http_server import FakeHttpServer, SafeHandler
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -84,16 +84,17 @@ if _MARKER:
 '''
 
 
-class _FakeEsclHandler(http.server.BaseHTTPRequestHandler):
-    """假 eSCL 设备：ScannerStatus 回 200，ScanJobs 回 409。"""
+class _FakeEsclHandler(SafeHandler):
+    """假 eSCL 设备：ScannerStatus 回 200，ScanJobs 回 409。
+
+    ★ 继承 `SafeHandler`（而不是裸 `http.server.BaseHTTPRequestHandler`）：
+    拿到「服务端 I/O 超时 + 客户端断开不炸线程 + Connection: close」三项加固。
+    裸实现曾让整轮 pytest 因「假 server 抢端口 ⇒ 客户端与 handler 双向阻塞」
+    而 abort（实测 5/5 必现），根因见 `tests/fake_http_server.py` 顶部。
+    """
 
     def _reply(self, code, body=b""):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/xml")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+        self.send_payload(body, status=code, content_type="text/xml")
 
     def do_GET(self):
         if self.path.endswith("/ScannerStatus"):
@@ -105,31 +106,20 @@ class _FakeEsclHandler(http.server.BaseHTTPRequestHandler):
         # 打印机上残留未完成任务 → 协议层据此给出 409 + 可执行指引
         self._reply(409, b"busy")
 
-    def log_message(self, *args):      # 静音 HTTP 访问日志
-        pass
-
 
 class FakeEsclServer:
-    """本地假 eSCL 设备（监听 127.0.0.1 的随机端口）。"""
+    """本地假 eSCL 设备（监听 127.0.0.1 的随机端口，**端口独占**）。"""
 
     def __init__(self):
-        self._httpd = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), _FakeEsclHandler)
-        self._thread = threading.Thread(
-            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.05},
-            daemon=True)
-        self.port = self._httpd.server_address[1]
+        self._srv = FakeHttpServer(_FakeEsclHandler)
+        self.port = self._srv.port
 
     def start(self):
-        self._thread.start()
+        self._srv.start()
         return self
 
     def stop(self):
-        try:
-            self._httpd.shutdown()
-        finally:
-            self._httpd.server_close()
-            self._thread.join(timeout=5)
+        self._srv.stop()
 
 
 def run_cli(argv, mode="conflict", appdata=None, timeout=90):
