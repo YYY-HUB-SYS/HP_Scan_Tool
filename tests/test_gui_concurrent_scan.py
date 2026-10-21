@@ -310,3 +310,76 @@ class TestSessionModeStaysSerial:
         assert len(win.started) == 1, "会话模式下开了第二批"
         assert len(win._active_jobs) == 1
         assert "等本次扫描结束" in win.status_bar.currentMessage()
+
+
+# ────────── 独立复审发现的三条（2026-10-21 修）────────────────────────
+
+class TestSessionGuardCannotBeBypassed:
+    """会话（双面 / 续扫）必须单台串行 —— 守卫不能被「扫描中切换模式」绕过。"""
+
+    def test_switching_mode_to_single_does_not_bypass_the_guard(self, win):
+        """★ 已有会话扫描在途 ⇒ 切回单面**也不许**再开一台。
+
+        旧实现只看「当前单选框」⇒ 用户在扫描进行中把模式从「续扫」切回「单面」，
+        守卫就会放行第二台 ⇒ 变成「会话 + 单面」混合 ⇒ 页面记账错乱。
+        """
+        win.mode_batch_radio.setChecked(True)          # 续扫（会话）模式
+        win.selected = _scanner("A", "192.168.1.1")
+        win._start_scan()                              # job_001 → 会话
+        assert len(win.started) == 1
+
+        win.mode_single_radio.setChecked(True)         # ★ 扫描进行中切回单面
+        win.selected = _scanner("B", "192.168.1.2")
+        win._start_scan()                              # ⇒ 必须被拦住
+        assert len(win.started) == 1, "守卫被『切换模式』绕过了（会话扫描不再串行）"
+        assert len(win._active_jobs) == 1
+
+
+class TestSessionRoutingUsesTheJobsOwnMode:
+    """页面归属必须按**该 job 自己的模式**，不是当前单选框。"""
+
+    def test_session_job_stays_in_session_when_mode_switches(
+            self, win, monkeypatch):
+        """★ 会话（续扫）启动的 job，扫描中切到「单面」也**必须**留在会话里。
+
+        旧实现用「当前单选框」判定 ⇒ 页面**从会话里漏出去**（走了预览）
+        ⇒ 用户以为并进了文档，实际单独弹了预览。
+
+        ★ 断言方向很关键：必须是「会话 job ⇒ 进会话」。
+          反过来测（单面 job ⇒ 不进会话）**测不出东西** ——
+          单面模式根本不建会话（`_session` 是 None）⇒ 旧行为在那条路径上
+          本来就不会走会话分支 ⇒ 断言恒成立（实测漏过变异）。
+        ★ 断言也不能只看 `previews` 非空：会话分支最后也会弹预览。
+          ⇒ 直接断言「会话路由被调用了」。
+        """
+        routed = []
+        monkeypatch.setattr(gui.ScanApp, "_session_batch_finished",
+                            lambda self, *a, **k: routed.append(a))
+        win.mode_batch_radio.setChecked(True)          # 续扫（会话）模式
+        win.selected = _scanner("A", "192.168.1.1")
+        win._start_scan()                              # job_001 → 会话
+        win.mode_single_radio.setChecked(True)         # ★ 扫描进行中切到单面
+        win._on_scan_finished("job_001", _result(win, "job_001"))
+        assert routed, "会话 job 的页面被漏出去了（没走会话路由）"
+
+
+class TestListenUiIsNotBlockedByARunningScan:
+    """监听结束的复位不能被「还有扫描在途」挡住（独立复审发现的回归）。"""
+
+    def test_listen_finish_reenables_listen_button_while_scan_runs(self, win):
+        """★ 扫描在途时监听结束 ⇒ listen_btn 必须被重新启用、取消监听按钮要清掉。
+
+        旧实现：监听收尾调 `_reset_scan_ui()`，而它在「还有扫描在途」时
+        早退 ⇒ listen_btn 永久禁用、取消监听按钮残留在状态栏。
+        """
+        win.selected = _scanner("A", "192.168.1.1")
+        win._start_scan()                              # 有扫描在途
+        # 造一个「监听中」的状态
+        win.listen_btn.setEnabled(False)
+        win.cancel_listen_btn = gui.AnimatedButton("取消监听",
+                                                   button_type="accent")
+        win.status_bar.addPermanentWidget(win.cancel_listen_btn)
+
+        win._reset_listen_ui()                         # 监听收尾走的路径
+        assert win.listen_btn.isEnabled(), "listen_btn 没被重新启用"
+        assert win.cancel_listen_btn is None, "取消监听按钮没被清掉"

@@ -742,6 +742,24 @@ def _active_job_count(app):
     return len(_active_jobs_of(app))
 
 
+def _has_session_job(app):
+    """在途 job 里是否有**会话**（双面 / 续扫）模式的扫描。
+
+    ★ 为什么不能只看「当前单选框」（2026-10-21 修）：
+      会话模式必须保持单台串行（正面→背面、逐批追加，本质是顺序的）。
+      若守卫只看**当前**模式，用户在扫描进行中把模式从「会话」切回「单面」，
+      守卫就会放行第二台 ⇒ 变成「会话 + 单面」混合 ⇒ 页面记账错乱。
+      ⇒ 这里改为看**在途 job 自己启动时的模式**。
+    """
+    for info in _active_jobs_of(app).values():
+        try:
+            if (info or {}).get("mode", SESSION_MODE_SINGLE) != SESSION_MODE_SINGLE:
+                return True
+        except Exception:       # pragma: no cover - 防御
+            continue
+    return False
+
+
 def _latest_active_job(app):
     """
     最近启动的在途 job（取消按钮默认取消它）。
@@ -2876,8 +2894,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # ★ 并发扫描（需求 2）：单面模式允许**多台并行**（后端 QThreadPool 4 并发）。
         #   但双面/续扫（会话）模式本质是**顺序**的（正面→背面、逐批追加）
         #   ⇒ 会话模式保持单台串行，避免两批同时入会话把"正面/背面"记账搞乱。
-        if _active_job_count(self) and _is_session_mode(self):
-            self.status_bar.showMessage("双面/续扫模式下请等本次扫描结束再扫下一台")
+        if _active_job_count(self) and (_is_session_mode(self)
+                                        or _has_session_job(self)):
+            self.status_bar.showMessage(
+                "双面/续扫模式下请等本次扫描结束再扫下一台"
+                "（已有会话扫描在途，不能并行）")
             return
 
         # 每次扫描都是新文档 ⇒ 清掉上一份文档残留的曝光参数（I-6）。
@@ -2947,7 +2968,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         job_id = self.coordinator.start_scan(self.selected, params)
         self._current_job_id = job_id
         # ★ 登记在途 job（每台各自跟踪 ⇒ 各自取消、各自回填结果）
-        _track_job(self, job_id, {"scanner": self.selected, "name": dev_title})
+        _track_job(self, job_id, {"scanner": self.selected, "name": dev_title,
+                                  "mode": mode})
         if mode != SESSION_MODE_SINGLE:
             self._pending_side_by_job[job_id] = side
 
@@ -3105,16 +3127,20 @@ class ScanApp(QMainWindow, _UiPostMixin):
                 logger.debug("页元数据汇总提示时主窗口已销毁")
         # ★ 批次 4：会话模式（双面 / 续扫）⇒ **不弹预览对话框**，
         #   页面先进会话，合并后统一给预览。
-        #   ★ 取模式必须**防御式**：既有测试里的最小替身（_StubApp）只借了
-        #     `_on_scan_finished` 这一个方法，没有会话接线 ⇒ 回落到单面。
-        mode = SESSION_MODE_SINGLE
-        getter = getattr(self, "_current_session_mode", None)
-        if getter is not None:
-            try:
-                mode = getter()
-            except Exception as e:            # pragma: no cover - 防御
-                logger.debug("取扫描模式失败，按单面处理: %s", e)
-                mode = SESSION_MODE_SINGLE
+        #   ★★ 取模式必须用**这个 job 自己的**（启动时记在在途表里），
+        #      不能用「当前单选框」：并发 / 扫描中切换模式会把页面**误投递**
+        #      （job 明明是单面却被塞进会话，或反过来从会话里漏出去）
+        #      —— 这是预存缺陷，被并发放大了。
+        mode = (info or {}).get("mode") or SESSION_MODE_SINGLE
+        if mode == SESSION_MODE_SINGLE:
+            # 兜底：该 job 没记模式（老替身 / WIA 路径）⇒ 沿用旧行为读当前单选框
+            getter = getattr(self, "_current_session_mode", None)
+            if getter is not None:
+                try:
+                    mode = getter()
+                except Exception as e:            # pragma: no cover - 防御
+                    logger.debug("取扫描模式失败，按单面处理: %s", e)
+                    mode = SESSION_MODE_SINGLE
         if mode != SESSION_MODE_SINGLE and getattr(self, "_session", None) is not None:
             self._session_batch_finished(job_id, result, mode)
             return
@@ -3316,6 +3342,28 @@ class ScanApp(QMainWindow, _UiPostMixin):
                 f"（{stale_hours} 小时内可找回），未加入会话")
             return
         self.status_bar.showMessage("扫描已取消")
+
+    def _reset_listen_ui(self):
+        """复位**监听相关**的 UI（不含扫描进度条 / 取消扫描按钮）。
+
+        ★ 为什么单独拆出来（2026-10-21 修，独立复审发现）：
+          监听模式会把 `scan_btn` 占用成「监听中...」并禁用、把 `listen_btn`
+          禁用、并在状态栏挂「取消监听」按钮。监听结束（线程收尾）或用户
+          取消监听时，**必须**复位这几处。
+
+          但并发扫描引入的 `_reset_scan_ui` 早退分支（还有别的扫描在途）
+          会**跳过**这些复位 ⇒ 结果：监听结束后 `listen_btn` 永久禁用、
+          「取消监听」按钮残留在状态栏。
+
+          ⇒ 监听路径改为**只**调本方法（与扫描 UI 的复位解耦），
+          既不影响并发语义，也不会误删正在监听时的「取消监听」按钮。
+        """
+        _refresh_scan_button(self)          # 恢复扫描按钮的文案 / 启用状态
+        self.listen_btn.setEnabled(True)
+        if hasattr(self, 'cancel_listen_btn') and self.cancel_listen_btn:
+            self.status_bar.removeWidget(self.cancel_listen_btn)
+            self.cancel_listen_btn.deleteLater()
+            self.cancel_listen_btn = None
 
     def _reset_scan_ui(self):
         """重置扫描 UI
@@ -4028,7 +4076,9 @@ class ScanApp(QMainWindow, _UiPostMixin):
                 # 否则它永远留在受保护集合里，缓存目录永远不被 eviction 回收。
                 self._release_job(job_id)
             finally:
-                self._post_ui(self._reset_scan_ui)
+                # ★ 只复位**监听**的 UI：`_reset_scan_ui` 在「还有别的扫描在途」
+                #   时会早退 ⇒ 监听结束后 listen_btn 永久禁用、取消监听按钮残留。
+                self._post_ui(self._reset_listen_ui)
 
         threading.Thread(target=_listen_thread, daemon=True).start()
 
@@ -4037,7 +4087,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if hasattr(self, '_listen_cancel_event'):
             self._listen_cancel_event.set()
         self.status_bar.showMessage("监听模式：已取消")
-        self._reset_scan_ui()
+        # ★ 同上：只复位监听 UI（扫描 UI 归扫描路径管）
+        self._reset_listen_ui()
 
     # ────────── 历史记录 ──────────
     def _show_history(self):
