@@ -169,13 +169,18 @@ begin
       UserDataDirs(False);
   end;
 
-  // 卸载收尾：把**空的应用目录**也删掉。
+  // 卸载收尾：把**空的应用目录树**也删掉。
   // ★ 为什么需要：卸载时若还有文件被占用（刚杀掉的实例句柄还没释放），
-  //   Inno 会删掉文件但**保留目录** ⇒ 用户的「程序」里留一个空文件夹。
-  //   实测：文件全删（剩 0 个）但 `{app}` 空目录还在。
-  //   RemoveDir 只删**空**目录 ⇒ 非空时静默失败（不报错，不影响卸载结果）。
+  //   Inno 会删掉文件但**保留目录** ⇒ 用户的「程序」里留一棵树
+  //   （实测：文件全删（剩 0 个）但 `{app}` 下的 `_internal\...` 空目录全在）。
+  // ★ 用 DelTree 而不是 RemoveDir：RemoveDir **只删空目录**，而卸载那一刻
+  //   目录还非空（文件正被占用）⇒ 静默失败 ⇒ 目录树照样留下。
+  //   DelTree 递归删目录、但**不删文件**（DeleteFiles=False）
+  //   ⇒ 被占用的文件留着（Inno 会报"无法删除"），空的目录树清掉。
+  //   ★ Inno 7 的 DelTree 是 **4 参**：DelTree(Path, IsDir, DeleteFiles, RecurseSubdirs)
+  //   （6 参/5 参都报 "Invalid number of parameters"，用小脚本逐个试出来的）
   if CurUninstallStep = usPostUninstall then
-    RemoveDir(ExpandConstant('{app}'));
+    DelTree(ExpandConstant('{app}'), True, False, True);
 end;
 
 // ── 升级时的兜底强退 ────────────────────────────────────────────────────
