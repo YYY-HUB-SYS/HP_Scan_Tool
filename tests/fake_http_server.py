@@ -1,12 +1,14 @@
 r"""
 测试用本地假 HTTP 服务（假 eSCL 设备替身）—— **抗挂死加固版**
 
-★ 为什么需要这个模块（2026-10-21 实测根因）
+★ 为什么需要这个模块（2026-10-21 实测）
 ------------------------------------------------------------------
 `tests/test_capabilities_known.py` 原先直接用
 `http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)` 起假设备。
-在**全量上下文**里，这个组合会**必现**地把整个 pytest 进程干掉
-（实测：6 文件子集 5/5 全崩，15~18 秒一轮，无并发也能复现）。
+在**全量上下文**里，这个组合会**低频但反复**地把整个 pytest 进程干掉
+（实测：6 文件子集 5/5 全崩，15~18 秒一轮；★ 订正：用 worktree 把同一份旧代码
+搬到安静机器上重测是 **6/6 不崩** ⇒ 这是**概率事件（约 5%~25%）**，
+不是代码的稳定属性）。
 
 崩溃栈每一轮逐字相同：
 
@@ -17,28 +19,39 @@ r"""
               → end_headers → do_GET
               （服务端正要把 status line 发出去）
 
-**根因（实测坐实，不是推断）**：
+★ **机制尚未定位**（独立 verifier 复核后订正了此前的说法，勿照抄旧版）：
 
-1. `http.server.HTTPServer.allow_reuse_address = 1` ⇒ 监听 socket 设了
-   `SO_REUSEADDR`。**Windows 上 `SO_REUSEADDR` 允许两个 socket 绑同一个端口**
-   （实测：第二个 socket bind 成功；不设它则 10048 独占失败）。
-2. ⇒ 同一进程里可以出现**两个监听同一端口的假 server**。
-3. ⇒ 客户端 `connect()` 的连接被投递到**其中某一个**（实测投递到先绑的那个），
-   另一个 server 的 handler 线程就在往一个「对端不读」的 socket 上 `sendall`。
-4. ⇒ 客户端等 status line、服务端卡在 sendall ⇒ **双向阻塞**。
-   双方都读不到数据 ⇒ socket 读超时（实测 urllib3 确实把 3 秒读超时装上了，
-   见 `urllib3/connection.py:627` `sock.settimeout(self.timeout)`）**也不触发**
-   （实测卡了 9 分钟）。
-5. ⇒ 进程最终 `Fatal Python error: Aborted`（5/5）或永久挂死（实测挂满 600 秒）。
+- ⚠️ **此前这里写「根因 = 同端口双监听 ⇒ 连接被投递到另一个 listener ⇒
+  两端错配」—— 这一条被实测否掉了**：Windows 上双 bind 确实成功，
+  但连接**只会投递给先绑的那个 listener** ⇒ 非胜出 listener 根本没有连接
+  ⇒ **双监听本身不足以产生互锁**。
+- ⇒ 下面是**已知事实**与**强线索**，不是已证根因：
+  1. `http.server.HTTPServer.allow_reuse_address = 1` ⇒ 监听 socket 设了
+     `SO_REUSEADDR`。**Windows 上它允许两个 socket 绑同一个端口**
+     （实测：第二个 bind 成功；不设则 10048 独占失败）⇒ 必须消除这个危险面。
+  2. 旧版 handler 用 `protocol_version = "HTTP/1.1"`（**keep-alive**）且响应
+     **不带 `Connection: close`** ⇒ 服务端响应后**不关连接**，handler 线程回到
+     `handle_one_request()` 阻塞在 `self.rfile.readline()` **等下一个请求**；
+     而 `self.rfile` 是带**预读**的 BufferedReader（8192 字节）。
+  3. `socketserver.ThreadingMixIn.server_close()` 会 `self._threads.join()`
+     ⇒ 卡在 `readline()` 的 handler 会让 teardown **永久阻塞**。
+  4. 客户端侧：urllib3 确实把 3 秒读超时装上了
+     （`urllib3/connection.py:627` `sock.settimeout(self.timeout)`、
+     `connectionpool.py:536` `conn.timeout = read_timeout`），但实测**卡了 9 分钟
+     都没触发** ⇒ 读超时在此状态下不可靠。
+  5. ⇒ 现象：客户端等 status line、服务端卡在 sendall ⇒ 双向阻塞 ⇒ 进程最终
+     `Fatal Python error: Aborted` 或永久挂死（实测挂满 600 秒）。
 
-**本模块的四道加固**（每道都对应上面一条可触达条件）：
+**本模块的五道加固**（消除可触达条件；★ **不是「已根治」**）：
 
 | 加固 | 消除的条件 |
 |------|-----------|
-| `allow_reuse_address = False` + `allow_reuse_port = False` | 端口**独占** ⇒ 同端口双监听不可能出现（根因 1、2） |
-| bind 撞端口（10048）时**换端口重试** | 独占后 bind 可能失败 ⇒ 必须能换端口而不是崩掉 |
-| 服务端 socket `settimeout` + 吞掉客户端断开异常 | handler 线程不会永久阻塞在 send/recv；也不会产生未捕获线程异常 |
-| `block_on_close = False` + `daemon_threads = True` | teardown 不会 join 卡死的 handler 线程 ⇒ 不会把 pytest 挂住 |
+| `allow_reuse_address = False` + `allow_reuse_port = False` | 端口**独占** ⇒ 同一端口上不会出现两个监听 socket（消除 §1 的危险面） |
+| bind 撞端口（10048）时**换端口重试** | 独占后 bind 会**明确报错** ⇒ 必须能换端口而不是崩掉 |
+| 服务端 socket `settimeout` | handler 线程不会永久阻塞在 send/recv |
+| 响应带 `Connection: close` | 响应后即关连接 ⇒ handler 不再回到 `readline()` 等下一个请求（直接针对 §2、§3） |
+| `block_on_close = False` + `daemon_threads = True` | teardown 不会 join 卡死的 handler 线程 ⇒ 不会把 pytest 挂住（直接针对 §3） |
+| 吞掉「客户端已断开」类异常 | 消除实测出现过的 `PytestUnhandledThreadExceptionWarning` |
 
 ★ 用法（两个调用方统一走这里）：
     with fake_escl_server(CAPS_XML) as base:
@@ -80,7 +93,7 @@ class _ExclusiveThreadingHTTPServer(http.server.ThreadingHTTPServer):
 
     daemon_threads = True
     block_on_close = False        # ★ 不 join handler 线程（卡死的 handler 不能拖住 teardown）
-    allow_reuse_address = False   # ★ 端口独占（根因）
+    allow_reuse_address = False   # ★ 端口独占（消除 SO_REUSEADDR 共享危险面）
     allow_reuse_port = False      # ★ 同上（SO_REUSEPORT 同样允许共享）
     request_queue_size = 32
 
