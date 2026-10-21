@@ -17,6 +17,19 @@ Windows 本地扫描驱动接口，作为 eSCL 不可用时的降级方案。仅
 **ScanJob**
 一次扫描任务的生命周期：POST 创建 → 轮询状态 → GET NextDocument 获取图像数据。
 
+**能力已知 (capabilities_known)**
+`ScannerInfo` 上的布尔字段：**设备到底有没有 ADF 的唯一权威信号**。
+只有 `fetch_capabilities()` 真的拿到能力文档（HTTP 200 + XML 可解析）才置位；
+走 `ScannerStatus` 回退探测**不置位**（那是「猜」，不是「知道」）。
+⚠️ 旧的「能力字段指纹前后对比」启发式已废弃 —— 在 WSD / GUI 链路上它是幂等 no-op，
+会把真机误判成「能力未知」从而丢掉自动回退。
+
+**命名形态 (Naming)**
+跨入口统一的产物/任务命名：`{前缀}_{秒级时间戳}_{字母开头的短随机后缀}`。
+★ 唯一性来自 `uuid4()`（OS CSPRNG），时间戳只做可读性前缀；
+★ **秒级而非微秒** —— Windows 时钟粒度 15.625 ms，同 tick 内微秒位本来就相同，
+属于**虚假精度**；★ 首字符固定是字母 ⇒ 不会长得像 `_001` 组号。
+
 ## 发现与连接
 
 **mDNS 发现**
@@ -40,6 +53,21 @@ RGB24（彩色）、Grayscale8（灰度）、BlackAndWhite1（黑白）。
 
 **输出格式 (DocumentFormat)**
 扫描数据的 MIME 格式：image/jpeg、image/png、image/tiff、application/pdf。
+
+**曝光 (Exposure)**
+落盘前的图像曝光/对比度调整（`exposure.py`，纯 PIL）。
+★ 2026-10-20 起**已并回本项目**（v3.3—2026-10-20 期间曾随 DocFix 剥离）。
+落盘链路顺序：**曝光 → 旋转 → A4 归一**；`jpg`/`png`/`tiff` 产物**也**过 `_a4_canvas`
+⇒ 同一页的图片与 PDF 尺寸必然一致。
+
+**预设 (Preset)**
+一组扫描/曝光参数的可复用组合（`preset_manager.py`），内置 4 个 + 用户自定义，
+持久化于 `%APPDATA%\HP_Scan_Tool\presets.json`。
+
+**倾斜角与纠偏 (Skew / Deskew)**
+`skew_detect.py`（纯 PIL 投影法，零第三方依赖）在**每页写入缓存后**测一次倾斜角，
+写进 `page_meta.deskew_angle`（**绝不旋转缓存原件**）；落盘时 `save_manager` 按阈值
+（默认 0.5°）施加纠偏。★ 阈值相关 4 个配置键见「持久化」段的 v4.0 口径注。
 
 ## 持久化
 
@@ -71,6 +99,13 @@ scan_config.json 文件，保存用户偏好：分辨率、颜色模式、格式
 微软推的设备发现协议，SOAP over WS-Discovery。与 mDNS 并行运行，结果按 IP 去重合并，最大化发现率。实现在 `wsd_engine.py`。
 
 ## 多页扫描
+
+**扫描会话 (Document Session)**
+一次「结束并保存」之前累积的所有页的集合（`document_session.py`）：多页、
+插入/移除分割线分组、双面续扫、中途从第 N 页重扫。
+★ 落盘时按组产出 `{base}.pdf` / `{base}_001.pdf` …；
+★ 会话状态采用**三方合并**（磁盘 / 进程内 / 用户上次已保存）⇒ 并发保存不丢页，
+也不会让已删的页复活。
 
 **批量预览 (Batch Preview)**
 多页 ADF 扫描全部完成后统一预览，用户可翻页查看/删除/调整，最后一次性保存。

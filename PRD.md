@@ -493,12 +493,15 @@ HP_Scan_Tool/
 ├── profile_manager.py      # 按设备保存扫描参数
 ├── history_manager.py      # 扫描历史日志
 ├── config_io.py            # 配置 I/O 共享层（原子写 + 跨进程锁）
+├── naming.py               # 跨入口命名形态（秒级时间戳 + 字母开头随机后缀；唯一性来自 uuid4）
 ├── cli.py                  # CLI 命令行入口
 ├── build_exe.py            # PyInstaller 打包脚本
 ├── tools/verify_scan.py    # 真机扫描验证脚本（产出 report.json）
 ├── requirements.txt        # pip 依赖声明
 ├── run.bat                 # 开发环境启动脚本
 ├── PRD.md                  # 本文件
+├── tests/                  # pytest 套件（79 个 .py：conftest 1 + test_* 75 + 辅助模块 3）
+├── docs/                   # 设计 / 审计 / 验证 / 计划文档
 └── dist/
     └── HP_Scan_Tool.exe    # 最终交付物（2026-10-21 11:1x 用最终代码重打实测 65,987,523 字节 ≈ 62.93 MiB；旧数字 65,866,395 / 64,968,184 字节分别是 01:30 的包与 2026-10-20 改造前基线）
 ```
@@ -515,8 +518,16 @@ HP_Scan_Tool/
 | eSCL 探活 | 后台 daemon | ~3s/台 |
 | 能力查询 | 后台 daemon | ~5s |
 | 状态查询 | 后台 daemon | ~4s |
-| 扫描执行 | 后台 daemon | 最多 120s |
+| 扫描执行（单页 / 多页） | 后台 daemon | 最多 **90s / 300s** |
+| eSCL HTTP 调用 | 后台 daemon | **socket 超时 + 墙钟看门狗** 双保险（`escl_engine._http_call_bounded`） |
 | UI 渲染 | 主线程 | — |
+
+> ⚠️ **2026-10-21 订正**：原表写「扫描执行 最多 120s」—— 已过期。协调器实际传
+> **单页 90 秒**（`scan_coordinator.py`）、**多页 300 秒**（`execute_multipage_scan`）。
+> ★ **墙钟看门狗**是本轮新增的一层：实测 `requests` 的 socket 读超时在「对端接受连接
+> 但迟迟不回数据」的状态下**可能长时间不触发**（抓到过卡 9 分钟的样本）⇒ 只靠
+> socket 超时，一台半死不活的扫描仪就能把扫描线程永久卡死。墙钟到期按
+> `ReadTimeout` 抛出，走既有的「设备无响应」中文提示链路。
 
 ### 3.4 打包配置
 

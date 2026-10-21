@@ -107,9 +107,15 @@ resources/
 
 Resource path resolution: `get_resource_path()` adds `resources/` prefix in development mode, uses `sys._MEIPASS` in frozen mode.
 
-### Deprecated/Stripped Code
+### Reinstated Modules (`exposure.py` / `preset_manager.py`)
+
+> ⚠️ **2026-10-21 订正**：本节标题原为 `Deprecated/Stripped Code` —— 那是 **v3.3（2026-07-19）** 的状态，
+> 标题本身成了**过期句**，会让人把这两个文件当死代码。内容早已订正，**这次把标题也一并改掉**。
 
 `exposure.py` and `preset_manager.py` are **active again** as of 2026-10-20. They were stripped in v3.3 (2026-07-19) and moved to a separate DocFix project, but that standalone DocFix software was abandoned and the basic exposure/filter features were **merged back into this project** (ADR-0008 + `docs/design/2026-10-20_新功能调研与方案_双面_续扫_纠偏_曝光_v1.0.md`). `hp_scan_gui_pyside.py` imports `preset_manager` / `exposure` for the preview exposure panel, and `save_manager.py` applies `apply_exposure` on the save path (曝光 → 旋转 → A4 归一). Presets persist at `%APPDATA%\HP_Scan_Tool\presets.json`. **Do not treat them as dead code.**
+
+★ **2026-10-21 再订正（保存路径现状）**：`jpg` / `png` / `tiff` 产物**一律也过 `_a4_canvas`** ⇒
+同一页的**图片**与 **PDF** 产物尺寸必然一致（2480×3507 @300dpi）。原来只说 PDF 过 A4 归一，已过期。
 
 The `_docfix_reserve/` directory no longer exists (removed long ago; it is not in the repo).
 
