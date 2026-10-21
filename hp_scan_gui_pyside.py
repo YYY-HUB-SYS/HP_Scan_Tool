@@ -5369,156 +5369,6 @@ def adjust_splits_after_delete(splits, page_idx: int):
     return new_splits
 
 
-class SaveGroupNameDialog(QDialog):
-    """
-    「重命名分组」模态对话框（**独立窗口**，保存前弹出）。
-
-    ★ 为什么是**独立对话框**（而不是在多页预览里塞输入框）
-      用户红线：主窗口与预览对话框的 **UI 样式与布局不许改**
-      ⇒ 不新增 / 删除 / 移动 `MultiPagePreviewDialog` 的任何控件
-      ⇒ 入口做成「保存前弹出的独立模态窗口」，
-        `MultiPagePreviewDialog` 的控件树**零改动**。
-
-    ★ 为什么组名只在**多组**时生效
-      单组场景的文件名契约是 `{base}.pdf` / `{base}_{组内序号:03d}.{ext}`
-      （与「单页任务」「直接保存」完全一致）⇒ 单组时**不弹窗、不传组名**，
-      产物名与改造前**逐字节一致**。
-
-    ★ 组名留空 ⇒ 净化后为空 ⇒ 落盘时回落到组号 `{组号:03d}`
-      ⇒ 行为与改造前完全一致。
-
-    ★ 组名进的是**文件名** ⇒ 必须净化（Windows 非法字符 / 路径分隔符 /
-      控制字符 / 结尾的点与空格 / 超长）。净化口径**只有一份**：
-      `save_manager.sanitize_group_name`（纯 Python，**不 import Qt**），
-      本对话框的**实时预览**也用它 ⇒ 预览与实际落盘不会分叉。
-    """
-
-    def __init__(self, parent, group_count, page_counts, base_name, ext):
-        super().__init__(parent)
-        self.setWindowTitle("重命名分组")
-        self.setModal(True)
-        self.resize(680, 420)
-        self._group_count = max(0, int(group_count or 0))
-        self._page_counts = list(page_counts or [])
-        self._base_name = str(base_name or "")
-        self._ext = str(ext or "")
-        self._edits = []
-        self._previews = []
-        self._labels = []
-        self._setup_ui()
-        self._refresh_previews()
-
-    def _setup_ui(self):
-        """每组一行：组标签 + 名字输入框 + 最终文件名预览。"""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(SPACING["md"])
-
-        hint = QLabel("给每一组起个名字（可以留空）—— 留空则沿用组号 001 / 002 …")
-        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        grid = QGridLayout()
-        grid.setSpacing(SPACING["sm"])
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-        for gi in range(1, self._group_count + 1):
-            page_count = (self._page_counts[gi - 1]
-                          if gi - 1 < len(self._page_counts) else 0)
-            name_label = QLabel(f"第 {gi} 组（共 {page_count} 页）")
-            name_label.setStyleSheet(f"color: {COLORS['text_primary']};")
-            edit = QLineEdit()
-            edit.setPlaceholderText(f"留空则用组号 {gi:03d}")
-            edit.textChanged.connect(self._on_name_changed)
-            preview = QLabel("")
-            preview.setStyleSheet(f"color: {COLORS['text_muted']};")
-            grid.addWidget(name_label, gi - 1, 0)
-            grid.addWidget(edit, gi - 1, 1)
-            grid.addWidget(preview, gi - 1, 2)
-            self._labels.append(name_label)
-            self._edits.append(edit)
-            self._previews.append(preview)
-        layout.addLayout(grid)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(SPACING["sm"])
-        btn_layout.addStretch(1)
-
-        self.btn_cancel = AnimatedButton("取消", button_type="secondary")
-        self.btn_cancel.clicked.connect(self.reject)
-        btn_layout.addWidget(self.btn_cancel)
-
-        self.btn_save = AnimatedButton("保存", button_type="primary")
-        self.btn_save.clicked.connect(self.accept)
-        btn_layout.addWidget(self.btn_save)
-
-        layout.addLayout(btn_layout)
-
-    def _on_name_changed(self, _text=""):
-        """输入变化 ⇒ 刷新所有组的文件名预览。"""
-        self._refresh_previews()
-
-    def exec(self):
-        """
-        弹窗（模态）。
-
-        ★ **无头环境保护**：`QT_QPA_PLATFORM=offscreen`（自动化 / CI / 无显示器的
-          机器）下**没有人能点这个模态框** ⇒ 不自动关就会把整个进程**挂死**
-          ⇒ 此时用 0ms 定时器**自动接受**（组名留空 ⇒ 落盘回落到组号
-          ⇒ 行为与「没有这个功能」完全一致）。
-          正式环境（windows 平台）**不触发**这条路径。
-        """
-        if QApplication.platformName() in ("offscreen", "minimal"):
-            QTimer.singleShot(0, self.accept)
-        return super().exec()
-
-    def _preview_name(self, group_index: int, raw: str) -> str:
-        """
-        某组的最终文件名（**该组第一个产物**的文件名）。
-
-        ★ 走的是 `save_manager.build_output_name` + `save_manager.sanitize_group_name`
-          ⇒ 与落盘侧**同一套口径**（预览看到什么，落盘就是什么）。
-        ★ 图片产物一组多文件 ⇒ 预览取组内序号 001 的那个。
-        """
-        sanitized = save_manager.sanitize_group_name(raw)
-        return save_manager.build_output_name(
-            self._base_name, self._ext, self._group_count, group_index, 1,
-            sanitized)
-
-    def _refresh_previews(self):
-        """按当前输入刷新每组的文件名预览。"""
-        for offset, edit in enumerate(self._edits):
-            self._previews[offset].setText(
-                self._preview_name(offset + 1, edit.text()))
-
-    def group_names(self) -> list[str]:
-        """
-        返回每组的组名（**已净化**；留空的组返回 ""）。
-
-        ★ 返回**净化后**的值：落盘侧 `save_manager` 还会再净化一次
-          （净化是幂等的 ⇒ 结果一致）⇒ 预览与落盘不会分叉。
-        ★ 长度恒等于组数 ⇒ 下标 0 对应第 1 组。
-        ★ **取消后恒为空串**（见 `reject`）⇒ 取消语义明确：
-          没有可用的组名，接线层直接放弃保存。
-        """
-        return [save_manager.sanitize_group_name(edit.text())
-                for edit in self._edits]
-
-    def reject(self):
-        """
-        取消 ⇒ **组名作废**（输入框清空、预览不更新）。
-
-        ★ 取值口径：取消 ⇒ `group_names()` 返回全空串列表
-          ⇒ 接线层（`_confirm`）看到 `exec() != Accepted` 直接放弃保存，
-            不会有"半套组名"被带进落盘。
-        """
-        for edit in self._edits:
-            edit.blockSignals(True)
-            edit.clear()
-            edit.blockSignals(False)
-        super().reject()
-
-
 class MultiPagePreviewDialog(QDialog, _UiPostMixin):
     """多页预览对话框（UI 优化版）"""
 
@@ -5537,7 +5387,14 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self.pages = list(range(1, page_count + 1))
         self.selected_idx = 0
         self.splits = set()
+        # ★ 组名（重命名分组）：**组号（1 基）→ 组名**；唯一真源。
+        #   组结构变化（切分 / 删页）后会留下过期条目 ⇒ 收集时按**当前组数**
+        #   取前 N 个即可，多余的忽略（不报错）。
         self.group_names = {}
+        # ★ 逐页曝光覆盖：**页号 → 该页的显式曝光 dict**（只装**有覆盖**的页）。
+        #   ★ 值**永远不是 None** —— 落盘侧的 None 表示「跟随整批」，
+        #     所以「本页明确不套曝光」必须存成显式的 mode="off" dict。
+        self._page_exposure = {}
         self._rotations = {}
         self._cropped = set()
         # 裁边结果：页号 → 文件路径（不覆盖缓存原件）
@@ -5566,6 +5423,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self._setup_ui()
         self._update_preview()
         self._refresh_thumbs()
+        self._sync_page_exposure_panel()
         add_fade_animation(self, ANIM["normal"])
 
     # ────────── 线程 / 生命周期 ──────────
@@ -5595,7 +5453,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
 
         self.thumbs_scroll = QScrollArea()
         self.thumbs_scroll.setWidgetResizable(True)
-        self.thumbs_scroll.setFixedWidth(120)
+        # ★ 缩略图列加宽 120 → 180（要放得下每组的「组名输入框」）
+        self.thumbs_scroll.setFixedWidth(180)
         self.thumbs_container = QWidget()
         self.thumbs_layout = QVBoxLayout(self.thumbs_container)
         self.thumbs_layout.setSpacing(4)
@@ -5627,6 +5486,34 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         self.exposure_panel = ExposurePanel(self, exposure=self._initial_exposure)
         self.exposure_panel.params_changed.connect(self._on_exposure_changed)
         layout.addWidget(self.exposure_panel)
+
+        # ── 本页曝光（逐页覆盖）──────────────────────────────────────────
+        #   文档级曝光之外，允许**当前页单独**调一套曝光；
+        #   没有单独设置的页**跟随整批**（落盘侧按 page_exposures 逐页判定）。
+        self.page_exposure_panel = ExposurePanel(self, exposure=None)
+        self.page_exposure_panel.header_btn.setText("本页曝光")
+        self.page_exposure_panel.params_changed.connect(self._on_page_exposure_changed)
+        layout.addWidget(self.page_exposure_panel)
+
+        page_exp_row = QHBoxLayout()
+        page_exp_row.setSpacing(SPACING["sm"])
+
+        self.page_exposure_single_btn = AnimatedButton("本页单独设置", button_type="secondary")
+        self.page_exposure_single_btn.setToolTip("以当前整批曝光为初值，给当前页单独设置曝光")
+        self.page_exposure_single_btn.clicked.connect(self._on_page_exposure_detach)
+        page_exp_row.addWidget(self.page_exposure_single_btn)
+
+        self.page_exposure_follow_btn = AnimatedButton("跟随整批", button_type="secondary")
+        self.page_exposure_follow_btn.setToolTip("撤销当前页的单独曝光 ⇒ 跟随整批")
+        self.page_exposure_follow_btn.clicked.connect(self._on_page_exposure_follow)
+        page_exp_row.addWidget(self.page_exposure_follow_btn)
+
+        self.page_exposure_state_label = QLabel("本页曝光：跟随整批")
+        self.page_exposure_state_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        page_exp_row.addWidget(self.page_exposure_state_label)
+
+        page_exp_row.addStretch()
+        layout.addLayout(page_exp_row)
 
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(SPACING["sm"])
@@ -5735,9 +5622,151 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                 break
         return group
 
+    # ────────── 组名（重命名分组） ──────────
+    def _group_starts(self):
+        """
+        每个组的 (组号 1 基, 起始页下标) —— 按页顺序。
+
+        ★ 口径与 `_build_groups`（scan_coordinator.compute_page_groups）一致：
+          第 1 组从第 0 页开始；第 g 组从第 g-1 个分割点开始。
+        ★ 过滤掉非法分割点（0 与越界）⇒ 不会产出空组，组数也不会虚高。
+        """
+        starts = [(1, 0)]
+        for sp in sorted(self.splits):
+            if 0 < sp < len(self.pages):
+                starts.append((len(starts) + 1, sp))
+        return starts
+
+    def _make_group_name_edit(self, group_no):
+        """
+        某一组的**组名输入框**（放在该组第一页的缩略图之前）。
+
+        ★ 初始文本从 `self.group_names` 取 ⇒ `_refresh_thumbs()` 重建后名字仍在。
+        ★ `textChanged` ⇒ 写回 `self.group_names`（唯一真源）。
+        """
+        edit = QLineEdit()
+        edit.setPlaceholderText(f"第 {group_no} 组名（留空用组号）")
+        edit.setToolTip(f"第 {group_no} 组的名字；留空则该组文件名用组号 {group_no:03d}")
+        edit.setText(self.group_names.get(group_no, ""))
+        edit.textChanged.connect(
+            lambda text, g=group_no: self._on_group_name_changed(g, text))
+        return edit
+
+    def _on_group_name_changed(self, group_no, text):
+        """组名输入框变化 ⇒ 写回 `self.group_names`（唯一真源）。"""
+        self.group_names[group_no] = text
+
+    def _current_group_name(self, group_no):
+        """某组的组名（**已净化**；空 ⇒ ""）。"""
+        try:
+            return save_manager.sanitize_group_name(
+                self.group_names.get(group_no, "") or "")
+        except Exception:
+            return ""
+
     # ────────── 曝光 ──────────
     def _on_exposure_changed(self):
         """曝光参数变化 → 重算预览（文档级参数，作用于全部页）。"""
+        self._recompute_preview()
+
+    # ────────── 逐页曝光（覆盖整批） ──────────
+    def _current_page_num(self):
+        """当前页的**页号**（1 基）；没有选中页时返回 None。"""
+        if not self.pages:
+            return None
+        if not (0 <= self.selected_idx < len(self.pages)):
+            return None
+        return self.pages[self.selected_idx]
+
+    def _current_exposure(self):
+        """
+        当前页**生效**的曝光参数。
+
+        ★ 优先用该页的**显式覆盖**（`self._page_exposure`）；
+          没有覆盖才跟随整批（`self.exposure_panel`）。
+        ★ 覆盖值可能是「显式关闭态」（mode="off"）⇒ 原样返回该 dict
+          （apply_exposure 对 mode="off" 原样返回 ⇒ 这一页明确不套曝光，
+            正好覆盖掉整批的曝光）。
+        """
+        page_num = self._current_page_num()
+        if page_num is not None:
+            override = self._page_exposure.get(page_num)
+            if override is not None:
+                return override
+        return self.exposure_panel.exposure_dict()
+
+    def _sync_page_exposure_panel(self):
+        """
+        把「本页曝光」面板回填成**当前页**的覆盖（没有覆盖 ⇒ 回填成关闭态）。
+
+        ★ 回填走 `set_exposure`（内部抑制信号）⇒ 不会误触发重算或写回。
+        """
+        page_num = self._current_page_num()
+        override = self._page_exposure.get(page_num) if page_num is not None else None
+        self.page_exposure_panel.set_exposure(override)
+        self._update_page_exposure_state()
+
+    def _update_page_exposure_state(self):
+        """刷新「本页曝光」状态标签。"""
+        page_num = self._current_page_num()
+        if page_num is not None and page_num in self._page_exposure:
+            text = "本页曝光：自定义"
+        else:
+            text = "本页曝光：跟随整批"
+        self.page_exposure_state_label.setText(text)
+
+    def _on_page_exposure_detach(self):
+        """「本页单独设置」⇒ 给当前页建一个覆盖（初值 = 整批当前曝光）。"""
+        page_num = self._current_page_num()
+        if page_num is None:
+            return
+        params = self.exposure_panel.exposure_dict()
+        if not params:
+            # 整批没开曝光 ⇒ 用中性值起头（手动模式、参数全默认值）
+            params = {"mode": ExposurePanel.MODE_MANUAL, "brightness": 0,
+                      "contrast": 0, "gamma": 1.0, "shadows": 0,
+                      "highlights": 0, "channel_gains": [1.0, 1.0, 1.0]}
+        else:
+            params = dict(params)
+            params["channel_gains"] = list(
+                params.get("channel_gains") or (1.0, 1.0, 1.0))
+        self._page_exposure[page_num] = params
+        self.page_exposure_panel.set_exposure(params)
+        self._update_page_exposure_state()
+        self._recompute_preview()
+
+    def _on_page_exposure_follow(self):
+        """「跟随整批」⇒ 删掉当前页的覆盖 ⇒ 该页回到整批曝光。"""
+        page_num = self._current_page_num()
+        if page_num is None:
+            return
+        self._page_exposure.pop(page_num, None)
+        self.page_exposure_panel.set_exposure(None)
+        self._update_page_exposure_state()
+        self._recompute_preview()
+
+    def _on_page_exposure_changed(self):
+        """
+        本页面板参数变化 ⇒ 写进当前页的覆盖 ⇒ 刷新状态 ⇒ 重算预览。
+
+        ★ ★ `ExposurePanel.exposure_dict()` 在 mode=off 时返回 **None**；
+          而落盘侧的 None 表示「**跟随整批**」⇒ 这里必须存**显式的关闭态**
+          dict，否则用户把本页面板关掉就等于「放弃覆盖」而不是「这一页不套曝光」。
+        """
+        page_num = self._current_page_num()
+        if page_num is None:
+            return
+        params = self.page_exposure_panel.exposure_dict()
+        if params is None:
+            params = {"mode": ExposurePanel.MODE_OFF, "brightness": 0,
+                      "contrast": 0, "gamma": 1.0, "shadows": 0,
+                      "highlights": 0, "channel_gains": [1.0, 1.0, 1.0]}
+        else:
+            params = dict(params)
+            params["channel_gains"] = list(
+                params.get("channel_gains") or (1.0, 1.0, 1.0))
+        self._page_exposure[page_num] = params
+        self._update_page_exposure_state()
         self._recompute_preview()
 
     def _recompute_preview(self):
@@ -5747,10 +5776,13 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         manual 约 **0.130s/页**（300dpi A4 主线程实测：decode 0.026s
         + apply_exposure 0.065s + QPixmap 0.039s）⇒ 同步重算，量级可接受；
         auto（约 0.37s/页）放工作线程算，完了经 _post_ui 回主线程刷新 QPixmap。
+
+        ★ 用的是**当前页生效**的曝光（`_current_exposure`）：
+          该页有单独覆盖 ⇒ 用覆盖；没有 ⇒ 跟随整批。
         """
         self._exposure_token += 1
         token = self._exposure_token
-        params = self.exposure_panel.exposure_dict()
+        params = self._current_exposure()
         if not params or params.get("mode") != ExposurePanel.MODE_AUTO:
             self._update_preview()
             return
@@ -5791,7 +5823,7 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
     def _update_preview(self):
         """同步渲染当前页（曝光 → 旋转）。"""
         try:
-            params = self.exposure_panel.exposure_dict()
+            params = self._current_exposure()
             page_num = self.pages[self.selected_idx]
             with Image.open(self._source_path(page_num)) as src:
                 img = src.copy()
@@ -5817,7 +5849,12 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             rot_text = f" (旋转 {rotation}°)" if rotation else ""
             group_text = ""
             if self.splits:
-                group_text = f" · 第 {self._group_index_of(self.selected_idx)} 组"
+                group_no = self._group_index_of(self.selected_idx)
+                group_text = f" · 第 {group_no} 组"
+                # ★ 组名也显示出来（净化后的口径 ⇒ 与产物文件名一致）
+                name = self._current_group_name(group_no)
+                if name:
+                    group_text += f"（{name}）"
             self.page_info_label.setText(
                 f"第 {self.selected_idx + 1} 页 / 共 {len(self.pages)} 页"
                 f"{group_text}{rot_text}")
@@ -5830,6 +5867,13 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             if widget:
                 widget.deleteLater()
 
+        # ★ 每组一个「组名输入框」：放在该组**第一页的缩略图之前**
+        #   （第 1 组没有分隔线 ⇒ 直接放在第 1 个缩略图之前；
+        #     第 2..N 组在分隔线**之后**、该页缩略图之前）
+        group_no_at = {}
+        for group_no, start_idx in self._group_starts():
+            group_no_at[start_idx] = group_no
+
         for idx, page_num in enumerate(self.pages):
             # 分组线：在该页缩略图上方画一条分隔线（用户要看得见分组真的存在）
             if idx in self.splits:
@@ -5838,6 +5882,10 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                 sep.setFixedHeight(3)
                 sep.setStyleSheet(f"background: {COLORS['primary']}; border: none;")
                 self.thumbs_layout.addWidget(sep)
+            # 组名输入框（分隔线之后、该页缩略图之前）
+            group_no = group_no_at.get(idx)
+            if group_no is not None:
+                self.thumbs_layout.addWidget(self._make_group_name_edit(group_no))
             try:
                 img = Image.open(self._source_path(page_num))
                 rotation = self._get_rotation(page_num)
@@ -5867,6 +5915,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
 
     def _on_thumb_clicked(self, idx):
         self.selected_idx = idx
+        # ★ 换页 ⇒ 「本页曝光」面板回填成**新当前页**的覆盖
+        self._sync_page_exposure_panel()
         self._recompute_preview()
         self._refresh_thumbs()
 
@@ -6029,6 +6079,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         if self.selected_idx >= len(self.pages):
             self.selected_idx = len(self.pages) - 1
 
+        # ★ 换页 ⇒ 「本页曝光」面板回填成**新当前页**的覆盖
+        self._sync_page_exposure_panel()
         self._recompute_preview()
         self._refresh_thumbs()
 
@@ -6044,8 +6096,10 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
           （纯函数入口 + PDF 体积预检回调，无 Qt 依赖）。
         ★ 裁过边的页用裁边件（原件保持只读）
         ★ 分组由 splits 决定，命名走 save_manager.build_output_name 的多组规则
-        ★ **多组**时先弹「重命名分组」独立模态对话框（`SaveGroupNameDialog`），
-          用户给的名字会经 save_manager 落到产物文件名里；单组不弹窗、不传组名。
+        ★ **组名就地填写**：多页预览左侧每个组有一个「组名输入框」，
+          保存时按组顺序收集进 `SaveRequest.group_names`；**不再弹任何对话框**。
+        ★ **逐页曝光覆盖**：按 `self.pages` 同序收集进 `SaveRequest.page_exposures`
+          （与 `page_specs` 下标天然对齐；没有覆盖的页为 None ⇒ 跟随整批）。
         """
         if getattr(self, "_saving", False):
             return
@@ -6055,20 +6109,16 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         groups = self._build_groups()
         total_pages = len(page_specs)
 
-        # ★★ 「重命名分组」：只在**多组**时弹独立模态对话框（保存前）
-        #   · 单组场景文件名契约与改造前逐字节一致 ⇒ 不弹窗、不传组名。
-        #   · 弹窗必须放在 `self._saving = True` **之前**：用户取消时直接 return
-        #     ⇒ 不落盘、不改任何状态，按钮也不会卡在「保存中...」。
-        #   · parent 用本对话框（self）⇒ 不牵扯主窗口的生命周期。
-        group_names = None
-        if len(groups) > 1:
-            dialog = SaveGroupNameDialog(
-                self, len(groups), [len(g) for g in groups],
-                self.output_path.rsplit(".", 1)[0], self.ext)
-            if dialog.exec() != QDialog.Accepted:
-                logger.info("用户取消「重命名分组」⇒ 放弃本次保存")
-                return
-            group_names = dialog.group_names()
+        # ★ 组名：按组顺序收集（组号 1 基 ⇒ 下标 0 对应第 1 组）。
+        #   组结构变化后可能留下**过期**的组号条目 ⇒ 按**当前组数**取前 N 个，
+        #   多余的忽略（不报错）。
+        group_names = [self.group_names.get(g, "")
+                       for g in range(1, len(groups) + 1)]
+
+        # ★ 逐页曝光覆盖：与 `self.pages` **同序** ⇒ 与 `page_specs` 下标天然对齐
+        #   （不排序、不去重）；没有覆盖的页存 None ⇒ 跟随整批。
+        page_exposures = [self._page_exposure.get(page_num)
+                          for page_num in self.pages]
 
         self._saving = True
         self._save_exposure = exposure
@@ -6081,11 +6131,15 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
         # ★ 单页单组：走 GUI 的统一入口 `_save_page_specs`（F-4）
         #   —— 命名与「单页任务」/「直接保存」一致：`{base}.{ext}`（不加序号）。
         if len(page_specs) == 1 and len(groups) == 1:
+            # 这一页若有单独曝光 ⇒ 以它为准（否则用整批曝光）
+            page_override = page_exposures[0] if page_exposures else None
+            eff_exposure = page_override if page_override is not None else exposure
+
             def _work_single():
                 return _save_page_specs(
                     self.job_id, self.ext, self.output_path, page_specs, groups,
                     extra_dirs=self.extra_dirs, device_name=self.device_name,
-                    device_ip=self.device_ip, exposure=exposure)
+                    device_ip=self.device_ip, exposure=eff_exposure)
 
             # 投递器在主线程创建（跨线程 emit 的接收端必须活在主线程）
             _ensure_ui_dispatcher()
@@ -6108,8 +6162,10 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             device_ip=self.device_ip,
             exposure=exposure,
             confirm=self._make_confirm_callback(),
-            # ★ 组名（多组才有；单组为 None ⇒ 落盘侧沿用组号命名）
+            # ★ 组名（按组顺序；留空 ⇒ 落盘侧回落到组号）
             group_names=group_names,
+            # ★ 逐页曝光覆盖（与 page_specs 下标对齐；None ⇒ 跟随整批）
+            page_exposures=page_exposures,
         )
 
         def _work():

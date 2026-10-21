@@ -211,7 +211,8 @@ preset_manager.py (在用)
 | 任务栏图标不闪烁 | ⚠️ v3.1 遗留 | v4.0 **没有** `SetCurrentProcessExplicitAppUserModelID` 调用（全仓零命中），未做显式任务栏分组设置 |
 | 窗口防逐帧渲染 | ✅ | withdraw → build → update_idletasks → deiconify |
 | 嵌入式字体 | ✅ | AddFontResourceExW 私有加载，ClearType 优化 |
-| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py`「＋分组线 / －分组线」按钮）。★ **「重命名分组」已实现**（2026-10-21，提交 `8701b60`）：**多组**时保存前弹出**独立模态窗口** `SaveGroupNameDialog`（每组一行：组标签 + 名字输入框 + 最终文件名预览），组名经 `save_manager.sanitize_group_name` 净化（Windows 非法字符 / 路径分隔符 / 控制字符 / 结尾的点与空格 / 超长）后**落进产物文件名**（`{base}_{组名}.pdf` / `{base}_{组名}_{组内号:03d}.{ext}`）。★ **留空 ⇒ 回落到组号** ⇒ 文件名与改造前**逐字节一致**；**单组不弹窗、不传组名**。★ 入口是**独立窗口** ⇒ 主窗口与多页预览的**控件树零改动**（守住「不改 UI 样式与布局」红线） |
+| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py`「＋分组线 / －分组线」按钮）。★ **「重命名分组」已实现**（2026-10-21）：多页预览的**缩略图列里，每组起始页之前一个组名输入框**（第 1 组在第 1 页之前，第 2..N 组在分隔线之后）；组名经 `save_manager.sanitize_group_name` 净化（Windows 非法字符 / 路径分隔符 / 控制字符 / 结尾的点与空格 / 超长）后**落进产物文件名**（`{base}_{组名}.pdf` / `{base}_{组名}_{组内号:03d}.{ext}`）。★ **留空 ⇒ 回落到组号** ⇒ 文件名与改造前**逐字节一致**；**单组**只有 1 个输入框。★ 保存前**不再弹任何命名对话框** |
+| 逐页曝光覆盖 | ✅ | ★ **2026-10-21 已实现**（用户拍板要做）。多页预览里当前页可**单独设置曝光**：「本页单独设置」以整批当前曝光为初值建覆盖，「跟随整批」清除覆盖；预览按**当前页的覆盖**渲染；保存时按 `page_specs` 下标对齐传给 `save_manager`（`page_exposures`：元素 `None` ⇒ 跟随整批，dict ⇒ 该页单独用自己的曝光）。落盘侧 PDF 与图片两条路径都支持（`save_manager.py` 的 `save_pages(..., page_exposures=...)` / `SaveRequest.page_exposures`）。★ 语义坑：`ExposurePanel.exposure_dict()` 在 mode=off 时返回 `None`，而 `None` 在落盘侧表示「跟随整批」⇒ 「本页明确不套曝光」必须存**显式的** `{"mode": "off", ...}`。⚠️ 会话（双面/续扫）落盘**不引入**逐页曝光；历史记录里的曝光仍是文档级那一份 |
 | 页面删除 | ✅ | 多页预览中删除不需要的页面 |
 | 并发扫描 | ✅ 后端支持 / **GUI 已开放多台并发** | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:382`）。★ **2026-10-21 起 GUI 也开放了**（`c5de886`）：扫描期间不再禁用扫描按钮，改用在途 job 表 `_active_jobs`（job_id → **该 job 自己的设备**）跟踪多台 ⇒ 每台各自可取消、各自回填结果与进度；状态栏仍只放**一个**取消按钮，取消**最近启动**的那台（再点一次轮到上一台）⇒ 每台都能单独取消。⚠️ **双面/续扫（会话）模式仍保持串行**（会话本质是顺序的：正面→背面、逐批追加，并行会把记账搞乱）⇒ 该模式下按钮仍禁用并拒绝开第二批。⚠️ 已知不足：① 曝光参数仍是全局态（并发下 B 台启动会清掉 A 台残留曝光，未改）；② 预览对话框仍是模态 `exec()`，A 台完成时弹预览会挡住主窗口（B 台仍在后台扫） |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
@@ -223,7 +224,7 @@ preset_manager.py (在用)
 | 剥离 exposure.py | 从各模块中移除所有曝光调用 —— **2026-10-20 已回流**（见下） |
 | 剥离 preset_manager.py | 不再被任何活跃模块导入 —— **2026-10-20 已回流** |
 | 简化 PreviewDialog | 去掉曝光调整/直方图/预设，只保留预览+保存 —— **2026-10-20 已恢复曝光面板（`ExposurePanel`）** |
-| 简化 MultiPagePreviewDialog | 去掉曝光控制/逐页覆盖，保留缩略图/分组/保存 —— **2026-10-20 已恢复曝光面板** |
+| 简化 MultiPagePreviewDialog | 去掉曝光控制/逐页覆盖，保留缩略图/分组/保存 —— **2026-10-20 已恢复曝光面板**；**2026-10-21 已补回「逐页曝光覆盖」**（见 §4.2） |
 | 清理 spec 文件 | 移除 exposure/preset_manager/ImageFilter/ImageMath —— **2026-10-20 已回流**（`exposure.py` 用到 `ImageFilter` / `ImageMath`） |
 | 清理测试 | 移除 conftest.py 和 test_cli.py 中的曝光相关内容 —— **2026-10-20 已补回**（`tests/test_exposure.py` / `test_exposure_integration.py` / `test_preset_manager.py`） |
 | 备份到 _docfix_reserve/ | 完整文件 + 切除代码段参考文档 —— **该目录已在 `8aaa4f1` 移出仓库，现不存在** |

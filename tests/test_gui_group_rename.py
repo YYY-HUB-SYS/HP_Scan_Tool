@@ -5,30 +5,33 @@
 ---------------------------------------------------------------------------
 `save_manager.build_output_name` 生成的组文件名是**自动**的：
   多组时 PDF 是 `{base}_{组号:03d}.pdf`、图片是 `{base}_{组号:03d}_{组内序号:03d}.{ext}`
-  ⇒ 用户给不了组名（`HANDOVER.md` 与 `docs/adr/0004-multipage-custom-grouping.md`
-  都登记「重命名分组未实现」）。
+  ⇒ 用户给不了组名。
 
-本轮实现：
-  · `save_manager.sanitize_group_name`（纯 Python，**不 import Qt**）—— 组名净化
-  · `save_manager.build_output_name(..., group_name="")` —— 多组时用组名替代组号
-  · `save_manager.save_pages(..., group_names=None)` / `SaveRequest.group_names`
-  · GUI：独立模态对话框 `SaveGroupNameDialog` + `MultiPagePreviewDialog._confirm` 接线
+★ 本轮（2026-10-21 第二版）：入口从「保存前弹独立模态窗口」改成
+  **多页预览里每组一个组名输入框**
+  · 删掉了 `SaveGroupNameDialog`（独立模态对话框）—— 保存前**不再有任何弹窗**
+  · `MultiPagePreviewDialog.group_names`：**组号（1 基）→ 组名**，唯一真源
+  · 组名输入框放在该组**第一页的缩略图之前**（第 1 组没有分隔线 ⇒ 放在第 1 个缩略图前）
+  · 保存时按组顺序收集进 `SaveRequest.group_names`
 
 ★ 硬约束（下面的用例把它钉死）
-  1. 单组场景文件名**与改造前逐字节一致**（即使传了组名也必须一致）
+  1. 单组场景文件名**与改造前逐字节一致**（只有 1 个组名输入框）
   2. 组名为空 / 净化后为空 ⇒ 回落到组号 ⇒ 与改造前完全一致
-  3. 组名进文件名 ⇒ 必须净化（Windows 非法字符 / 路径分隔符 / 控制字符 /
-     结尾的点与空格 / 超长）⇒ 不产生路径穿越
-  4. 多页预览的控件树**零改动**（入口是**独立对话框**，不是往预览里塞输入框）
+  3. 组名进文件名 ⇒ 必须净化（落盘侧 `save_manager.sanitize_group_name` 负责）
+  4. 组结构变化（切分 / 删页）留下的**过期**组号条目 ⇒ 忽略，不报错
+  5. 保存前**不弹任何对话框**
 
 ★ 全部 offscreen 跑：**绝不连真机、绝不弹真窗、绝不出纸**。
 """
 
+import io
 import os
 import tempfile
+import time
 
 import pytest
 from PIL import Image
+from PySide6.QtCore import QEvent
 
 # 必须在创建 QApplication 之前设置：禁止弹出真实窗口
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -41,7 +44,6 @@ os.environ["USERPROFILE"] = _TMP_HOME
 try:
     import hp_scan_gui_pyside as gui
     import cache_manager
-    import history_manager
     import save_manager
 finally:
     if _PREV_USERPROFILE is not None:
@@ -54,25 +56,6 @@ finally:
 def qapp(qt_app):
     """整个模块共用一个 QApplication（offscreen，不显示窗口）"""
     return qt_app
-
-
-@pytest.fixture
-def isolated(tmp_path, monkeypatch):
-    """把缓存根目录与历史文件重定向到临时目录（与 test_save_manager.py 同款）"""
-    cache_root = str(tmp_path / "cache")
-    os.makedirs(cache_root, exist_ok=True)
-    monkeypatch.setattr(cache_manager, "_default_cache_root", lambda: cache_root)
-    monkeypatch.setattr(cache_manager, "_cache_config_path",
-                        lambda: os.path.join(cache_root, "cache_config.json"))
-    monkeypatch.setattr(cache_manager, "_config_cache", None)
-    monkeypatch.setattr(cache_manager, "_config_cache_time", 0)
-    monkeypatch.setattr(cache_manager, "_active_jobs", set())
-    monkeypatch.setattr(cache_manager, "_pending_jobs", set())
-    monkeypatch.setattr(cache_manager, "_cache_size_cache", None)
-    hist = str(tmp_path / "history.json")
-    monkeypatch.setattr(history_manager, "_history_file", lambda: hist)
-    monkeypatch.setattr(history_manager, "HISTORY_FILE", None)
-    return cache_root, hist
 
 
 @pytest.fixture
@@ -234,7 +217,7 @@ class TestBuildOutputName:
 class TestSavePagesWithGroupNames:
     """真写文件（临时目录）⇒ 断言**实际落盘的文件名**"""
 
-    def test_pdf_group_names_land_in_filenames(self, tmp_path, src_jpg, isolated):
+    def test_pdf_group_names_land_in_filenames(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.pdf")
         specs = [(src_jpg, 0), (src_jpg, 0)]
         files = save_manager.save_pages("job_pdf_names", "pdf", base, specs,
@@ -243,7 +226,7 @@ class TestSavePagesWithGroupNames:
         assert names == {"HP_Scan_发票.pdf", "HP_Scan_收据.pdf"}
         assert all(os.path.getsize(f) > 0 for f in files)
 
-    def test_image_group_names_land_in_filenames(self, tmp_path, src_jpg, isolated):
+    def test_image_group_names_land_in_filenames(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.jpg")
         specs = [(src_jpg, 0), (src_jpg, 0)]
         files = save_manager.save_pages("job_img_names", "jpg", base, specs,
@@ -252,7 +235,7 @@ class TestSavePagesWithGroupNames:
         # 第 1 组用组名；第 2 组留空 ⇒ 回落到组号 002
         assert names == {"HP_Scan_发票_001.jpg", "HP_Scan_002_001.jpg"}
 
-    def test_without_group_names_names_are_unchanged(self, tmp_path, src_jpg, isolated):
+    def test_without_group_names_names_are_unchanged(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.jpg")
         specs = [(src_jpg, 0), (src_jpg, 0)]
         files = save_manager.save_pages("job_img_legacy", "jpg", base, specs,
@@ -260,7 +243,7 @@ class TestSavePagesWithGroupNames:
         names = {os.path.basename(f) for f in files}
         assert names == {"HP_Scan_001_001.jpg", "HP_Scan_002_001.jpg"}
 
-    def test_single_group_ignores_group_names(self, tmp_path, src_jpg, isolated):
+    def test_single_group_ignores_group_names(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.jpg")
         specs = [(src_jpg, 0)]
         files = save_manager.save_pages("job_img_single", "jpg", base, specs,
@@ -268,7 +251,7 @@ class TestSavePagesWithGroupNames:
         names = {os.path.basename(f) for f in files}
         assert names == {"HP_Scan_001.jpg"}
 
-    def test_group_names_shorter_than_groups_falls_back(self, tmp_path, src_jpg, isolated):
+    def test_group_names_shorter_than_groups_falls_back(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.jpg")
         specs = [(src_jpg, 0), (src_jpg, 0)]
         files = save_manager.save_pages("job_img_partial", "jpg", base, specs,
@@ -276,7 +259,7 @@ class TestSavePagesWithGroupNames:
         names = {os.path.basename(f) for f in files}
         assert names == {"HP_Scan_发票_001.jpg", "HP_Scan_002_001.jpg"}
 
-    def test_illegal_group_name_is_sanitized_on_disk(self, tmp_path, src_jpg, isolated):
+    def test_illegal_group_name_is_sanitized_on_disk(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.jpg")
         specs = [(src_jpg, 0), (src_jpg, 0)]
         files = save_manager.save_pages("job_img_dirty", "jpg", base, specs,
@@ -284,7 +267,7 @@ class TestSavePagesWithGroupNames:
         names = {os.path.basename(f) for f in files}
         assert names == {"HP_Scan_发票_001.jpg", "HP_Scan_002_001.jpg"}
 
-    def test_run_save_job_passes_group_names_through(self, tmp_path, src_jpg, isolated):
+    def test_run_save_job_passes_group_names_through(self, tmp_path, src_jpg):
         base = str(tmp_path / "HP_Scan.pdf")
         req = save_manager.SaveRequest(
             job_id="job_rsj", ext="pdf", output_path=base,
@@ -299,7 +282,7 @@ class TestSavePagesWithGroupNames:
                                        page_specs=[], groups=[])
         assert req.group_names is None
 
-    def test_group_names_passed_as_string_is_ignored(self, tmp_path, src_jpg, isolated):
+    def test_group_names_passed_as_string_is_ignored(self, tmp_path, src_jpg):
         """★ 类型闸：误传字符串（`"发票"`）⇒ 整组忽略 ⇒ 回落组号，
         而不是把 `"发票"[0]` 当成第 1 组的组名（那会静默错名）。"""
         base = str(tmp_path / "HP_Scan.jpg")
@@ -310,116 +293,51 @@ class TestSavePagesWithGroupNames:
         assert names == {"HP_Scan_001_001.jpg", "HP_Scan_002_001.jpg"}
 
 
-# ────────── GUI 层：SaveGroupNameDialog ──────────
+# ────────── GUI 层：多页预览里的「组名输入框」 ──────────
 
-class TestSaveGroupNameDialog:
-    """独立模态对话框（offscreen，不显示窗口）"""
-
-    def _make(self, group_count=2, page_counts=(1, 1), base="C:/out/HP_Scan", ext="pdf"):
-        return gui.SaveGroupNameDialog(None, group_count, list(page_counts), base, ext)
-
-    def test_default_inputs_are_empty(self, qapp):
-        dlg = self._make()
-        assert len(dlg._edits) == 2
-        assert all(edit.text() == "" for edit in dlg._edits)
-
-    def test_placeholder_hints_group_index(self, qapp):
-        dlg = self._make()
-        assert "001" in dlg._edits[0].placeholderText()
-        assert "002" in dlg._edits[1].placeholderText()
-
-    def test_preview_defaults_to_group_index_form(self, qapp):
-        dlg = self._make()
-        assert dlg._previews[0].text() == "C:/out/HP_Scan_001.pdf"
-        assert dlg._previews[1].text() == "C:/out/HP_Scan_002.pdf"
-
-    def test_preview_updates_with_input(self, qapp):
-        dlg = self._make()
-        dlg._edits[0].setText("发票")
-        assert dlg._previews[0].text() == "C:/out/HP_Scan_发票.pdf"
-        # 另一组不受影响
-        assert dlg._previews[1].text() == "C:/out/HP_Scan_002.pdf"
-
-    def test_preview_sanitizes_illegal_chars(self, qapp):
-        dlg = self._make()
-        dlg._edits[0].setText("发/票")
-        assert dlg._previews[0].text() == "C:/out/HP_Scan_发票.pdf"
-
-    def test_image_preview_contains_group_seq(self, qapp):
-        dlg = self._make(ext="jpg")
-        assert dlg._previews[0].text() == "C:/out/HP_Scan_001_001.jpg"
-        dlg._edits[0].setText("发票")
-        assert dlg._previews[0].text() == "C:/out/HP_Scan_发票_001.jpg"
-
-    def test_group_names_returns_sanitized_values(self, qapp):
-        dlg = self._make()
-        dlg._edits[0].setText("  发票  ")
-        dlg._edits[1].setText("")
-        assert dlg.group_names() == ["发票", ""]
-
-    def test_save_button_accepts_and_returns_names(self, qapp):
-        dlg = self._make()
-        dlg._edits[0].setText("发票")
-        dlg._edits[1].setText("收据")
-        dlg.btn_save.click()
-        assert dlg.result() == gui.QDialog.Accepted
-        assert dlg.group_names() == ["发票", "收据"]
-
-    def test_cancel_button_rejects_and_clears_names(self, qapp):
-        dlg = self._make()
-        dlg._edits[0].setText("发票")
-        dlg.btn_cancel.click()
-        assert dlg.result() == gui.QDialog.Rejected
-        # 取消 ⇒ 组名作废（接线层直接放弃保存）
-        assert dlg.group_names() == ["", ""]
-
-    def test_page_counts_are_shown(self, qapp):
-        dlg = self._make(group_count=2, page_counts=(3, 5))
-        assert dlg._labels[0].text() == "第 1 组（共 3 页）"
-        assert dlg._labels[1].text() == "第 2 组（共 5 页）"
-
-    def test_headless_exec_auto_accepts(self, qapp):
-        """★ 无头环境（offscreen）下 `exec()` 必须**自动返回**。
-
-        否则自动化流程会被这个模态框**永久挂死**（多组保存路径）。
-        自动接受 ⇒ 组名留空 ⇒ 落盘回落到组号（与改造前一致）。
-        """
-        dlg = self._make()
-        try:
-            assert dlg.exec() == gui.QDialog.Accepted
-            assert dlg.group_names() == ["", ""]
-        finally:
-            dlg.deleteLater()
+def _flush(qapp):
+    """把 deleteLater 的控件真正销毁掉（否则布局里新旧混在一起）"""
+    qapp.processEvents()
+    qapp.sendPostedEvents(None, QEvent.DeferredDelete)
+    qapp.processEvents()
 
 
-# ────────── GUI 层：_confirm 接线 ──────────
+def _thumbs_widgets(dlg):
+    """缩略图列里**当前**的控件（按顺序；跳过 stretch 这类没有 widget 的项）"""
+    out = []
+    for i in range(dlg.thumbs_layout.count()):
+        w = dlg.thumbs_layout.itemAt(i).widget()
+        if w is not None:
+            out.append(w)
+    return out
 
-class _FakeGroupNameDialog:
-    """SaveGroupNameDialog 替身：记录调用、**绝不弹窗**。"""
 
-    calls = []
-    names = []
-    events = []
-    exec_result = None
+def _name_edits(dlg):
+    """缩略图列里的**组名输入框**（按顺序 ⇒ 下标 0 = 第 1 组）"""
+    return [w for w in _thumbs_widgets(dlg) if isinstance(w, gui.QLineEdit)]
 
-    def __init__(self, parent, group_count, page_counts, base_name, ext):
-        self.parent = parent
-        self.group_count = group_count
-        self.page_counts = list(page_counts)
-        self.base_name = base_name
-        self.ext = ext
-        type(self).calls.append(self)
-        type(self).events.append("dialog")
 
-    def exec(self):
-        return type(self).exec_result
-
-    def group_names(self):
-        return list(type(self).names)
+def _make_preview(qapp, tmp_path, page_count=2, splits=(), ext="jpg",
+                  job_id=None):
+    """造一个带**真实缓存页**的多页预览对话框（缩略图能真的出来）"""
+    job_id = job_id or ("job_gr_%s_%d" % (ext, page_count))
+    fmt = "JPEG" if ext in ("jpg", "jpeg") else "PNG"
+    buf = io.BytesIO()
+    Image.new("RGB", (60, 80), (200, 220, 240)).save(buf, fmt)
+    data = buf.getvalue()
+    for page in range(1, page_count + 1):
+        cache_manager.write_page(job_id, page, data, ext)
+    dlg = gui.MultiPagePreviewDialog(None, job_id, ext,
+                                     str(tmp_path / ("out." + ext)), page_count)
+    if splits:
+        dlg.splits = set(splits)
+        dlg._refresh_thumbs()
+    _flush(qapp)
+    return dlg
 
 
 class _SaveProbe:
-    """拦截落盘入口：记录 SaveRequest 与调用顺序（**绝不真写盘**）。"""
+    """拦截落盘入口：记录 SaveRequest（**绝不真写盘**）。"""
 
     def __init__(self):
         self.requests = []
@@ -438,16 +356,6 @@ class _SaveProbe:
 
 
 @pytest.fixture
-def fake_group_dialog(monkeypatch):
-    _FakeGroupNameDialog.calls = []
-    _FakeGroupNameDialog.names = []
-    _FakeGroupNameDialog.events = []
-    _FakeGroupNameDialog.exec_result = gui.QDialog.Accepted
-    monkeypatch.setattr(gui, "SaveGroupNameDialog", _FakeGroupNameDialog)
-    return _FakeGroupNameDialog
-
-
-@pytest.fixture
 def save_probe(monkeypatch):
     probe = _SaveProbe()
     monkeypatch.setattr(save_manager, "run_save_job", probe.run_save_job)
@@ -457,62 +365,234 @@ def save_probe(monkeypatch):
     return probe
 
 
-class TestConfirmWiring:
-    """`MultiPagePreviewDialog._confirm` 的接线"""
+class TestGroupNameInputs:
+    """预览里每组一个组名输入框"""
 
-    def _preview(self, tmp_path, page_count=2, splits=None):
-        out = str(tmp_path / "HP_Scan.jpg")
-        dlg = gui.MultiPagePreviewDialog(None, "job_wiring", "jpg", out, page_count)
-        dlg.splits = set(splits or ())
-        return dlg
+    def test_single_group_has_exactly_one_input(self, qapp, tmp_path, isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3)
+        try:
+            assert len(_name_edits(dlg)) == 1, "单组时应当只有 1 个组名输入框"
+        finally:
+            dlg.deleteLater()
 
-    def test_multi_group_opens_dialog_and_passes_names(
-            self, qapp, tmp_path, isolated, fake_group_dialog, save_probe):
-        fake_group_dialog.names = ["发票", "收据"]
-        dlg = self._preview(tmp_path, splits={1})
-        dlg._confirm()
-        assert len(fake_group_dialog.calls) == 1
-        call = fake_group_dialog.calls[0]
-        assert call.group_count == 2
-        assert call.page_counts == [1, 1]
-        assert call.base_name == str(tmp_path / "HP_Scan")
-        assert call.ext == "jpg"
-        assert call.parent is dlg
-        assert len(save_probe.requests) == 1
-        assert save_probe.requests[0].group_names == ["发票", "收据"]
+    def test_one_input_per_group(self, qapp, tmp_path, isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            assert len(_name_edits(dlg)) == 2
+            dlg.splits = {1, 2}
+            dlg._refresh_thumbs()
+            _flush(qapp)
+            assert len(_name_edits(dlg)) == 3
+        finally:
+            dlg.deleteLater()
 
-    def test_dialog_opens_before_saving(
-            self, qapp, tmp_path, isolated, fake_group_dialog, save_probe):
-        """★ 弹窗必须**先于**落盘（否则用户还没起名就已经开始写了）"""
-        fake_group_dialog.events = save_probe.events
-        dlg = self._preview(tmp_path, splits={1})
-        dlg._confirm()
-        assert save_probe.events == ["dialog", "save"]
+    def test_first_group_input_is_before_first_thumbnail(self, qapp, tmp_path,
+                                                         isolated_cache):
+        """第 1 组没有分隔线 ⇒ 输入框就在第 1 个缩略图之前"""
+        dlg = _make_preview(qapp, tmp_path, page_count=2)
+        try:
+            widgets = _thumbs_widgets(dlg)
+            assert isinstance(widgets[0], gui.QLineEdit), \
+                "第 1 组的输入框不在缩略图列最前面"
+            assert isinstance(widgets[1], gui.QPushButton), \
+                "第 1 个缩略图没跟在第 1 组输入框后面"
+        finally:
+            dlg.deleteLater()
 
-    def test_cancel_does_not_save_and_keeps_state(
-            self, qapp, tmp_path, isolated, fake_group_dialog, save_probe):
-        fake_group_dialog.exec_result = gui.QDialog.Rejected
-        dlg = self._preview(tmp_path, splits={1})
-        dlg._confirm()
-        assert len(fake_group_dialog.calls) == 1
-        assert save_probe.requests == []
-        # ★ 取消后状态完全不变（按钮不会卡在「保存中...」）
-        assert dlg._saving is False
-        assert dlg.save_btn.text() == "保存全部"
-        assert dlg.save_btn.isEnabled() is True
+    def test_second_group_input_is_after_separator(self, qapp, tmp_path,
+                                                    isolated_cache):
+        """第 2 组：分隔线 → 组名输入框 → 该页缩略图"""
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            kinds = [type(w).__name__ for w in _thumbs_widgets(dlg)]
+            assert kinds == ["QLineEdit", "QPushButton", "QFrame",
+                             "QLineEdit", "QPushButton", "QPushButton"], kinds
+        finally:
+            dlg.deleteLater()
 
-    def test_single_group_does_not_open_dialog(
-            self, qapp, tmp_path, isolated, fake_group_dialog, save_probe):
-        dlg = self._preview(tmp_path, splits=None)
-        dlg._confirm()
-        assert fake_group_dialog.calls == []
-        assert len(save_probe.requests) == 1
-        assert save_probe.requests[0].group_names is None
+    def test_placeholder_and_tooltip_mention_group_number(self, qapp, tmp_path,
+                                                            isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            edits = _name_edits(dlg)
+            # placeholder 说明「留空用组号」，tooltip 给出具体的组号
+            assert "组名" in edits[0].placeholderText()
+            assert "留空" in edits[0].placeholderText()
+            assert "第 2 组" in edits[1].placeholderText()
+            assert "001" in edits[0].toolTip()
+            assert "002" in edits[1].toolTip()
+        finally:
+            dlg.deleteLater()
 
-    def test_empty_group_names_still_pass_through(
-            self, qapp, tmp_path, isolated, fake_group_dialog, save_probe):
-        """全部留空 ⇒ 传空串列表 ⇒ 落盘侧回落到组号（文件名与改造前一致）"""
-        fake_group_dialog.names = ["", ""]
-        dlg = self._preview(tmp_path, splits={1})
-        dlg._confirm()
-        assert save_probe.requests[0].group_names == ["", ""]
+    def test_typing_is_recorded_in_group_names(self, qapp, tmp_path, isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            edits = _name_edits(dlg)
+            edits[1].setText("合同")
+            assert dlg.group_names.get(2) == "合同"
+            # 别的组没被污染
+            assert dlg.group_names.get(1, "") == ""
+        finally:
+            dlg.deleteLater()
+
+    def test_name_survives_thumb_refresh(self, qapp, tmp_path, isolated_cache):
+        """`_refresh_thumbs()` 会重建输入框 ⇒ 名字必须还在（唯一真源是字典）"""
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            _name_edits(dlg)[1].setText("合同")
+            dlg._refresh_thumbs()
+            _flush(qapp)
+            assert _name_edits(dlg)[1].text() == "合同"
+            assert dlg.group_names.get(2) == "合同"
+        finally:
+            dlg.deleteLater()
+
+    def test_name_survives_page_switch(self, qapp, tmp_path, isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            _name_edits(dlg)[1].setText("合同")
+            dlg._on_thumb_clicked(2)
+            _flush(qapp)
+            assert _name_edits(dlg)[1].text() == "合同"
+        finally:
+            dlg.deleteLater()
+
+    def test_split_button_changes_input_count(self, qapp, tmp_path, isolated_cache):
+        """走真实按钮路径（＋分组线）⇒ 组数变 ⇒ 输入框数量跟着变"""
+        dlg = _make_preview(qapp, tmp_path, page_count=4)
+        try:
+            assert len(_name_edits(dlg)) == 1
+            dlg.selected_idx = 2
+            dlg._toggle_split()
+            _flush(qapp)
+            assert len(_name_edits(dlg)) == 2
+            dlg.selected_idx = 3
+            dlg._toggle_split()
+            _flush(qapp)
+            assert len(_name_edits(dlg)) == 3
+        finally:
+            dlg.deleteLater()
+
+    def test_page_info_shows_group_name(self, qapp, tmp_path, isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            _name_edits(dlg)[1].setText("合同")
+            dlg.selected_idx = 1
+            dlg._recompute_preview()
+            assert "第 2 组（合同）" in dlg.page_info_label.text(), \
+                dlg.page_info_label.text()
+        finally:
+            dlg.deleteLater()
+
+    def test_page_info_without_name_keeps_plain_group_text(self, qapp, tmp_path,
+                                                           isolated_cache):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            dlg.selected_idx = 1
+            dlg._recompute_preview()
+            text = dlg.page_info_label.text()
+            assert "第 2 组" in text and "（" not in text, text
+        finally:
+            dlg.deleteLater()
+
+
+class TestNoNamingDialog:
+    """★ 保存前**不再弹任何对话框**（旧的 `SaveGroupNameDialog` 已删除）"""
+
+    def test_naming_dialog_class_is_gone(self):
+        assert not hasattr(gui, "SaveGroupNameDialog"), \
+            "独立命名对话框还在（应改成预览内输入框）"
+
+    def test_confirm_opens_no_dialog(self, qapp, tmp_path, isolated_cache,
+                                     monkeypatch, save_probe):
+        opened = []
+
+        def _record(self, *a, **k):
+            opened.append(self)
+            raise AssertionError("保存前弹出了对话框：%r" % (self,))
+
+        monkeypatch.setattr(gui.QDialog, "exec", _record)
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            _name_edits(dlg)[0].setText("发票")
+            dlg._confirm()
+            assert opened == [], "保存前弹了对话框"
+            assert len(save_probe.requests) == 1
+        finally:
+            dlg.deleteLater()
+
+
+class TestConfirmGroupNames:
+    """`_confirm` 把组名传给落盘层"""
+
+    def test_names_are_passed_in_group_order(self, qapp, tmp_path, isolated_cache,
+                                              save_probe):
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            edits = _name_edits(dlg)
+            edits[0].setText("发票")
+            edits[1].setText("合同")
+            dlg._confirm()
+            assert len(save_probe.requests) == 1
+            assert save_probe.requests[0].group_names == ["发票", "合同"]
+        finally:
+            dlg.deleteLater()
+
+    def test_empty_name_is_passed_as_empty_string(self, qapp, tmp_path,
+                                                   isolated_cache, save_probe):
+        """留空 ⇒ 传空串 ⇒ 落盘侧回落到组号（文件名与改造前一致）"""
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            dlg._confirm()
+            assert save_probe.requests[0].group_names == ["", ""]
+        finally:
+            dlg.deleteLater()
+
+    def test_single_group_passes_one_empty_name(self, qapp, tmp_path,
+                                                 isolated_cache, save_probe):
+        dlg = _make_preview(qapp, tmp_path, page_count=2)
+        try:
+            assert len(_name_edits(dlg)) == 1
+            dlg._confirm()
+            assert save_probe.requests[0].group_names == [""]
+        finally:
+            dlg.deleteLater()
+
+    def test_stale_group_entries_are_ignored(self, qapp, tmp_path, isolated_cache,
+                                              save_probe):
+        """组结构变化后 `group_names` 里可能留下**过期**条目 ⇒ 忽略，不报错"""
+        dlg = _make_preview(qapp, tmp_path, page_count=3, splits={1})
+        try:
+            _name_edits(dlg)[1].setText("合同")
+            assert dlg.group_names.get(2) == "合同"
+            dlg.splits = set()               # 第 2 组没了
+            dlg._refresh_thumbs()
+            _flush(qapp)
+            dlg._confirm()
+            assert save_probe.requests[0].group_names == [""]
+        finally:
+            dlg.deleteLater()
+
+
+class TestGroupNameReachesFileName:
+    """端到端：输入框里起的名字 ⇒ 真的落进产物文件名"""
+
+    def test_group_name_lands_in_output_filename(self, qapp, tmp_path,
+                                                  isolated_cache, monkeypatch):
+        monkeypatch.setattr(gui.os, "startfile", lambda *a, **k: None)
+        dlg = _make_preview(qapp, tmp_path, page_count=2, splits={1})
+        try:
+            edits = _name_edits(dlg)
+            edits[0].setText("发票")
+            edits[1].setText("收据")
+            dlg._confirm()
+            deadline = time.time() + 15.0
+            while time.time() < deadline and not dlg._save_finished:
+                qapp.processEvents()
+                time.sleep(0.01)
+            assert dlg._save_finished, "保存没结束"
+        finally:
+            dlg.deleteLater()
+
+        names = sorted(p.name for p in tmp_path.glob("out*.jpg"))
+        assert names == ["out_发票_001.jpg", "out_收据_001.jpg"], names
