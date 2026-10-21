@@ -27,6 +27,7 @@ import os
 import sys
 import shutil
 import tempfile
+import time
 
 import pytest
 
@@ -42,7 +43,38 @@ if PROJECT_ROOT not in sys.path:
 # ── 防线 1：导入期把 APPDATA 指向会话沙箱 ────────────────────────────────
 # 必须在任何被测模块被 import 之前执行（conftest.py 由 pytest 先行导入）。
 _SESSION_APPDATA = tempfile.mkdtemp(prefix="hp_scan_tool_pytest_")
+#: 本次 pytest 会话的开始时间
+_SESSION_T0 = time.time()
 os.environ["APPDATA"] = _SESSION_APPDATA
+
+
+# ── 临时目录泄漏治理（2026-10-21）────────────────────────────────────
+# ★ 背景（实测）：**12 个测试文件在「模块级」用 `tempfile.mkdtemp` 建 HOME
+#   沙箱，且从不清理**（`hp_gui_test_home_*` / `hp_exposure_test_home_*` /
+#   `hp_gui_slice3_home_*` / `hp_b46_*` …）⇒ **每跑一次 pytest 就在 %TEMP%
+#   漏一个目录**，实测累计 **3222 个**（最老的距今 14 小时）。
+#   ⇒ 逐个文件改成 TemporaryDirectory 会漏掉「子进程里建的」那两处，
+#   而且以后新增文件还会再犯 ⇒ 这里**统一接管 mkdtemp**：
+#   记录每个新建目录，session 结束时统一删。
+#
+# ★ 为什么不影响那些「故意接管 mkdtemp」的用例
+#   （`test_cli.py` / `test_save_manager.py` 用 monkeypatch 替换
+#   `tempfile.mkdtemp`）：monkeypatch 会把**本包装替换掉** ⇒ 那些用例
+#   改用 `tmp_path` 下的目录，本来就由 pytest 清理。
+_MKDTEMP_TRACKED = []
+_real_mkdtemp = tempfile.mkdtemp
+
+
+def _tracked_mkdtemp(*args, **kwargs):
+    path = _real_mkdtemp(*args, **kwargs)
+    try:
+        _MKDTEMP_TRACKED.append(path)
+    except Exception:
+        pass
+    return path
+
+
+tempfile.mkdtemp = _tracked_mkdtemp
 
 # 真实用户目录（仅用于断言比对，不做任何写操作）
 _REAL_USER_DIR = os.path.join(
@@ -51,9 +83,17 @@ _REAL_USER_DIR = os.path.join(
 
 @pytest.fixture(scope="session", autouse=True)
 def _cleanup_session_appdata():
-    """会话结束后清掉沙箱 APPDATA 目录"""
+    """会话结束后清掉沙箱 APPDATA 目录 + 本次会话新建的临时目录"""
     yield
     shutil.rmtree(_SESSION_APPDATA, ignore_errors=True)
+    # ★ 统一清理「本次会话期间通过 tempfile.mkdtemp 新建」的目录
+    #   （详见 _tracked_mkdtemp 的说明）
+    for _p in _MKDTEMP_TRACKED:
+        try:
+            if os.path.isdir(_p):
+                shutil.rmtree(_p, ignore_errors=True)
+        except OSError:
+            pass
 
 
 # ── Qt application 唯一性（会话级，全项目共用一个） ────────────────────────

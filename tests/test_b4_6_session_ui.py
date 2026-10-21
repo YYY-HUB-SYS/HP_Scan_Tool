@@ -38,7 +38,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # 导入 GUI 模块会执行 setup_exception_logging()，往 ~/Desktop/hp_scan_debug.log 写日志。
 # 测试期把 USERPROFILE 指向临时目录，避免污染用户桌面上的日志文件。
-_TMP_HOME = tempfile.mkdtemp(prefix="hp_gui_b46_home_")
+#
+# ★ 用 TemporaryDirectory 而不是裸 mkdtemp（2026-10-21 修）：
+#   裸 mkdtemp **永不清理** ⇒ 每跑一次 pytest 就在 %TEMP% 漏一个 hp_gui_b46_home_*
+#   （实测一次全量跑就多一个，几十轮后 %TEMP% 堆成一片）。
+#   TemporaryDirectory 在**进程正常退出时自动删除**；进程被 abort 时由
+#   tests/conftest.py 的 session 级 fixture 兜底清理。
+_TMP_HOME_OBJ = tempfile.TemporaryDirectory(prefix="hp_gui_b46_home_")
+_TMP_HOME = _TMP_HOME_OBJ.name
 os.makedirs(os.path.join(_TMP_HOME, "Desktop"), exist_ok=True)
 _PREV_USERPROFILE = os.environ.get("USERPROFILE")
 os.environ["USERPROFILE"] = _TMP_HOME
@@ -747,25 +754,32 @@ def test_real_modal_dialog_does_not_crash():
     script = textwrap.dedent(
         """
         import os, sys, tempfile
+        import shutil
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
         # ★ 先隔离用户数据（在 import 业务模块之前）
         sandbox = tempfile.mkdtemp(prefix="hp_b46_probe_")
-        os.environ["APPDATA"] = sandbox
         home = tempfile.mkdtemp(prefix="hp_b46_home_")
-        os.makedirs(os.path.join(home, "Desktop"), exist_ok=True)
-        os.environ["USERPROFILE"] = home
-        sys.path.insert(0, %r)
-        from PySide6.QtWidgets import QApplication
-        from PySide6.QtCore import QTimer
-        import hp_scan_gui_pyside as gui
-        app = QApplication([])
-        dlg = gui.SkewWarningDialog("job", 1, 4.0, "")
-        assert dlg.parent() is None
-        def _close():
-            dlg._on_continue()
-        QTimer.singleShot(50, _close)
-        dlg.exec()
-        print("CHOICE", dlg.choice)
+        try:
+            os.environ["APPDATA"] = sandbox
+            os.makedirs(os.path.join(home, "Desktop"), exist_ok=True)
+            os.environ["USERPROFILE"] = home
+            sys.path.insert(0, %r)
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import QTimer
+            import hp_scan_gui_pyside as gui
+            app = QApplication([])
+            dlg = gui.SkewWarningDialog("job", 1, 4.0, "")
+            assert dlg.parent() is None
+            def _close():
+                dlg._on_continue()
+            QTimer.singleShot(50, _close)
+            dlg.exec()
+            print("CHOICE", dlg.choice)
+        finally:
+            # ★ 子进程里建的 mkdtemp 父进程管不到（conftest 的统一接管只覆盖
+            #   父进程内的调用）⇒ 这里自己删，否则每次都漏两个。
+            for _d in (sandbox, home):
+                shutil.rmtree(_d, ignore_errors=True)
         """
     ) % PROJECT_ROOT
     path = os.path.join(tempfile.gettempdir(), "hp_b46_modal_probe.py")
