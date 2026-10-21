@@ -51,11 +51,21 @@ def test_temp_name_differs_between_threads(tmp_path, qapp, monkeypatch):
     monkeypatch.setattr(os, "replace", _spy)
 
     barrier = threading.Barrier(2)
+    #: 竞态失败的异常（Windows 上两个线程 replace 到**同一目标** ⇒ 输的那一个
+    #: 会拿到 PermissionError(WinError 5)「拒绝访问」，因为目标文件正被对方占用）
+    errors = []
 
     def _writer(color):
         img = Image.new("RGB", (120, 160), color)
         barrier.wait()                       # 让两个线程真正重叠
-        gui._write_image_atomic(img, target, "jpg")
+        try:
+            gui._write_image_atomic(img, target, "jpg")
+        except PermissionError as e:
+            # ★ 绝不能让它逃出线程：pytest 会把「线程里未处理的异常」记成
+            #   PytestUnhandledThreadExceptionWarning ⇒ **污染整轮测试的告警基线**
+            #   （本轮实测：平时那 1 条 warning 就是它；它还会盖住真正的告警）。
+            # ★ 这里断言"只允许是 Windows 的目标占用冲突"，其它异常照旧抛出。
+            errors.append(e)
 
     threads = [threading.Thread(target=_writer, args=(c,))
                for c in ("red", "blue")]
@@ -68,6 +78,9 @@ def test_temp_name_differs_between_threads(tmp_path, qapp, monkeypatch):
     assert len(seen) == 2, "两次原子写应各产生一次 os.replace，实际 %d" % len(seen)
     assert seen[0] != seen[1], (
         "两个线程共用同一个临时文件名 ⇒ 会互相破坏、产出半截文件: %s" % seen)
+    for err in errors:
+        assert isinstance(err, PermissionError), (
+            "竞态里出现的异常必须是 PermissionError（Windows 目标占用），实际 %r" % err)
     for name in seen:
         # 临时文件必须与目标**同目录**（os.replace 跨目录就不是原子替换了）
         assert os.path.dirname(os.path.abspath(name)) == \

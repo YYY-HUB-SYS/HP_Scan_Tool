@@ -786,7 +786,10 @@ def test_real_modal_dialog_does_not_crash():
         f.write(script)
     try:
         proc = subprocess.run(
-            [sys.executable, path], capture_output=True, text=True, timeout=120)
+            [sys.executable, path], capture_output=True, text=True, timeout=120,
+            # ★ 同上：text=True 必须配 encoding，否则按控制台代码页（GBK）解码
+            #   子进程的 UTF-8 输出 ⇒ _readerthread 里 UnicodeDecodeError
+            encoding="utf-8", errors="replace")
     finally:
         try:
             os.remove(path)

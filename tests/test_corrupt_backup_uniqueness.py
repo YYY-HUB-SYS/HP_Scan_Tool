@@ -251,6 +251,12 @@ class TestCrossProcessBackupUniqueness:
         proc = subprocess.run(
             [sys.executable, "-c", _CHILD_BACKUP_CODE, path, PROJECT_ROOT],
             capture_output=True, text=True, timeout=60,
+            # ★ 必须显式指定编码：父进程默认按**控制台代码页（GBK）**解码子进程的
+            #   UTF-8 输出 ⇒ `_readerthread` 里抛 UnicodeDecodeError
+            #   ⇒ 泄漏成 PytestUnhandledThreadExceptionWarning。
+            #   ★ 这条 warning 是**偶发**的（取决于子进程输出里是否恰好出现
+            #   GBK 解不了的字节序列）⇒ 本轮实测 8 轮全量里出现 3 次。
+            encoding="utf-8", errors="replace",
         )
         assert proc.returncode == 0, (
             "子进程备份失败: rc=%s stderr=%s" % (proc.returncode, proc.stderr))
