@@ -171,3 +171,82 @@ def atomic_write_json(path: str, data) -> None:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+# ────────── GUI 偏好项（scan_config.json 的 GUI 侧键）────────────────────
+#
+# ★ 为什么偏好项的**默认值本体**放在本模块：
+#   scan_config.json 是本项目唯一的 GUI 配置（协调器读、GUI 写），但协调器
+#   对本轮来说是**只读**模块 ⇒ GUI 侧的偏好默认值需要一个中性的真源。
+#   放这里 ⇒ GUI / 测试共用同一份默认值，不会两处漂移。
+#
+# ★ 语义（open_folder_prompt）：
+#   False（默认）= 保存完成后**直接打开**所在文件夹、不弹窗（历史行为，向后兼容）
+#   True          = 保存完成后**先弹模态确认框**
+#                   （「已保存：<路径>」「是否打开所在文件夹？」），
+#                   用户选「是」才打开；框里可勾选「记住此选择」。
+#
+# ★ open_folder_remember 记录「记住的选择」：
+#   "ask"（默认，每次都问）/ "always"（不问，直接打开）/ "never"（不问，也不打开）。
+#   ★ 只在 open_folder_prompt 为 True 时才生效。
+GUI_PREFERENCE_DEFAULTS = {
+    "open_folder_prompt": False,
+    "open_folder_remember": "ask",
+}
+
+#: open_folder_remember 的合法取值
+OPEN_FOLDER_REMEMBER_MODES = ("ask", "always", "never")
+
+
+def get_gui_preference(cfg: dict, key: str):
+    """
+    取一个 GUI 偏好项（**带类型兜底**）。
+
+    - 键不存在        ⇒ 返回默认值（缺省值本体 = GUI_PREFERENCE_DEFAULTS）
+    - 类型不对/取值非法 ⇒ 退回默认值（配置文件被手改坏时**不能崩**）
+    """
+    default = GUI_PREFERENCE_DEFAULTS.get(key)
+    if not isinstance(cfg, dict):
+        return default
+    value = cfg.get(key, default)
+    if isinstance(default, bool):
+        # ★ 严格：类型不对（配置被手改坏）⇒ 退回默认值，
+        #   不能把 "yes"/"off" 之类的字符串当成 True。
+        if isinstance(value, bool):
+            return value
+        return default
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            return default
+        allowed = OPEN_FOLDER_REMEMBER_MODES if key == "open_folder_remember" else None
+        if allowed is not None and value not in allowed:
+            return default
+        return value
+    return value
+
+
+def set_gui_preference(cfg: dict, key: str, value) -> bool:
+    """写一个 GUI 偏好项（**就地**修改 cfg）。返回是否真的改了。"""
+    if not isinstance(cfg, dict) or key not in GUI_PREFERENCE_DEFAULTS:
+        return False
+    old = cfg.get(key)
+    cfg[key] = value
+    return old != value
+
+
+def apply_gui_preference_defaults(cfg: dict) -> bool:
+    """
+    把 GUI 偏好项的缺省值补进配置字典（就地修改）。返回**是否真的补了键**。
+
+    ★ 与 `scan_coordinator.apply_deskew_defaults` 同构（同一套「补默认值」语义），
+      区别是这里管的是 **GUI 侧**的键。
+    ★ 补了键才值得落盘；没补就不写文件（避免每次启动都动一次配置）。
+    """
+    if not isinstance(cfg, dict):
+        return False
+    changed = False
+    for key, default in GUI_PREFERENCE_DEFAULTS.items():
+        if key not in cfg:
+            cfg[key] = default
+            changed = True
+    return changed

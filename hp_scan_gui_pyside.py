@@ -27,6 +27,7 @@ except Exception:            # pragma: no cover - 预热失败不该挡住启动
     pass
 
 import cache_manager
+import config_io
 import doc_merge
 import document_session
 import history_manager
@@ -133,6 +134,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QPixmap, QImage, QIcon, QFont, QFontDatabase,
     QPainter, QColor, QTransform,
+    QShortcut, QKeySequence,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -681,15 +683,126 @@ def _pending_save_count(app, label=None) -> int:
     return _save_tracker_of(app).count(label)
 
 
+# ────────── 并发扫描：在途 job 登记（需求 2）────────────────────────────
+#
+# ★ 为什么不能继续用单个 `_current_job_id`：
+#   后端 `scan_coordinator` 早就用 `QThreadPool`（`setMaxThreadCount(4)`）跑多任务，
+#   但 GUI 只跟踪一个 job id ⇒ 一次只能扫一台。现在改成**在途 job 表**
+#   （job_id → 该 job 的设备信息），每台各自取消、各自回填结果。
+
+def _active_jobs_of(app):
+    """
+    在途扫描 job 表（job_id → {"scanner":…, "name":…}）；没有就懒建一个。
+
+    ★ 做成模块级函数（而不是方法）：本文件里 `_on_scan_finished` 之类的方法
+      会被既有测试的**最小替身**借用（替身只有那几个方法）⇒ 不能假设替身上
+      也有本文件新加的属性/方法。
+    """
+    jobs = getattr(app, "_active_jobs", None)
+    if not isinstance(jobs, dict):
+        jobs = {}
+        try:
+            app._active_jobs = jobs
+        except Exception:       # pragma: no cover - 极端替身（属性不可写）
+            pass
+    return jobs
+
+
+def _track_job(app, job_id, info=None):
+    """登记一个在途扫描 job（重复登记同一 id ⇒ 覆盖）。"""
+    if not job_id:
+        return
+    _active_jobs_of(app)[job_id] = dict(info or {})
+
+
+def _job_info(app, job_id):
+    """取某个在途 job 的信息（没有 ⇒ 空 dict）。"""
+    return dict(_active_jobs_of(app).get(job_id) or {})
+
+
+def _job_label(app, job_id):
+    """某个在途 job 的设备名（状态栏区分多台并行时用）。"""
+    return (_job_info(app, job_id) or {}).get("name") or ""
+
+
+def _finish_job(app, job_id):
+    """
+    把 job 从在途表里摘掉。返回**是否还有别的在途 job**。
+
+    ★ 幂等：协调器随后还会发 `scan_cancelled` / `scan_finished`，
+      重复摘同一个 id 是安全的（不会误伤别的 job）。
+    """
+    jobs = _active_jobs_of(app)
+    jobs.pop(job_id, None)
+    return bool(jobs)
+
+
+def _active_job_count(app):
+    """在途扫描数。"""
+    return len(_active_jobs_of(app))
+
+
+def _latest_active_job(app):
+    """
+    最近启动的在途 job（取消按钮默认取消它）。
+
+    ★ 单个「取消扫描」按钮 ⇒ 多台并行时只能一次取消一台；
+      取**最近启动**的那台（用户通常在盯最新那台）。
+      再点一次就轮到上一台 ⇒ 每台都能单独取消。
+    """
+    jobs = _active_jobs_of(app)
+    if not jobs:
+        return None
+    return next(reversed(jobs))
+
+
+def _scanner_title(scanner):
+    """设备显示名（状态栏里区分多台并行时用）。取不到 ⇒ 空串。"""
+    if scanner is None:
+        return ""
+    if isinstance(scanner, dict):
+        for key in ("name", "model", "id"):
+            value = scanner.get(key)
+            if value:
+                return str(value)
+        return ""
+    for attr in ("custom_name", "model", "name", "ip"):
+        try:
+            value = getattr(scanner, attr, None)
+        except Exception:       # pragma: no cover - 防御
+            value = None
+        if value:
+            return str(value)
+    return ""
+
+
+def _is_session_mode(app):
+    """
+    当前是否是**双面/续扫（会话）**模式。取不到 ⇒ 按单面（可并行）。
+
+    ★ 会话模式本质是**顺序**的（正面→背面、逐批追加）⇒ 必须保持单台串行，
+      否则两批同时入会话会把「正面/背面」记账搞乱。
+    """
+    getter = getattr(app, "_current_session_mode", None)
+    if getter is None:
+        return False
+    try:
+        return getter() != SESSION_MODE_SINGLE
+    except Exception:           # pragma: no cover - 防御
+        return False
+
+
 def _refresh_scan_button(app):
     """
-    按「落盘在途」刷新扫描按钮状态。
+    按「落盘在途 / 扫描在途」刷新扫描按钮状态。
 
     ★ 复审 A1-R1：直接保存后台化之后，**落盘期间扫描按钮被重新启用**
       ⇒ 用户能再点一次扫描 ⇒ 两个 save_pages 并发重叠（产物还可能互相覆盖）。
       这里把「落盘在途」当成一等状态：落盘结束前按钮保持禁用（文案也换掉，
       让用户知道界面为什么点不动）。
-    ★ 扫描进行中也不能点（与改造前的行为一致）。
+    ★ 并发扫描（需求 2）：**扫描在途不再禁用按钮** —— 用户可以在 A 台还在扫的
+      时候接着扫 B 台（后端 QThreadPool 支持 4 并发）。
+      ★ 例外：**会话模式**（双面/续扫）必须串行 ⇒ 仍禁用（保持原有行为）。
     """
     btn = getattr(app, "scan_btn", None)
     if btn is None:
@@ -700,7 +813,7 @@ def _refresh_scan_button(app):
         if pending:
             btn.setText("保存中...")
             btn.setEnabled(False)
-        elif scanning:
+        elif scanning and _is_session_mode(app):
             btn.setText("扫描中...")
             btn.setEnabled(False)
         else:
@@ -708,6 +821,117 @@ def _refresh_scan_button(app):
             btn.setEnabled(True)
     except RuntimeError:       # pragma: no cover - 控件已销毁
         logger.debug("刷新扫描按钮状态失败（控件已销毁）")
+
+
+# ────────── 保存后「打开文件夹」偏好（需求 1）────────────────────────────
+
+def _open_folder_prefs(parent=None):
+    """
+    取「保存后打开文件夹」的两个偏好：(是否弹窗询问, 记住模式)。
+
+    ★ 优先用主窗口的**内存配置**（`parent.cfg`，用户刚改的值），
+      没有主窗口（对话框独立存在 / 最小替身）⇒ 退回读配置文件。
+    """
+    cfg = getattr(parent, "cfg", None)
+    if not isinstance(cfg, dict):
+        try:
+            cfg = scan_coordinator.load_config()
+        except Exception as e:            # pragma: no cover - 读配置失败
+            logger.debug("读配置失败（打开文件夹偏好）: %s", e)
+            cfg = {}
+    prompt = bool(config_io.get_gui_preference(cfg, "open_folder_prompt"))
+    remember = config_io.get_gui_preference(cfg, "open_folder_remember")
+    return prompt, remember
+
+
+def _remember_open_folder_choice(parent, mode):
+    """
+    把「记住的选择」写回配置（mode ∈ always / never）。返回是否写成功。
+
+    ★ 有主窗口 ⇒ 走主窗口的 `_save_cfg`（统一出口：失败会弹窗告诉用户"未生效"）。
+      没有 ⇒ 直接读写 scan_config.json。
+    """
+    if mode not in ("always", "never"):
+        return False
+    cfg = getattr(parent, "cfg", None)
+    saver = getattr(parent, "_save_cfg", None)
+    if isinstance(cfg, dict) and callable(saver):
+        config_io.set_gui_preference(cfg, "open_folder_remember", mode)
+        try:
+            return bool(saver(what="打开文件夹设置"))
+        except Exception as e:            # pragma: no cover - 防御
+            logger.error("写回「打开文件夹」偏好失败: %s", e)
+            return False
+    try:
+        cfg = scan_coordinator.load_config()
+    except Exception:                     # pragma: no cover - 读配置失败
+        cfg = {}
+    config_io.set_gui_preference(cfg, "open_folder_remember", mode)
+    try:
+        return bool(scan_coordinator.save_config(cfg))
+    except Exception as e:                # pragma: no cover - 写配置失败
+        logger.error("写回「打开文件夹」偏好失败: %s", e)
+        return False
+
+
+def _ask_open_folder(folder, parent=None):
+    """
+    模态询问「是否打开所在文件夹？」。返回 (是否打开, 是否记住选择)。
+
+    ★ 用 QMessageBox **实例**（不是静态 question）—— 需要带
+      「记住此选择」复选框；`exec()` 是模态的（阻塞到用户回答）。
+    ★ 不拿可能已被销毁的窗口当 parent（野指针 ⇒ 堆损坏）。
+    """
+    box = QMessageBox(
+        QMessageBox.Question, "已保存",
+        "已保存：%s\n\n是否打开所在文件夹？" % folder,
+        QMessageBox.Yes | QMessageBox.No, parent)
+    box.setCheckBoxText("记住此选择（以后不再询问）")
+    box.setDefaultButton(QMessageBox.Yes)
+    reply = box.exec()
+    remember = False
+    try:
+        remember = bool(box.checkBox().isChecked())
+    except Exception:                     # pragma: no cover - 防御
+        remember = False
+    return reply == QMessageBox.Yes, remember
+
+
+def _open_folder_after_save(saved_files, parent=None):
+    """
+    保存完成后打开所在文件夹 —— **受配置 `open_folder_prompt` 控制**。
+
+    ★ 默认（`open_folder_prompt` = False）= **直接打开、不弹窗**（历史行为，向后兼容）。
+    ★ 开启后 = 弹模态确认框；用户选「是」才打开；勾了「记住此选择」则写回配置
+      （下次保存不再问）。
+    返回 True = 打开了文件夹；False = 没打开。
+    """
+    if not saved_files:
+        return False
+    try:
+        folder = os.path.dirname(saved_files[0])
+    except Exception:                     # pragma: no cover - 防御
+        return False
+    if not folder:
+        return False
+    prompt, remember = _open_folder_prefs(parent)
+    if remember == "never":
+        return False
+    if prompt and remember == "ask":
+        try:
+            yes, keep = _ask_open_folder(folder, parent)
+        except RuntimeError:              # 主窗口已销毁 ⇒ 按「不打开」处理
+            logger.debug("打开文件夹确认框时主窗口已销毁，按「不打开」处理")
+            return False
+        if keep:
+            _remember_open_folder_choice(parent, "always" if yes else "never")
+        if not yes:
+            return False
+    try:
+        os.startfile(folder)
+    except Exception:
+        pass
+    return True
 
 
 def _timestamped_output_name(prefix: str, ext: str) -> str:
@@ -1720,8 +1944,16 @@ class ScanApp(QMainWindow, _UiPostMixin):
             logger.debug("协调器没有 page_meta_save_failed 信号: %s", e)
         _ensure_ui_dispatcher()
         self._current_job_id = None
+        # ★ 并发扫描（需求 2）：在途 job 表（job_id → 该 job 的设备信息）
+        #   —— 不再只跟踪单个 `_current_job_id`（那样一次只能扫一台）。
+        self._active_jobs = {}
         self.coordinator.load_config()
         self.cfg = self.coordinator.cfg
+        # GUI 偏好项的缺省值（只补到内存，不写盘；用户改了再落盘）
+        try:
+            config_io.apply_gui_preference_defaults(self.cfg)
+        except Exception as e:            # pragma: no cover - 防御
+            logger.debug("补 GUI 偏好缺省值失败: %s", e)
 
         # 启动时清理过期缓存
         try:
@@ -1746,6 +1978,8 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self._exposure_state = None
         # WIA 路径的取消信号（GUI 兜底持有；正常已登记进协调器）
         self._wia_cancel_event = None
+        # ★ WIA 那个 job 的 id（并发时用来分辨"取消的是哪一路"）
+        self._wia_job_id = None
         # ★ 复审 A1-R1：在途保存用**计数**登记（不是单个布尔标志）
         #   ⇒ 几个在跑就减几个；"全部完成"只在计数归零时成立。
         self._save_tracker = _SaveTracker()
@@ -1839,6 +2073,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.scan_progress.setMaximumHeight(16)
         self.scan_progress.setVisible(False)
         self.status_bar.addPermanentWidget(self.scan_progress)
+
+        # ★ 保存后「打开文件夹」偏好的开关（快捷键 Ctrl+Shift+O）——
+        #   **不加控件**：加控件会动主窗口布局（用户红线）；
+        #   改的是**配置**（open_folder_prompt）⇒ 重启后依然生效。
+        self.open_folder_shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), self)
+        self.open_folder_shortcut.activated.connect(self._toggle_open_folder_prompt)
 
         # 淡入动画
         add_fade_animation(self, ANIM["slow"])
@@ -2301,6 +2541,27 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.cfg["direct_save"] = self.direct_save_val
         self._save_cfg()
 
+    def _toggle_open_folder_prompt(self):
+        """
+        切换「保存后是否弹窗询问打开文件夹」（快捷键 Ctrl+Shift+O）。
+
+        ★ 用**快捷键**而不是加复选框 —— 加控件会动主窗口布局（用户红线）。
+        ★ 改的是**配置**（`open_folder_prompt` / `open_folder_remember`）
+          ⇒ 重启后依然生效；写盘失败会由 `_save_cfg` 如实上报（不假装生效）。
+        """
+        cur = bool(config_io.get_gui_preference(self.cfg, "open_folder_prompt"))
+        new = not cur
+        config_io.set_gui_preference(self.cfg, "open_folder_prompt", new)
+        # 手动切换 ⇒ 「记住的选择」复位成"每次都问"（否则用户改主意也改不动）
+        config_io.set_gui_preference(self.cfg, "open_folder_remember", "ask")
+        ok = self._save_cfg(what="打开文件夹设置")
+        state = "开启（保存后会先询问）" if new else "关闭（保存后直接打开）"
+        if ok:
+            self.status_bar.showMessage(f"保存后打开文件夹：{state}")
+        else:
+            self.status_bar.showMessage(
+                f"保存后打开文件夹：{state}（配置未落盘，下次启动可能还原）")
+
     def _sync_direct_save_checkbox(self):
         """
         复选框显示状态必须与实际生效状态一致。
@@ -2612,6 +2873,12 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if _pending_save_count(self):
             self.status_bar.showMessage("正在保存中，请等保存结束后再扫描")
             return
+        # ★ 并发扫描（需求 2）：单面模式允许**多台并行**（后端 QThreadPool 4 并发）。
+        #   但双面/续扫（会话）模式本质是**顺序**的（正面→背面、逐批追加）
+        #   ⇒ 会话模式保持单台串行，避免两批同时入会话把"正面/背面"记账搞乱。
+        if _active_job_count(self) and _is_session_mode(self):
+            self.status_bar.showMessage("双面/续扫模式下请等本次扫描结束再扫下一台")
+            return
 
         # 每次扫描都是新文档 ⇒ 清掉上一份文档残留的曝光参数（I-6）。
         # 曝光是「预览里的临时调整」，跨文档静默套用会让用户扫出来的图被改过。
@@ -2661,36 +2928,63 @@ class ScanApp(QMainWindow, _UiPostMixin):
             "output_dir": out_dir,
         }
 
-        self.scan_btn.setText("扫描中...")
-        self.scan_btn.setEnabled(False)
+        # ★ 并发扫描（需求 2）：扫描期间**不再禁用**扫描按钮 ——
+        #   A 台还在扫的时候可以接着扫 B 台（按钮状态由 `_refresh_scan_button` 裁决）。
         self._scan_in_progress = True
-        self.status_bar.showMessage("正在扫描...")
+        _refresh_scan_button(self)
+        dev_title = _scanner_title(self.selected)
+        self.status_bar.showMessage(
+            "正在扫描 %s..." % dev_title if dev_title else "正在扫描...")
         self.scan_progress.setVisible(True)
         self.scan_progress.setRange(0, 0)
 
-        self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
-        self.cancel_scan_btn.clicked.connect(self._cancel_scan)
-        self.status_bar.addPermanentWidget(self.cancel_scan_btn)
+        # 取消按钮：状态栏**只放一个**（多台并行时取消最近启动的那台）
+        if not getattr(self, "cancel_scan_btn", None):
+            self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
+            self.cancel_scan_btn.clicked.connect(self._cancel_scan)
+            self.status_bar.addPermanentWidget(self.cancel_scan_btn)
 
-        self._current_job_id = self.coordinator.start_scan(self.selected, params)
+        job_id = self.coordinator.start_scan(self.selected, params)
+        self._current_job_id = job_id
+        # ★ 登记在途 job（每台各自跟踪 ⇒ 各自取消、各自回填结果）
+        _track_job(self, job_id, {"scanner": self.selected, "name": dev_title})
         if mode != SESSION_MODE_SINGLE:
-            self._pending_side_by_job[self._current_job_id] = side
+            self._pending_side_by_job[job_id] = side
 
     def _cancel_scan(self):
-        """取消扫描"""
-        job_id = getattr(self, "_current_job_id", None)
+        """取消扫描（多台并行时取消**最近启动**的那台）"""
+        job_id = _latest_active_job(self)
+        if job_id is None:
+            job_id = getattr(self, "_current_job_id", None)
         if job_id:
             self.coordinator.cancel_scan(job_id)
         # WIA 路径兜底：协调器里没登记成功时，GUI 直接 set **同一个** event
+        #   ★ 只针对 WIA 那个 job —— 否则并发时取消 eSCL 会把 WIA 一起取消掉。
         event = getattr(self, "_wia_cancel_event", None)
-        if event is not None:
+        wia_job = getattr(self, "_wia_job_id", None)
+        if event is not None and (wia_job is None or job_id == wia_job):
             event.set()
+        label = _job_label(self, job_id)
+        # 从在途表里摘掉（协调器随后还会发 scan_cancelled，重复摘是无害的）
+        still_running = _finish_job(self, job_id)
+        if still_running:
+            self.status_bar.showMessage(
+                "已请求取消%s，仍有 %d 台在扫描"
+                % (("（%s）" % label) if label else "", _active_job_count(self)))
+            self._scan_in_progress = True
+            _refresh_scan_button(self)
+            return
         self.status_bar.showMessage("扫描已取消")
         self._reset_scan_ui()
 
     # ────────── 协调器信号槽 ──────────
 
     def _on_scan_progress(self, job_id, message, page):
+        # ★ 多台并行时给消息加上设备名（否则两台的消息互相覆盖，看不出是哪台）
+        if _active_job_count(self) > 1:
+            label = _job_label(self, job_id)
+            if label:
+                message = "[%s] %s" % (label, message)
         self.status_bar.showMessage(message)
 
     def _on_source_warning(self, warning):
@@ -2784,7 +3078,16 @@ class ScanApp(QMainWindow, _UiPostMixin):
             logger.debug("页元数据失败提示时主窗口已销毁")
 
     def _on_scan_finished(self, job_id, result):
-        self._reset_scan_ui()
+        # ★ 并发扫描：先把本 job 从在途表摘掉（"还有没有别的在扫"才准），
+        #   并且**用这台自己的设备**回填结果（不是当前选中的那台）。
+        info = _job_info(self, job_id)
+        still_running = _finish_job(self, job_id)
+        if still_running:
+            # 还有别的在扫 ⇒ 只刷新按钮，**不动**进度条/取消按钮
+            self._scan_in_progress = True
+            _refresh_scan_button(self)
+        else:
+            self._reset_scan_ui()
         if not result.cached_paths:
             self.status_bar.showMessage("扫描未产生任何页面")
             return
@@ -2815,10 +3118,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if mode != SESSION_MODE_SINGLE and getattr(self, "_session", None) is not None:
             self._session_batch_finished(job_id, result, mode)
             return
-        scanner = self.selected
+        # ★ 用**这台 job 自己的设备**回填（并发时当前选中的可能是另一台）
+        scanner = info.get("scanner") or self.selected
         # 「直接保存」勾选 ⇒ 跳过预览对话框，直接落盘
         if self.direct_save_val:
-            self._direct_save_result(result)
+            self._direct_save_result(result, scanner=scanner)
             return
         # 扫描结束、结果交给用户预览之前：把 job 登记为「已扫描未保存」，
         # 让它的缓存目录在用户预览期间不受 eviction / stale 清理影响。
@@ -2835,7 +3139,7 @@ class ScanApp(QMainWindow, _UiPostMixin):
             self._show_preview(result.cached_paths[0], result.ext, result.output_path,
                               result.job_id, scanner)
 
-    def _direct_save_result(self, result):
+    def _direct_save_result(self, result, scanner=None):
         """
         「直接保存」模式：跳过预览，直接把缓存页落盘。
 
@@ -2844,12 +3148,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
           完成/失败都回主线程再提示 —— 与多页预览保存**同一套机制**
           （`_run_in_background` + 模块级投递器）。
         save_manager 负责：写目标文件 → 复制到额外输出目录 → 清缓存 → 写扫描历史。
-        设备名/IP 取自当前选中设备；未选中设备时留空，不报错。
+        设备名/IP 取自**本次扫描那台**设备（并发时不是当前选中的那台）；
+        未选中设备时留空，不报错。
 
         曝光参数：只在**本次扫描内**沿用（扫描开始时已清空残留），
         提示里会写明"沿用了曝光"，避免用户不知道图被动过。
         """
-        scanner = self.selected
+        scanner = scanner if scanner is not None else self.selected
         dev_name = (scanner.model or "") if scanner else ""
         dev_ip = (scanner.ip or "") if scanner else ""
         page_specs = [(path, 0) for path in result.cached_paths]
@@ -2960,12 +3265,24 @@ class ScanApp(QMainWindow, _UiPostMixin):
 
 
     def _on_scan_failed(self, job_id, error):
-        self._reset_scan_ui()
+        # ★ 并发扫描：本台结束**不能**把别的台的进度条/取消按钮清掉
+        _finish_job(self, job_id)
+        if _active_job_count(self):
+            self._scan_in_progress = True
+            _refresh_scan_button(self)
+        else:
+            self._reset_scan_ui()
         QMessageBox.critical(self, "扫描错误", error)
         self.status_bar.showMessage(f"扫描失败: {error[:50]}")
 
     def _on_scan_cancelled(self, job_id):
-        self._reset_scan_ui()
+        # ★ 并发扫描：本台取消**不能**把别的台的进度条/取消按钮清掉
+        _finish_job(self, job_id)
+        if _active_job_count(self):
+            self._scan_in_progress = True
+            _refresh_scan_button(self)
+        else:
+            self._reset_scan_ui()
         # ★ 防御式取状态：既有测试的最小替身可能没有会话接线
         pending = getattr(self, "_pending_resume_from", None) or {}
         sides = getattr(self, "_pending_side_by_job", None) or {}
@@ -3001,10 +3318,19 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.status_bar.showMessage("扫描已取消")
 
     def _reset_scan_ui(self):
-        """重置扫描 UI"""
-        # ★ 落盘在途时**不许**重新启用扫描按钮（复审 A1-R1）：
-        #   后台化之后这里原本无条件 setEnabled(True) ⇒ 用户能在落盘途中再扫一份
-        #   ⇒ 两个 save_pages 并发重叠。改成"落盘在途 ⇒ 保持禁用"。
+        """重置扫描 UI
+
+        ★ 并发扫描：**还有别的扫描在跑时不能重置** —— 一台结束就把进度条、
+          取消按钮清掉，用户会以为"全扫完了"，也没法再取消另一台。
+          此时只刷新按钮状态就返回。
+        ★ 落盘在途时**不许**重新启用扫描按钮（复审 A1-R1）：
+          后台化之后这里原本无条件 setEnabled(True) ⇒ 用户能在落盘途中再扫一份
+          ⇒ 两个 save_pages 并发重叠。改成"落盘在途 ⇒ 保持禁用"。
+        """
+        if _active_job_count(self):
+            self._scan_in_progress = True
+            _refresh_scan_button(self)
+            return
         self._scan_in_progress = False
         _refresh_scan_button(self)
         self.listen_btn.setEnabled(True)
@@ -3930,18 +4256,22 @@ class ScanApp(QMainWindow, _UiPostMixin):
         # 登记到协调器 ⇒ coordinator.cancel_scan(job_id) 停的是**同一个** event
         self._register_cancel_event(job_id, cancel_event)
         self._wia_cancel_event = cancel_event
+        self._wia_job_id = job_id
         self._current_job_id = job_id
+        # ★ 并发扫描：WIA 任务也登记进在途表（取消/界面重置逻辑与 eSCL 统一）
+        _track_job(self, job_id, {"scanner": None, "name": "USB 扫描"})
 
         self.status_bar.showMessage("正在通过 WIA 扫描...")
         # 新的一次扫描 = 新文档 ⇒ 清掉残留曝光（I-6）
         self._reset_exposure_state()
 
         # 取消入口：与 eSCL 路径一致（状态栏上的「取消扫描」按钮）
-        self.scan_btn.setEnabled(False)
         self._scan_in_progress = True
-        self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
-        self.cancel_scan_btn.clicked.connect(self._cancel_scan)
-        self.status_bar.addPermanentWidget(self.cancel_scan_btn)
+        _refresh_scan_button(self)
+        if not getattr(self, "cancel_scan_btn", None):
+            self.cancel_scan_btn = AnimatedButton("取消扫描", button_type="accent")
+            self.cancel_scan_btn.clicked.connect(self._cancel_scan)
+            self.status_bar.addPermanentWidget(self.cancel_scan_btn)
 
         def _wia_thread():
             try:
@@ -3960,29 +4290,54 @@ class ScanApp(QMainWindow, _UiPostMixin):
                     output_path = os.path.join(
                         out_dir, _timestamped_output_name("HP_WIA", ext)
                     )
-                    self._post_ui(lambda: self._show_preview(
-                        cache_path, ext, output_path, job_id))
+
+                    def _show():
+                        # ★ 先摘掉在途登记（否则界面重置会被"还有别的在扫"挡掉）
+                        _finish_job(self, job_id)
+                        self._show_preview(
+                            cache_path, ext, output_path, job_id)
+
+                    self._post_ui(_show)
                 else:
-                    self._post_ui(lambda: self._reset_scan_ui())
-                    self._post_ui(lambda: self.status_bar.showMessage("WIA 扫描失败"))
+                    def _failed():
+                        _finish_job(self, job_id)
+                        self._reset_scan_ui()
+                        self.status_bar.showMessage("WIA 扫描失败")
+
+                    self._post_ui(_failed)
             except ScanCancelled:
                 # ★ 用户取消 ⇒ **不是失败**（V3-F-4）：发 scan_cancelled，
                 #   绝不能发 scan_failed（否则用户看到"扫描失败"）。
                 self._post_ui(lambda: self._on_wia_cancelled(job_id))
             except Exception as e:
-                self._post_ui(lambda: self._scan_error(f"WIA 错误: {e}"))
+                # ★ `except ... as e` 的 e 在 except 块结束时会被**删除**
+                #   ⇒ 闭包里必须先绑一份（否则回调里 NameError）。
+                err_text = f"WIA 错误: {e}"
+
+                def _err():
+                    _finish_job(self, job_id)
+                    self._scan_error(err_text)
+
+                self._post_ui(_err)
                 # 预览没开起来 ⇒ 没人替我们注销 job（否则缓存目录永不被回收）
                 self._release_job(job_id)
             finally:
                 self._clear_cancel_event(job_id)
                 self._wia_cancel_event = None
+                self._wia_job_id = None
 
         threading.Thread(target=_wia_thread, daemon=True).start()
 
     def _on_wia_cancelled(self, job_id):
         """WIA 扫描被用户取消（取消 ≠ 失败）。"""
         try:
-            self._reset_scan_ui()
+            # ★ 并发扫描：摘掉在途登记；别的台还在扫 ⇒ 不重置界面
+            _finish_job(self, job_id)
+            if _active_job_count(self):
+                self._scan_in_progress = True
+                _refresh_scan_button(self)
+            else:
+                self._reset_scan_ui()
             self.status_bar.showMessage("扫描已取消")
             # 发协调器的 scan_cancelled（与 eSCL 路径同一套信号语义）——
             # ★ WIA 路径是 GUI 自己起的线程（协调器没有 WIA 路径）⇒ 这里补发，
@@ -4917,10 +5272,9 @@ class PreviewDialog(QDialog, _UiPostMixin):
                 parent.set_exposure_state(exposure)
             self.accept()
             if saved_files:
-                try:
-                    os.startfile(os.path.dirname(saved_files[0]))
-                except Exception:
-                    pass
+                # ★ 保存后打开所在文件夹 —— 受配置 `open_folder_prompt` 控制
+                #   （默认直接打开、不弹窗；开启后先弹模态确认框）。
+                _open_folder_after_save(saved_files, parent=parent)
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
 
@@ -5616,10 +5970,9 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                 QMessageBox.warning(
                     None, "保存部分失败" if failed_pages else "保存提示", summary)
             self.accept()
-            try:
-                os.startfile(os.path.dirname(saved_files[0]))
-            except Exception:
-                pass
+            # ★ 保存后打开所在文件夹 —— 受配置 `open_folder_prompt` 控制
+            #   （默认直接打开、不弹窗；开启后先弹模态确认框）。
+            _open_folder_after_save(saved_files, parent=parent)
         except RuntimeError:
             # 对话框已被销毁（用户提前关窗）—— 不用再提示
             logger.debug("保存完成时对话框已销毁")
