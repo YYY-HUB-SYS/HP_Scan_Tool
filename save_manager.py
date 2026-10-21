@@ -368,6 +368,9 @@ class SaveRequest:
     # ★ 各组的自定义组名（**重命名分组**功能）：与 groups 等长，
     #   下标 0 对应第 1 组；None / 长度不足 ⇒ 那些组沿用组号命名。
     group_names: list | None = None
+    # ★ **逐页曝光覆盖**：与 page_specs 等长（下标对齐）；元素为 None 表示
+    #   该页跟随整批的 exposure，为 dict 表示该页单独用自己的曝光。
+    page_exposures: list | None = None
 
 
 def run_save_job(req: SaveRequest) -> SaveResult:
@@ -382,7 +385,8 @@ def run_save_job(req: SaveRequest) -> SaveResult:
                       req.groups, extra_dirs=req.extra_dirs,
                       device_name=req.device_name, device_ip=req.device_ip,
                       exposure=req.exposure, confirm=req.confirm,
-                      group_names=req.group_names)
+                      group_names=req.group_names,
+                      page_exposures=req.page_exposures)
 
 
 def estimate_pdf_peak_bytes(page_specs) -> int:
@@ -463,6 +467,30 @@ def _group_name_at(group_names, group_index: int) -> str:
         return ""
     value = group_names[index]
     return value if isinstance(value, str) else ""
+
+
+def _page_exposure_at(page_exposures, page_index: int):
+    """
+    取第 `page_index` 页（**0 基**）的**逐页曝光覆盖**；没有覆盖 ⇒ 返回 None。
+
+    ★ 语义：`None` = 该页**跟随整批**的曝光；返回一个 dict = 该页**单独**用自己的曝光。
+    ★ 与 `_group_name_at` 同款类型闸：只接受 list / tuple，
+      误传字符串时 `"abc"[0]` 会被当成第 1 页的覆盖 ⇒ 静默错曝光。
+    ★ 覆盖值是**原始 dict**（未净化）—— 净化统一由 `_exposure_params` 做，
+      这样「GUI 回填的值」与「外部传入的值」走**同一条**净化路径。
+    """
+    if not page_exposures or not isinstance(page_exposures, (list, tuple)):
+        return None
+    try:
+        index = int(page_index)
+    except (TypeError, ValueError):
+        return None
+    if index < 0 or index >= len(page_exposures):
+        return None
+    value = page_exposures[index]
+    if not isinstance(value, dict):
+        return None
+    return value
 
 
 def build_output_name(base: str, ext: str, group_count: int,
@@ -808,7 +836,8 @@ def _open_page_image(cache_file: str, rotation: int = 0, exposure=None,
 
 
 def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None,
-               deskew_angles=None, deskew_threshold=None) -> tuple[int, int, list]:
+               deskew_angles=None, deskew_threshold=None,
+               page_exposures=None) -> tuple[int, int, list]:
     """
     合成 PDF（单页/多页同一份代码）。返回 (成功页数, 失败页数, 失败页下标列表)。
 
@@ -843,7 +872,10 @@ def _write_pdf(pages, out_path: str, dpi: int = 300, exposure=None,
                 angle = 0.0
                 if deskew_angles and idx - 1 < len(deskew_angles):
                     angle = deskew_angles[idx - 1]
-                img = _open_page_image(cache_file, rotation, exposure,
+                # ★ 逐页曝光覆盖：该页有覆盖用自己的，没有则跟随整批的 `exposure`
+                page_exp = _page_exposure_at(page_exposures, idx - 1)
+                eff_exposure = page_exp if page_exp is not None else exposure
+                img = _open_page_image(cache_file, rotation, eff_exposure,
                                        deskew_angle=angle,
                                        deskew_threshold=deskew_threshold)
                 canvas = _a4_canvas(img, dpi)
@@ -1029,7 +1061,8 @@ def save_pages(job_id: str, ext: str, output_path: str,
                device_name: str = "", device_ip: str = "",
                exposure=None,
                confirm: Callable | None = None,
-               group_names: list | None = None) -> SaveResult:
+               group_names: list | None = None,
+               page_exposures: list | None = None) -> SaveResult:
     """
     多页保存（可分组）。
 
@@ -1041,6 +1074,12 @@ def save_pages(job_id: str, ext: str, output_path: str,
     group_names: ★ 各组的自定义组名（**重命名分组**）：与 groups 等长，
                 下标 0 对应第 1 组。None / 长度不足 ⇒ 那些组**沿用组号**
                 （与改造前逐字节一致）。组名会先经 sanitize_group_name 净化。
+    page_exposures: ★ **逐页曝光覆盖**：与 page_specs **等长**（下标对齐），
+                每个元素是 None（该页**跟随整批**的 exposure）或一个曝光 dict
+                （该页**单独**用自己的曝光）。None / 长度不足 ⇒ 那些页跟随整批。
+                ★ 覆盖值会走**同一条**净化路径（`_exposure_params`），
+                  与 GUI 回填的值口径一致。
+                ★ PDF 与图片两条路径都支持。
 
     自动纠偏（批次 4）：逐页纠偏角取自页元数据（page_meta.deskew_angle），
     顺序为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**；
@@ -1060,7 +1099,6 @@ def save_pages(job_id: str, ext: str, output_path: str,
     skipped_pages: list[int] = []
     warnings: list[str] = []
     saved_page_count = 0
-    exposure_active = _exposure_params(exposure) is not None
 
     # ── 自动纠偏（批次 4）────────────────────────────────────────────
     # 纠偏角来自页元数据（扫描时测出来的），逐页解析：
@@ -1082,9 +1120,14 @@ def save_pages(job_id: str, ext: str, output_path: str,
                                          _group_name_at(group_names, gi))
             # 体积预检：在开始合并**之前**提示（不静默截断）
             _precheck_pdf_volume(pages, confirm, warnings)
+            # ★ 逐页曝光覆盖：把**全局** page_specs 下标映射成本组的下标
+            #   （`_write_pdf` 收到的是「组内页列表」⇒ 覆盖列表也必须是组内口径）
+            group_page_exposures = [_page_exposure_at(page_exposures, page_idx)
+                                    for page_idx in group_indices]
             ok, failed, failed_idx = _write_pdf(pages, pdf_path, exposure=exposure,
                                                 deskew_angles=group_angles,
-                                                deskew_threshold=deskew_threshold)
+                                                deskew_threshold=deskew_threshold,
+                                                page_exposures=group_page_exposures)
             failed_pages += failed
             # failed_idx 是组内下标 ⇒ 映射回 page_specs 的全局下标
             skipped_pages.extend(group_indices[i] for i in failed_idx)
@@ -1101,8 +1144,12 @@ def save_pages(job_id: str, ext: str, output_path: str,
                 try:
                     fpath = build_output_name(base, ext, group_count, gi, seq,
                                              _group_name_at(group_names, gi))
+                    # ★ 逐页曝光覆盖：该页有覆盖用自己的，没有则跟随整批
+                    page_exp = _page_exposure_at(page_exposures, page_idx)
+                    eff_exposure = page_exp if page_exp is not None else exposure
+                    page_exposure_active = _exposure_params(eff_exposure) is not None
                     if (ext in ("jpg", "jpeg") and not rotation
-                            and not exposure_active and not apply_angle
+                            and not page_exposure_active and not apply_angle
                             and _is_intact_a4_jpeg(cache_file, DEFAULT_DPI)):
                         # ★ 快路径：源页**已经是 A4 画布** ⇒ `_a4_canvas` 提前返回
                         #   （像素一个都不动）⇒ 复制原始字节 **==** 归一后的产物
@@ -1114,7 +1161,7 @@ def save_pages(job_id: str, ext: str, output_path: str,
                         # 完整的 A4 尺寸 JPEG）⇒ 走解码路径：能解码就正常落盘，
                         # 解不开就由下面的 except 计入 failed_pages ——
                         # **绝不谎报成功**（N2）。
-                        img = _open_page_image(cache_file, rotation, exposure,
+                        img = _open_page_image(cache_file, rotation, eff_exposure,
                                                deskew_angle=angle,
                                                deskew_threshold=deskew_threshold)
                         try:
