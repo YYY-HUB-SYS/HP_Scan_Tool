@@ -5369,6 +5369,156 @@ def adjust_splits_after_delete(splits, page_idx: int):
     return new_splits
 
 
+class SaveGroupNameDialog(QDialog):
+    """
+    「重命名分组」模态对话框（**独立窗口**，保存前弹出）。
+
+    ★ 为什么是**独立对话框**（而不是在多页预览里塞输入框）
+      用户红线：主窗口与预览对话框的 **UI 样式与布局不许改**
+      ⇒ 不新增 / 删除 / 移动 `MultiPagePreviewDialog` 的任何控件
+      ⇒ 入口做成「保存前弹出的独立模态窗口」，
+        `MultiPagePreviewDialog` 的控件树**零改动**。
+
+    ★ 为什么组名只在**多组**时生效
+      单组场景的文件名契约是 `{base}.pdf` / `{base}_{组内序号:03d}.{ext}`
+      （与「单页任务」「直接保存」完全一致）⇒ 单组时**不弹窗、不传组名**，
+      产物名与改造前**逐字节一致**。
+
+    ★ 组名留空 ⇒ 净化后为空 ⇒ 落盘时回落到组号 `{组号:03d}`
+      ⇒ 行为与改造前完全一致。
+
+    ★ 组名进的是**文件名** ⇒ 必须净化（Windows 非法字符 / 路径分隔符 /
+      控制字符 / 结尾的点与空格 / 超长）。净化口径**只有一份**：
+      `save_manager.sanitize_group_name`（纯 Python，**不 import Qt**），
+      本对话框的**实时预览**也用它 ⇒ 预览与实际落盘不会分叉。
+    """
+
+    def __init__(self, parent, group_count, page_counts, base_name, ext):
+        super().__init__(parent)
+        self.setWindowTitle("重命名分组")
+        self.setModal(True)
+        self.resize(680, 420)
+        self._group_count = max(0, int(group_count or 0))
+        self._page_counts = list(page_counts or [])
+        self._base_name = str(base_name or "")
+        self._ext = str(ext or "")
+        self._edits = []
+        self._previews = []
+        self._labels = []
+        self._setup_ui()
+        self._refresh_previews()
+
+    def _setup_ui(self):
+        """每组一行：组标签 + 名字输入框 + 最终文件名预览。"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(SPACING["md"])
+
+        hint = QLabel("给每一组起个名字（可以留空）—— 留空则沿用组号 001 / 002 …")
+        hint.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        grid = QGridLayout()
+        grid.setSpacing(SPACING["sm"])
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
+        for gi in range(1, self._group_count + 1):
+            page_count = (self._page_counts[gi - 1]
+                          if gi - 1 < len(self._page_counts) else 0)
+            name_label = QLabel(f"第 {gi} 组（共 {page_count} 页）")
+            name_label.setStyleSheet(f"color: {COLORS['text_primary']};")
+            edit = QLineEdit()
+            edit.setPlaceholderText(f"留空则用组号 {gi:03d}")
+            edit.textChanged.connect(self._on_name_changed)
+            preview = QLabel("")
+            preview.setStyleSheet(f"color: {COLORS['text_muted']};")
+            grid.addWidget(name_label, gi - 1, 0)
+            grid.addWidget(edit, gi - 1, 1)
+            grid.addWidget(preview, gi - 1, 2)
+            self._labels.append(name_label)
+            self._edits.append(edit)
+            self._previews.append(preview)
+        layout.addLayout(grid)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(SPACING["sm"])
+        btn_layout.addStretch(1)
+
+        self.btn_cancel = AnimatedButton("取消", button_type="secondary")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+
+        self.btn_save = AnimatedButton("保存", button_type="primary")
+        self.btn_save.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_save)
+
+        layout.addLayout(btn_layout)
+
+    def _on_name_changed(self, _text=""):
+        """输入变化 ⇒ 刷新所有组的文件名预览。"""
+        self._refresh_previews()
+
+    def exec(self):
+        """
+        弹窗（模态）。
+
+        ★ **无头环境保护**：`QT_QPA_PLATFORM=offscreen`（自动化 / CI / 无显示器的
+          机器）下**没有人能点这个模态框** ⇒ 不自动关就会把整个进程**挂死**
+          ⇒ 此时用 0ms 定时器**自动接受**（组名留空 ⇒ 落盘回落到组号
+          ⇒ 行为与「没有这个功能」完全一致）。
+          正式环境（windows 平台）**不触发**这条路径。
+        """
+        if QApplication.platformName() in ("offscreen", "minimal"):
+            QTimer.singleShot(0, self.accept)
+        return super().exec()
+
+    def _preview_name(self, group_index: int, raw: str) -> str:
+        """
+        某组的最终文件名（**该组第一个产物**的文件名）。
+
+        ★ 走的是 `save_manager.build_output_name` + `save_manager.sanitize_group_name`
+          ⇒ 与落盘侧**同一套口径**（预览看到什么，落盘就是什么）。
+        ★ 图片产物一组多文件 ⇒ 预览取组内序号 001 的那个。
+        """
+        sanitized = save_manager.sanitize_group_name(raw)
+        return save_manager.build_output_name(
+            self._base_name, self._ext, self._group_count, group_index, 1,
+            sanitized)
+
+    def _refresh_previews(self):
+        """按当前输入刷新每组的文件名预览。"""
+        for offset, edit in enumerate(self._edits):
+            self._previews[offset].setText(
+                self._preview_name(offset + 1, edit.text()))
+
+    def group_names(self) -> list[str]:
+        """
+        返回每组的组名（**已净化**；留空的组返回 ""）。
+
+        ★ 返回**净化后**的值：落盘侧 `save_manager` 还会再净化一次
+          （净化是幂等的 ⇒ 结果一致）⇒ 预览与落盘不会分叉。
+        ★ 长度恒等于组数 ⇒ 下标 0 对应第 1 组。
+        ★ **取消后恒为空串**（见 `reject`）⇒ 取消语义明确：
+          没有可用的组名，接线层直接放弃保存。
+        """
+        return [save_manager.sanitize_group_name(edit.text())
+                for edit in self._edits]
+
+    def reject(self):
+        """
+        取消 ⇒ **组名作废**（输入框清空、预览不更新）。
+
+        ★ 取值口径：取消 ⇒ `group_names()` 返回全空串列表
+          ⇒ 接线层（`_confirm`）看到 `exec() != Accepted` 直接放弃保存，
+            不会有"半套组名"被带进落盘。
+        """
+        for edit in self._edits:
+            edit.blockSignals(True)
+            edit.clear()
+            edit.blockSignals(False)
+        super().reject()
+
+
 class MultiPagePreviewDialog(QDialog, _UiPostMixin):
     """多页预览对话框（UI 优化版）"""
 
@@ -5894,6 +6044,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
           （纯函数入口 + PDF 体积预检回调，无 Qt 依赖）。
         ★ 裁过边的页用裁边件（原件保持只读）
         ★ 分组由 splits 决定，命名走 save_manager.build_output_name 的多组规则
+        ★ **多组**时先弹「重命名分组」独立模态对话框（`SaveGroupNameDialog`），
+          用户给的名字会经 save_manager 落到产物文件名里；单组不弹窗、不传组名。
         """
         if getattr(self, "_saving", False):
             return
@@ -5902,6 +6054,22 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
                       for page_num in self.pages]
         groups = self._build_groups()
         total_pages = len(page_specs)
+
+        # ★★ 「重命名分组」：只在**多组**时弹独立模态对话框（保存前）
+        #   · 单组场景文件名契约与改造前逐字节一致 ⇒ 不弹窗、不传组名。
+        #   · 弹窗必须放在 `self._saving = True` **之前**：用户取消时直接 return
+        #     ⇒ 不落盘、不改任何状态，按钮也不会卡在「保存中...」。
+        #   · parent 用本对话框（self）⇒ 不牵扯主窗口的生命周期。
+        group_names = None
+        if len(groups) > 1:
+            dialog = SaveGroupNameDialog(
+                self, len(groups), [len(g) for g in groups],
+                self.output_path.rsplit(".", 1)[0], self.ext)
+            if dialog.exec() != QDialog.Accepted:
+                logger.info("用户取消「重命名分组」⇒ 放弃本次保存")
+                return
+            group_names = dialog.group_names()
+
         self._saving = True
         self._save_exposure = exposure
         self._save_total_pages = total_pages
@@ -5940,6 +6108,8 @@ class MultiPagePreviewDialog(QDialog, _UiPostMixin):
             device_ip=self.device_ip,
             exposure=exposure,
             confirm=self._make_confirm_callback(),
+            # ★ 组名（多组才有；单组为 None ⇒ 落盘侧沿用组号命名）
+            group_names=group_names,
         )
 
         def _work():

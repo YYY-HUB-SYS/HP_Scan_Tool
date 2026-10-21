@@ -69,6 +69,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "build_output_name", "copy_to_extra_dirs", "save_pages", "save_session",
     "save_single",
+    "sanitize_group_name", "GROUP_NAME_MAX_LEN",
     "estimate_pdf_peak_bytes", "run_save_job",
     "SaveRequest", "SaveResult", "SaveAborted",
     "PDF_PEAK_FACTOR", "PDF_PEAK_LIMIT_BYTES",
@@ -364,6 +365,9 @@ class SaveRequest:
     exposure: dict | None = None
     # 体积预检的确认回调：收到提示文案，返回 False 表示用户放弃保存
     confirm: Callable | None = field(default=None)
+    # ★ 各组的自定义组名（**重命名分组**功能）：与 groups 等长，
+    #   下标 0 对应第 1 组；None / 长度不足 ⇒ 那些组沿用组号命名。
+    group_names: list | None = None
 
 
 def run_save_job(req: SaveRequest) -> SaveResult:
@@ -377,7 +381,8 @@ def run_save_job(req: SaveRequest) -> SaveResult:
     return save_pages(req.job_id, req.ext, req.output_path, req.page_specs,
                       req.groups, extra_dirs=req.extra_dirs,
                       device_name=req.device_name, device_ip=req.device_ip,
-                      exposure=req.exposure, confirm=req.confirm)
+                      exposure=req.exposure, confirm=req.confirm,
+                      group_names=req.group_names)
 
 
 def estimate_pdf_peak_bytes(page_specs) -> int:
@@ -402,8 +407,67 @@ def estimate_pdf_peak_bytes(page_specs) -> int:
 
 
 
+#: 组名最大长度（超出截断）—— 留出余量给 `{base}_{组名}_{组内号}.{ext}` 的其余部分
+GROUP_NAME_MAX_LEN = 60
+
+#: Windows 文件名非法字符（路径分隔符 `\/` 也在内 ⇒ 一并删掉，杜绝路径穿越）
+_ILLEGAL_GROUP_NAME_CHARS = '<>:"/\\|?*'
+
+
+def sanitize_group_name(name: str) -> str:
+    """
+    组名净化：Windows 文件名非法字符 / 路径分隔符 / 控制字符 / 首尾空白 /
+    结尾的点与空格 / 超长 ⇒ 一律去掉；净化后为空则返回 ""。
+
+    ★ **纯 Python**（本模块不 import Qt）⇒ GUI 侧复用**同一份**做实时预览，
+      避免"预览看到的名字"与"真正落盘的名字"两套口径分叉。
+    ★ 非法字符是**删除**（不是替换成下划线）—— 替换会凭空造出用户没写过的字符。
+    ★ 结尾的点与空格是 Windows 明确不允许的（`foo.` / `foo ` 会变成 `foo`）
+      ⇒ 一并去掉，顺带让 `..` 这类"只由点组成"的名字回落成空串（防路径穿越）。
+    ★ 入参可以是 None / 非字符串 ⇒ **不抛异常**，返回 ""。
+    """
+    if not isinstance(name, str):
+        return ""
+    kept = []
+    for ch in name:
+        if ch in _ILLEGAL_GROUP_NAME_CHARS:
+            continue
+        code = ord(ch)
+        # ASCII 控制字符（0x00-0x1F 与 0x7F）不可进文件名
+        if code < 0x20 or code == 0x7F:
+            continue
+        kept.append(ch)
+    text = "".join(kept).strip()
+    text = text.rstrip(". ")
+    if len(text) > GROUP_NAME_MAX_LEN:
+        text = text[:GROUP_NAME_MAX_LEN].rstrip(". ")
+    return text
+
+
+def _group_name_at(group_names, group_index: int) -> str:
+    """
+    取第 `group_index` 组（**1 基**）的组名；列表缺失 / 越界 / 元素非字符串
+    ⇒ 返回 ""（⇒ 落盘时回落到组号）。
+
+    ★ 类型闸：只接受 **list / tuple**。
+      误传字符串时（`group_names="发票"`）若不拦，`"发票"[0]` 会被当成**第 1 组**的
+      组名 ⇒ 产物名变成 `..._发.pdf` —— 静默错名，比报错更难查。
+    """
+    if not group_names or not isinstance(group_names, (list, tuple)):
+        return ""
+    try:
+        index = int(group_index) - 1
+    except (TypeError, ValueError):
+        return ""
+    if index < 0 or index >= len(group_names):
+        return ""
+    value = group_names[index]
+    return value if isinstance(value, str) else ""
+
+
 def build_output_name(base: str, ext: str, group_count: int,
-                      group_index: int, in_group_seq: int) -> str:
+                      group_index: int, in_group_seq: int,
+                      group_name: str = "") -> str:
     """
     生成输出文件名。
 
@@ -411,16 +475,24 @@ def build_output_name(base: str, ext: str, group_count: int,
         PDF  -> {base}.pdf
         其他 -> {base}_{组内序号:03d}.{ext}
     多组（group_count > 1）—— 组间不得覆盖：
-        PDF  -> {base}_{组号:03d}.pdf
-        其他 -> {base}_{组号:03d}_{组内序号:03d}.{ext}
+        PDF  -> {base}_{组标识}.pdf
+        其他 -> {base}_{组标识}_{组内序号:03d}.{ext}
+
+    ★ **组标识** = 用户给的组名（经 `sanitize_group_name` 净化）
+      ⇒ 组名为空 / 净化后为空时**回落到组号** `{group_index:03d}`
+      ⇒ 与改造前的 `{base}_{组号:03d}...` 逐字节一致。
+    ★ 组名**只在多组时生效**：单组场景完全走原逻辑（组名一律忽略）。
+    ★ `group_name` 追加在参数**末尾**且有默认值 ⇒ 既有调用方不受影响。
     """
     if ext == "pdf":
         if group_count <= 1:
             return f"{base}.pdf"
-        return f"{base}_{group_index:03d}.pdf"
+        tag = sanitize_group_name(group_name) or f"{group_index:03d}"
+        return f"{base}_{tag}.pdf"
     if group_count <= 1:
         return f"{base}_{in_group_seq:03d}.{ext}"
-    return f"{base}_{group_index:03d}_{in_group_seq:03d}.{ext}"
+    tag = sanitize_group_name(group_name) or f"{group_index:03d}"
+    return f"{base}_{tag}_{in_group_seq:03d}.{ext}"
 
 
 def _int_param(exposure, key: str) -> int:
@@ -956,7 +1028,8 @@ def save_pages(job_id: str, ext: str, output_path: str,
                extra_dirs=None,
                device_name: str = "", device_ip: str = "",
                exposure=None,
-               confirm: Callable | None = None) -> SaveResult:
+               confirm: Callable | None = None,
+               group_names: list | None = None) -> SaveResult:
     """
     多页保存（可分组）。
 
@@ -965,6 +1038,9 @@ def save_pages(job_id: str, ext: str, output_path: str,
     exposure:   曝光参数（文档级，所有页同一份），语义同 save_single。
     confirm:    体积预检的确认回调（收到提示文案，返回 False 表示放弃保存）。
                 None ⇒ 只记 warning 并继续（提示进返回值的 .warnings）。
+    group_names: ★ 各组的自定义组名（**重命名分组**）：与 groups 等长，
+                下标 0 对应第 1 组。None / 长度不足 ⇒ 那些组**沿用组号**
+                （与改造前逐字节一致）。组名会先经 sanitize_group_name 净化。
 
     自动纠偏（批次 4）：逐页纠偏角取自页元数据（page_meta.deskew_angle），
     顺序为 **曝光 → 手动旋转 → 自动纠偏 → A4 归一**；
@@ -1002,7 +1078,8 @@ def save_pages(job_id: str, ext: str, output_path: str,
             pages = [page_specs[page_idx] for page_idx in group_indices]
             group_angles = [deskew_angles[page_idx] if page_idx < len(deskew_angles)
                             else 0.0 for page_idx in group_indices]
-            pdf_path = build_output_name(base, ext, group_count, gi, 1)
+            pdf_path = build_output_name(base, ext, group_count, gi, 1,
+                                         _group_name_at(group_names, gi))
             # 体积预检：在开始合并**之前**提示（不静默截断）
             _precheck_pdf_volume(pages, confirm, warnings)
             ok, failed, failed_idx = _write_pdf(pages, pdf_path, exposure=exposure,
@@ -1022,7 +1099,8 @@ def save_pages(job_id: str, ext: str, output_path: str,
                 angle = deskew_angles[page_idx] if page_idx < len(deskew_angles) else 0.0
                 apply_angle = deskew_angle_to_apply(angle, deskew_threshold)
                 try:
-                    fpath = build_output_name(base, ext, group_count, gi, seq)
+                    fpath = build_output_name(base, ext, group_count, gi, seq,
+                                             _group_name_at(group_names, gi))
                     if (ext in ("jpg", "jpeg") and not rotation
                             and not exposure_active and not apply_angle
                             and _is_intact_a4_jpeg(cache_file, DEFAULT_DPI)):
