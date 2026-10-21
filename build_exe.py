@@ -1,7 +1,21 @@
-"""
+r"""
 PyInstaller 打包脚本 — HP Scan Tool v4.0 (PySide6)
-运行: python build_exe.py
-输出: dist/HP_Scan_Tool.exe（单文件便携版）
+
+两种发行形态（默认 onefile，加 --onedir 切目录发布）：
+
+  1) **onefile 便携版**（默认）：`dist/HP_Scan_Tool.exe` 单文件，拷到哪都能跑。
+     ⚠️ 代价（实测，2026-10-21）：onefile 每次启动都要把 138.5 MiB 解压到
+     `%TEMP%\_MEIxxxxxx` ⇒ ① 启动慢 3.3 秒 ② 崩溃/强杀会**残留** 138.5 MiB/次
+     （进程死后能删）③ 别人"清空 %TEMP%"会**打断正在运行的程序**（DLL 被抽走）。
+
+  2) **onedir 安装版**（`--onedir`）：`build/onedir/HP_Scan_Tool/` 目录，
+     交给 Inno Setup 打成安装包（见 `installer/hp_scan_tool.iss`）⇒
+     **安装后是真实文件，完全不解压 %TEMP%**，走标准安装/卸载流程。
+     ★ 这是「发给每个人」时的**正式部署形态**；onefile 版保留给免安装场景。
+
+运行:
+    python build_exe.py            # onefile 便携版
+    python build_exe.py --onedir   # onedir 目录发布（安装包的输入）
 """
 
 import os
@@ -15,6 +29,13 @@ if sys.platform == "win32":
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIST = os.path.join(HERE, "dist")
+
+# ★ onedir 模式的输出目录（**不放在 dist/**）——
+#   ① `dist/` 里已有交付用的 `HP_Scan_Tool.exe`（单文件版），
+#      onedir 会产出同名**目录** `dist\HP_Scan_Tool\` ⇒ 两者并存极易误取；
+#   ② onedir 只是安装包的**中间产物** ⇒ 放 build/ 下，与 PyInstaller 的
+#      默认 workpath 同级，语义清楚。
+ONEDIR_OUT = os.path.join(HERE, "build", "onedir")
 
 # ── EXE 元数据：写进 Windows 版本资源（文件属性 → Version 标签页）─────────
 APP_VERSION = "4.0.0.0"
@@ -90,17 +111,25 @@ print("=" * 50)
 print("  惠普集成扫描工具 v4.0 — 打包中")
 print("=" * 50)
 
+# ★ 发行形态：默认 onefile（单文件便携版）；`--onedir` 走目录发布（安装包的输入）
+ONEDIR = "--onedir" in sys.argv
+MODE_NAME = "onedir（目录发布，供 Inno Setup 打安装包）" if ONEDIR else "onefile（单文件便携版）"
+print("  发行形态: %s" % MODE_NAME)
+
 with tempfile.TemporaryDirectory(prefix="hp_scan_tool_version_") as version_dir:
     version_file = write_version_file(version_dir)
     print(f"版本资源文件: {version_file}")
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onefile",
         "--windowed",
         "--name", "HP_Scan_Tool",
         # 资源文件
-        "--add-data", f"resources{os.pathsep}resources",
+        # ★ **必须用绝对路径**：PyInstaller 6.x 里 `--add-data` 的相对路径是相对
+        #   **spec 文件所在目录**解析的，而 onedir 模式把 --specpath 指到
+        #   build/onedir ⇒ 相对路径会变成 build\onedir\resources（找不到）。
+        #   （onefile 模式没这问题：specpath 默认在项目根。）
+        "--add-data", f"{os.path.join(HERE, 'resources')}{os.pathsep}resources",
         # EXE 图标（绝对路径，基于 __file__ 解析，不依赖 CWD）
         "--icon", ICON_PATH,
         # EXE 版本资源（Windows 文件属性里的 Version）
@@ -129,18 +158,49 @@ with tempfile.TemporaryDirectory(prefix="hp_scan_tool_version_") as version_dir:
         # 清理
         "--clean",
         "--noconfirm",
-        os.path.join(HERE, "hp_scan_gui_pyside.py"),
     ]
+
+    if ONEDIR:
+        # ★ onedir：**不加 --onefile** ⇒ PyInstaller 默认产出目录
+        #   （真实文件，不是运行期解压 ⇒ 不碰 %TEMP%）
+        os.makedirs(ONEDIR_OUT, exist_ok=True)
+        cmd += [
+            "--distpath", ONEDIR_OUT,
+            "--workpath", os.path.join(ONEDIR_OUT, "_work"),
+            "--specpath", ONEDIR_OUT,
+        ]
+    else:
+        cmd.append("--onefile")
+
+    cmd.append(os.path.join(HERE, "hp_scan_gui_pyside.py"))
 
     print(f"\n命令: {' '.join(cmd)}\n")
     result = subprocess.run(cmd, cwd=HERE)
 
 if result.returncode == 0:
-    exe = os.path.join(DIST, "HP_Scan_Tool.exe")
-    size_mb = os.path.getsize(exe) / (1024 * 1024) if os.path.exists(exe) else 0
-    print(f"\n打包成功!")
-    print(f"  位置: {exe}")
-    print(f"  大小: {size_mb:.1f} MB")
+    if ONEDIR:
+        app_dir = os.path.join(ONEDIR_OUT, "HP_Scan_Tool")
+        exe = os.path.join(app_dir, "HP_Scan_Tool.exe")
+        total = 0
+        count = 0
+        for root, _dirs, files in os.walk(app_dir):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                    count += 1
+                except OSError:
+                    pass
+        print(f"\n打包成功（onedir）!")
+        print(f"  目录: {app_dir}")
+        print(f"  主程序: {exe}（{os.path.getsize(exe) / (1024 * 1024):.1f} MB）")
+        print(f"  整个目录: {count} 个文件 / {total / (1024 * 1024):.1f} MiB")
+        print(f"  ⇒ 交给 installer/hp_scan_tool.iss 打安装包")
+    else:
+        exe = os.path.join(DIST, "HP_Scan_Tool.exe")
+        size_mb = os.path.getsize(exe) / (1024 * 1024) if os.path.exists(exe) else 0
+        print(f"\n打包成功!")
+        print(f"  位置: {exe}")
+        print(f"  大小: {size_mb:.1f} MB")
 else:
     print(f"\n打包失败，返回码: {result.returncode}")
     sys.exit(1)

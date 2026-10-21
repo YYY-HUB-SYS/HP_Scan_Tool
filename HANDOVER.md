@@ -11,7 +11,7 @@ HP Scan Tool 是一款面向惠普网络打印机的 Windows 桌面扫描客户�
 **项目路径**: `<PROJECT_DIR>`
 **Git 仓库**: 已初始化（`.git` 存在），remote 指向 <GIT_REPO>
 **技术栈**: Python 3.11+ / PySide6 / Pillow / python-zeroconf / WSDiscovery / requests / pywin32
-**打包**: PyInstaller 单文件 EXE（由 `build_exe.py` 统一构建，无独立 spec 文件）
+**打包**: 两种形态 —— **安装包**（`build_installer.py` → PyInstaller **onedir** + Inno Setup，per-user 免管理员，★ 正式部署形态，**运行期不解压 `%TEMP%`**）与**单文件便携版**（`build_exe.py` → PyInstaller onefile，免安装但每次启动解压 138.5 MiB 到 `%TEMP%`）
 
 ### 1.1 当前状态（2026-09-21 v4.0）
 
@@ -94,7 +94,13 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 │       ├── baseline_D1.md        # 真机基准（改造前）+ D2 回归章节的索引
 │       └── regression_D2.md      # 真机回归对照（改造后）
 ├── tools/
-│   └── verify_scan.py      # 真机基准脚本（D1/D2）
+│   ├── verify_scan.py      # 真机基准脚本（D1/D2）
+│   └── verify_release.py   # 出包自检（onedir 完整性 + 安装包 PE/版本 + 清单报告）
+├── installer/
+│   ├── hp_scan_tool.iss    # Inno Setup 安装脚本（per-user，免管理员）
+│   └── Languages/
+│       └── ChineseSimplified.isl  # 仓库自带中文向导（换机/CI 不依赖系统安装）
+├── build_installer.py      # 打安装包：onedir → ISCC → 自检（一条命令）
 ├── PRD.md                  # 产品需求文档 v3.1
 ├── CONTEXT.md              # 领域术语表
 ├── CODEBUDDY.md            # CodeBuddy 项目指引
@@ -286,8 +292,14 @@ GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）*
 
 - 动态 import 的模块必须加入 hiddenimports
 - EXE 被占用时用 `--distpath` 指定不同目录绕过文件锁
-- 字体/图标由 `build_exe.py` 的 `--add-data resources;resources` 一并打包
+- 字体/图标由 `build_exe.py` 的 `--add-data resources;resources` 一并打包（★ onedir 模式必须用**绝对路径**，相对路径会按 spec 目录解析）
+- ★ 发行形态有两套：**安装包**（onedir + Inno Setup，`build_installer.py`）与**单文件便携版**（onefile，`build_exe.py`）——
+  详细差异与安装器踩坑见 §8.2
 - 单文件 EXE **66,003,273 字节（62.95 MiB）** —— **2026-10-21 18:3x 用最终代码重打的实测值**（SHA256 `0D6AF3C68FB003D635D8CB53B90A6E7C1E8BB822D5D231EB82FB122E166C475A`；offscreen 启动 6 秒未崩；`naming` / `escl_engine` 均在包内）。★ **已替换 `dist/HP_Scan_Tool.exe`**（2026-10-21 18:40，回读字节数与 SHA256 与新包逐字节一致）。⚠️ 此前文档里的数字**均已过期**：66,004,536 字节（17:2x 那次）、65,987,523 字节 / 62.93 MiB（11:1x 那次）、65,866,395 字节 / 62.80 MiB（01:30 的包，`19efd5c` 排除 numpy 后重打的）、「63,452,740 字节旧包（2026-07-28）」、「约 62 MB（2026-10-20 改造前基线实测 64,968,184 字节）」
+- ★ **安装包** **46,603,297 字节（44.4 MiB）** —— `build/release/HP_Scan_Tool_Setup_v4.0.0.0.exe`
+  （SHA256 `2EA8E85AFA2175FDA45375CD704922FEDAE577EFAF9A57CBBA8CAC1D995D73D8`；
+  真机验证：静默安装成功（**不需管理员**）→ 跑起来 **TEMP 无 `_MEI`** → 静默卸载 →
+  程序目录/卸载条目/快捷方式全清、**用户数据与扫描成品零丢失**）
 
 ---
 
@@ -361,17 +373,49 @@ pip install -r requirements.txt
 python hp_scan_gui_pyside.py
 ```
 
-### 8.2 PyInstaller 打包
+### 8.2 打包（两种发行形态）
 
 ```bash
-python build_exe.py
+python build_installer.py    # ★ 正式部署：onedir 目录发布 → Inno Setup → 安装包 + 出包自检
+python build_exe.py          # 便携版：onefile 单文件
 ```
 
-`build_exe.py` 是唯一的打包入口（`--onefile` 单文件模式）。仓库不再保留独立的 `.spec` 文件——它此前是 onedir 配置，与 CI 实际运行的 onefile 模式冲突，且长期未被使用。
+| 形态 | 入口 | 产物 | 说明 |
+|---|---|---|---|
+| **安装包**（★ 发给每个人） | `build_installer.py` | `build/release/HP_Scan_Tool_Setup_v4.0.0.0.exe`（44.4 MiB） | per-user 安装（**不需要管理员**）+ 标准卸载 + 快捷方式 |
+| 便携版 | `build_exe.py` | `dist/HP_Scan_Tool.exe`（62.9 MiB 单文件） | 免安装；**每次启动解压 138.5 MiB 到 `%TEMP%`**，崩溃/强杀会残留 |
 
-输出：`dist/HP_Scan_Tool.exe`（单文件便携版）
+**★ 为什么正式部署用安装包（onedir）而不是单文件**
+onefile 每次启动把 138.5 MiB 解压到 `%TEMP%\_MEIxxxxxx`（实测启动 3.3 秒）⇒
+① 别人「清空 `%TEMP%`」会**打断正在运行的程序**（DLL 被抽走）；
+② 崩溃/强杀**残留** 138.5 MiB/次（进程死后能删）；
+③ 卸载要清 `%TEMP%` 里的东西就绕不开。
+onedir 安装后是**真实文件**，**完全不解压 `%TEMP%`**（真机验证：运行期间 `_MEI` 增量为 0）。
+
+**安装器要点**（`installer/hp_scan_tool.iss`，Inno Setup 6.3+）
+- `.iss` 是 **UTF-8 无 BOM**；6.3 以下必须加 BOM（否则中文向导乱码）⇒ 脚本内有**版本闸门**
+  `#if VER < EncodeVer(6,3,0) #error`，编译期直接报错。
+- `MessagesFile` 用**相对 .iss 的路径**（`installer/Languages/ChineseSimplified.isl`，仓库自带）
+  ⇒ 换机 / CI 装的是 Inno 6 时不会因绝对路径而失败。
+- `AppId` 写法 `{{GUID}`（**两个**左花括号、**一个**右花括号）—— 多一个右花括号会写坏卸载键名。
+- 升级覆盖安装：`CloseApplications=force` + `InitializeSetup` 里 `taskkill /F /IM` 兜底强退旧实例。
+- `VersionInfoVersion` 必须写（不写 ⇒ Setup 壳的**文件版本**是 0.0.0.0，肉眼极难发现）。
+- `[Tasks]` 默认**是勾选**的，取消要写 `Flags: unchecked`（写 `Flags: checked` 会**中止编译**）。
+- 卸载清理用户数据用 **`SuppressibleMsgBox(..., IDNO)`** 而不是 `MsgBox`：
+  普通 `MsgBox` 在**静默模式**下不显示、直接返回 **IDYES** ⇒ 静默卸载会误删用户数据。
+  ★ 静默模式返回默认的 `IDNO` ⇒ **保留数据**。
+- ★ 卸载只删 `Documents\HP_Scans\**.cache**`（中间产物）——
+  `Documents\HP_Scans\` 的**根目录就是默认输出目录**（`scan_coordinator.DEFAULT_OUT_DIR`）
+  ⇒ 用户的**扫描成品**在那里，整目录删会毁掉用户扫出来的文件。
+
+**出包自检**：`python tools/verify_release.py` ⇒ 校验 onedir 完整性 + 无开发期残留 +
+安装包合法 PE + 文件名版本号 ⇒ 生成清单 `build/release/MANIFEST.txt`（每件大小与 sha256）。
+
+`build_exe.py` 仍是单文件便携版的入口（`--onefile` 单文件模式）。仓库不再保留独立的 `.spec` 文件——它此前是 onedir 配置，与 CI 实际运行的 onefile 模式冲突，且长期未被使用。
 
 注意：打包前确认 `build_exe.py` 里的 `--add-data` 资源路径与 `--hidden-import` 模块列表与当前代码一致。**当前项目内模块全部是静态 import**（`exposure` / `preset_manager` / `page_meta` / `config_io` / `pypdf` 等已由 PyInstaller 依赖分析器实测自动收录），**只有改成动态 import 的模块才需要补进 hidden-imports** —— 否则会变成打包后运行时 ImportError。
+★ onedir 模式的 `--add-data` **必须用绝对路径**：PyInstaller 6.x 里相对路径是相对
+  **spec 文件所在目录**解析的，而 onedir 模式把 `--specpath` 指到了 `build/onedir`。
 
 ### 8.3 CLI 模式
 

@@ -71,13 +71,46 @@ python cli.py discover --format json
 python cli.py history --limit 10
 ```
 
-## 📦 打包
+## 📦 打包与部署
+
+本产品有**两种发行形态**，用途不同：
+
+| 形态 | 产物 | 怎么用 | 什么时候用 |
+|---|---|---|---|
+| **安装包**（★ 正式部署） | `build/release/HP_Scan_Tool_Setup_v4.0.0.0.exe`（44.4 MiB） | 双击安装 → 开始菜单快捷方式 → 控制面板「应用和功能」里可卸载 | **发给每个人的是这个** |
+| 便携版（免安装） | `dist/HP_Scan_Tool.exe`（62.9 MiB 单文件） | 拷到哪都能双击跑 | 临时用 / 不能装东西的机器 |
+
+### 为什么正式部署用安装包
+
+单文件版（onefile）**每次启动**都要把 138.5 MiB 解压到 `%TEMP%\_MEIxxxxxx`（实测启动 3.3 秒）⇒
+① 启动慢；② 崩溃或被强杀会**残留** 138.5 MiB/次；③ 别人「清空 `%TEMP%`」会**打断正在运行的程序**（DLL 被抽走）。
+
+安装版是**目录发布**（onedir）⇒ 安装后是**真实文件**，**完全不解压 `%TEMP%`**，并走标准安装/卸载。
+
+### 打安装包
+
+```bash
+python build_installer.py          # ① onedir 目录发布 → ② Inno Setup 编译 → ③ 出包自检
+python build_installer.py --skip-build   # 只重打安装包（onedir 产物已在）
+```
+
+产物：`build/release/HP_Scan_Tool_Setup_v4.0.0.0.exe`
+自检清单：`build/release/MANIFEST.txt`（每件的大小与 sha256）
+
+### 安装包的行为
+
+- **不需要管理员权限**（per-user 安装，装到 `%LOCALAPPDATA%\Programs\HP Scan Tool`）—— 办公环境很多同事没有管理员权限。
+- 升级/覆盖安装时**静默强退**正在运行的旧实例（`CloseApplications=force` + `taskkill` 兜底）。
+- 卸载时**问一句**要不要删用户数据（配置 / 曝光预设 / 扫描历史 / 会话 / 缓存）。
+  ★ **你扫描出来的文件永远不会被删**（`Documents\HP_Scans\` 根目录是产品的默认输出目录，卸载只删其中的 `.cache\` 中间产物）。
+  ★ 静默卸载（`/VERYSILENT`）默认**保留**数据（用 `SuppressibleMsgBox` 指定默认值 `IDNO`；普通 `MsgBox` 在静默模式下会直接返回 `IDYES` ⇒ 会误删数据）。
+- 依赖：Inno Setup **6.3+**（`.iss` 是 UTF-8 无 BOM；6.3 以下必须加 BOM，否则中文向导乱码 ⇒ 脚本里有**版本闸门**，编译期直接报错）。
+
+### 只打单文件便携版
 
 ```bash
 python build_exe.py
 ```
-
-输出：`dist/HP_Scan_Tool.exe`（单文件便携版）
 
 ## 🗂️ 项目结构
 
