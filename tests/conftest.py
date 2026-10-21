@@ -82,6 +82,45 @@ _REAL_USER_DIR = os.path.join(
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _no_startfile_in_tests():
+    """
+    ★ 测试期间**禁止** `os.startfile` 真正执行（2026-10-21 修）。
+
+    背景（实测）：产品代码在「保存后」会 `os.startfile(dirname(saved_files[0]))`
+    打开所在文件夹（`hp_scan_gui_pyside.py:4921` / `:5620`，**这是产品行为，不改**）。
+    而 `tests/test_gui_v4_fixes.py` 的
+    `test_single_page_crop_keeps_rotation` /
+    `test_single_page_crop_page_meta_matches_actual` /
+    `test_crop_without_rotation_keeps_legacy_geometry`
+    这三个用例走了保存流程却**没有 mock `startfile`**
+    ⇒ **每跑一次全量测试就在用户屏幕上弹一批资源管理器文件夹窗口**
+    （实测：一次全量跑开几十个窗口；本轮反复跑全量 ⇒ 累计几百个）。
+
+    ★ 为什么放在 conftest 而不是逐个测试加 mock：
+      ① 漏一个就是一次弹窗（已经漏过三个）；
+      ② 以后新增测试还会再犯 ⇒ 这里做成**会话级**兜底，一劳永逸。
+    ★ 不影响断言：需要验证"保存后打开了文件夹"的用例仍能拿到调用记录
+      （`_STARTFILE_CALLS`），只是不会真的弹窗。
+    """
+    import os as _os
+    real_startfile = _os.startfile
+
+    def _fake_startfile(path, *args, **kwargs):
+        _STARTFILE_CALLS.append(path)
+        return None
+
+    _os.startfile = _fake_startfile
+    try:
+        yield
+    finally:
+        _os.startfile = real_startfile
+
+
+#: 测试期间被拦下的 `os.startfile` 调用记录（供断言"保存后应打开文件夹"用）
+_STARTFILE_CALLS = []
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _cleanup_session_appdata():
     """会话结束后清掉沙箱 APPDATA 目录 + 本次会话新建的临时目录"""
     yield
