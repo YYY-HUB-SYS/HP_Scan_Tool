@@ -158,21 +158,6 @@ def _non_negative_int(value: str) -> int:
 # ★ 预设名是**唯一真源 = preset_manager**（内置 4 个 + %APPDATA% 下的用户
 #   自定义预设）⇒ CLI 不自己维护一份名字表 ⇒ 不会与 GUI 漂移。
 
-#: 曝光参数字典的字段（exposure.apply_exposure / save_manager 认的键）
-_EXPOSURE_PARAM_KEYS = ("mode", "brightness", "contrast", "gamma",
-                        "shadows", "highlights", "channel_gains")
-
-#: 曝光参数的默认值（预设条目缺字段时用）
-_EXPOSURE_PARAM_DEFAULTS = {
-    "mode": "off",
-    "brightness": 0,
-    "contrast": 0,
-    "gamma": 1.0,
-    "shadows": 0,
-    "highlights": 0,
-    "channel_gains": (1.0, 1.0, 1.0),
-}
-
 
 def _builtin_exposure_names() -> list:
     """内置曝光预设名（唯一真源 = preset_manager.builtin_presets）。"""
@@ -184,18 +169,23 @@ def _builtin_exposure_names() -> list:
     return names
 
 
-def _exposure_params_from_preset(preset: dict) -> dict:
+def _exposure_params_from_preset(preset: dict):
     """
-    把预设条目转成曝光参数字典（交给 apply_exposure / save_manager）。
+    把预设条目规范化成曝光参数字典。
 
-    ★ 只挑**已知字段**：预设 JSON 由用户编辑，可能带 "name" / "builtin" 之类
-      的额外键 ⇒ 直接 `apply_exposure(**preset)` 会因未知关键字炸掉。
+    ★ 复用 `save_manager._exposure_params`（**PDF 路径用的同一份**净化逻辑）⇒
+      ① 非法值回落默认（brightness="abc" ⇒ 0、gamma=99 ⇒ 1.0、
+         通道增益长度≠3 ⇒ (1.0,1.0,1.0)）——像素按什么算，历史就记什么；
+      ② 存进历史的是**净化后**的值，与 PDF 路径的历史载荷**同口径**
+         （否则历史写着 gamma=99，图片却按 1.0 处理过 ⇒ 记录与事实不符）；
+      ③ 图片路径与 PDF 路径的曝光行为完全一致。
+    ★ 返回 None = "曝光不生效"（mode 既不是 auto 也不是 manual）
+      —— 与 save_manager 的判定一致 ⇒ mode="off" 的预设不改变任何产物。
+    ★ 这里调 save_manager 的**私有**函数：它是"净化口径"的唯一真源，而
+      save_manager 不在本文件的所有权范围内 ⇒ 复用它比在 CLI 里抄一份规则更防漂移
+      （它若被改名/删除，cli.py 会立刻报错，不会静默漂移）。
     """
-    params = dict(_EXPOSURE_PARAM_DEFAULTS)
-    for key in _EXPOSURE_PARAM_KEYS:
-        if key in preset:
-            params[key] = preset[key]
-    return params
+    return save_manager._exposure_params(preset)
 
 
 def _resolve_exposure_preset(name: str):
@@ -326,26 +316,40 @@ def cmd_scan(args):
     output = args.output or os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
 
     # ── 曝光预设解析（**先于任何网络动作**）────────────────────────
-    # 预设不存在 ⇒ **立刻**报错退出：不扫描、不落盘、不吐 traceback。
+    # 预设不存在 / 名字为空 ⇒ **立刻**报错退出：不扫描、不落盘、不吐 traceback。
     # （早失败 = 用户不用干等一次真实扫描才发现预设名打错了。）
-    # 用 getattr 而不是 args.exposure：手工构造的 Namespace（老调用方 /
-    # 外部脚本）没有这个键时不该炸 —— 缺省即"不做曝光"。
+    # ★ 用 `is not None` 而不是真值判断：argparse 的默认是 None，
+    #   所以"没传"与"传了空串"必须能区分 —— 空串**不许**被静默忽略成"没传"。
+    # ★ 用 getattr 而不是 args.exposure：手工构造的 Namespace（老调用方 /
+    #   外部脚本）没有这个键时不该炸 —— 缺省即"不做曝光"。
     exposure_params = None
     exposure_name = getattr(args, "exposure", None)
-    if exposure_name:
+    if exposure_name is not None:
         try:
             preset, available = _resolve_exposure_preset(exposure_name)
         except Exception as e:
             print(f"错误: 读取曝光预设失败 — {e}", file=sys.stderr)
             return 1
         if preset is None:
-            print(f"错误: 曝光预设不存在: {exposure_name}", file=sys.stderr)
+            # ★ 报错句自带**连续**中文短语「曝光预设不存在」/「曝光预设名不能为空」
+            #   —— 测试按连续子串断言，拆成"曝光预设"+"不存在"会被
+            #   下一行的「可用曝光预设: …」与回显的用户输入满足 ⇒ 护栏形同虚设。
+            if not exposure_name.strip():
+                print("错误: 曝光预设名不能为空（请给出预设名）", file=sys.stderr)
+            else:
+                print(f"错误: 曝光预设不存在: {exposure_name}", file=sys.stderr)
             if available:
                 print("可用曝光预设: " + "、".join(available), file=sys.stderr)
             else:
                 print("可用曝光预设: （无）", file=sys.stderr)
             return 2
-        exposure_params = _exposure_params_from_preset(preset)
+        try:
+            # ★ 净化后的参数字典（与 PDF 路径同口径）：存进历史的就是
+            #   像素实际生效的那份值，不是预设里的原始值。
+            exposure_params = _exposure_params_from_preset(preset)
+        except Exception as e:
+            print(f"错误: 曝光预设参数非法 — {e}", file=sys.stderr)
+            return 1
 
     # 探测 eSCL —— **单轮**探测，候选 = 默认(http:80 / https:443) + http:443。
     #
@@ -376,7 +380,8 @@ def cmd_scan(args):
     # 执行扫描
     # 进度提示走 stderr：stdout 留给结果（失败时 stdout 必须为空，
     # 否则消费方（如 `hp_scan scan ... > out`）会拿到半截输出）。
-    exposure_hint = f", 曝光={exposure_name}" if exposure_name else ""
+    # ★ 只在**真的生效**时提曝光（mode="off" 的预设不改变任何产物）。
+    exposure_hint = f", 曝光={exposure_name}" if exposure_params is not None else ""
     print(f"正在扫描 (DPI={resolution}, 格式={fmt}, 来源={source}"
           f"{exposure_hint})...", file=sys.stderr)
     try:
@@ -640,7 +645,9 @@ def _build_parser() -> argparse.ArgumentParser:
              + "、".join(_builtin_exposure_names())
              + "；用户自定义预设见 %%APPDATA%%\\HP_Scan_Tool\\presets.json。"
                "不指定则不做曝光处理（默认，产物与不加曝光时一致）。"
-               "预设名不存在会直接报错退出并列出可用预设")
+               "预设名不存在会直接报错退出并列出可用预设。"
+               "注意：CLI 的图片产物只做曝光，不做 A4 归一与纠偏；"
+               "PDF 产物走 save_manager 的 A4 归一（与 GUI 一致）")
 
     # discover 子命令
     p_discover = subparsers.add_parser("discover", help="发现局域网扫描仪")
