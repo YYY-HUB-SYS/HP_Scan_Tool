@@ -751,37 +751,36 @@ def test_real_modal_dialog_does_not_crash():
     上一轮的 0xc0000374 就是模态弹窗路径上的 use-after-free ⇒
     堆损坏是概率性的，单次绿不算数，所以这里单独跑一遍真实 exec()。
     """
+    # ★ 父进程先建一个**父目录**，子进程在它里面建 sandbox / home。
+    #   原因：子进程自己的 `finally` 里 rmtree 常常删不干净
+    #   （home 下有 Qt 占用中的文件 ⇒ ignore_errors=True 静默跳过 ⇒ 每次漏一个）。
+    #   改由**父进程**在子进程完全退出后删整个父目录 ⇒ 占用已释放，必删得掉。
+    probe_root = tempfile.mkdtemp(prefix="hp_b46_probe_")
     script = textwrap.dedent(
         """
-        import os, sys, tempfile
-        import shutil
+        import os, sys
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
-        # ★ 先隔离用户数据（在 import 业务模块之前）
-        sandbox = tempfile.mkdtemp(prefix="hp_b46_probe_")
-        home = tempfile.mkdtemp(prefix="hp_b46_home_")
-        try:
-            os.environ["APPDATA"] = sandbox
-            os.makedirs(os.path.join(home, "Desktop"), exist_ok=True)
-            os.environ["USERPROFILE"] = home
-            sys.path.insert(0, %r)
-            from PySide6.QtWidgets import QApplication
-            from PySide6.QtCore import QTimer
-            import hp_scan_gui_pyside as gui
-            app = QApplication([])
-            dlg = gui.SkewWarningDialog("job", 1, 4.0, "")
-            assert dlg.parent() is None
-            def _close():
-                dlg._on_continue()
-            QTimer.singleShot(50, _close)
-            dlg.exec()
-            print("CHOICE", dlg.choice)
-        finally:
-            # ★ 子进程里建的 mkdtemp 父进程管不到（conftest 的统一接管只覆盖
-            #   父进程内的调用）⇒ 这里自己删，否则每次都漏两个。
-            for _d in (sandbox, home):
-                shutil.rmtree(_d, ignore_errors=True)
+        # ★ 先隔离用户数据（在 import 业务模块之前）；两个沙箱都建在父目录里
+        sandbox = os.path.join(%r, "sandbox")
+        home = os.path.join(%r, "home")
+        os.makedirs(sandbox, exist_ok=True)
+        os.makedirs(os.path.join(home, "Desktop"), exist_ok=True)
+        os.environ["APPDATA"] = sandbox
+        os.environ["USERPROFILE"] = home
+        sys.path.insert(0, %r)
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QTimer
+        import hp_scan_gui_pyside as gui
+        app = QApplication([])
+        dlg = gui.SkewWarningDialog("job", 1, 4.0, "")
+        assert dlg.parent() is None
+        def _close():
+            dlg._on_continue()
+        QTimer.singleShot(50, _close)
+        dlg.exec()
+        print("CHOICE", dlg.choice)
         """
-    ) % PROJECT_ROOT
+    ) % (probe_root, probe_root, PROJECT_ROOT)
     path = os.path.join(tempfile.gettempdir(), "hp_b46_modal_probe.py")
     with open(path, "w", encoding="utf-8") as f:
         f.write(script)
@@ -793,6 +792,9 @@ def test_real_modal_dialog_does_not_crash():
             os.remove(path)
         except OSError:
             pass
+        # ★ 子进程退出后回收整个父目录（含 sandbox / home）
+        import shutil as _shutil
+        _shutil.rmtree(probe_root, ignore_errors=True)
     assert proc.returncode == 0, (
         "真实模态弹窗进程异常退出: rc=%s\n%s\n%s"
         % (proc.returncode, proc.stdout, proc.stderr))
