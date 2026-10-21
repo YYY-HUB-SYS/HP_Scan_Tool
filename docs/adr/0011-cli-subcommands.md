@@ -5,7 +5,7 @@
 
 ## 决策
 命令行接口采用 argparse 子命令模式：
-- `hp_scan scan --ip IP [--resolution N] [--format FMT] [--source SRC] [--exposure MODE]`
+- `hp_scan scan --ip IP [--resolution N] [--format FMT] [--source SRC] [--exposure PRESET]`　★ `--exposure` 取的是**预设名**（2026-10-21 实现，提交 `fb41553`），不是 MODE
 - `hp_scan discover [--timeout N]`
 - `hp_scan status --ip IP`
 - `hp_scan history [--limit N]`

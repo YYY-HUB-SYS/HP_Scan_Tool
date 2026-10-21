@@ -128,7 +128,7 @@
 
 - 新建 cli.py: argparse + 子命令
 - `hp_scan scan --ip IP [--resolution N] [--format FMT] [--source SRC] [--output DIR]`
-  > ⚠️ **2026-10-21 订正**：原写的 `[--exposure MODE]` **未实现** —— `cli.py` 的 scan 子命令实参集合是 `--ip` / `--resolution` / `--format` / `--color` / `--source` / `--duplex` / `--output`，**没有 `--exposure`**。曝光参数目前只在 GUI 的 `ExposurePanel` 里持有，落盘时经 `save_manager.save_single(..., exposure=...)` 传下去；CLI 路径完全没有曝光入口。要补的话工作量小（解析 exposure dict 并透传给 `save_manager`）。
+  > ✅ **2026-10-21 已实现**（提交 `fb41553` + `c5223ef`）：`cli.py scan --exposure <预设名>` 支持**内置 4 个**与**用户自定义**预设（`%APPDATA%\HP_Scan_Tool\presets.json`）。⚠️ 取的是**预设名**（不是 MODE）：预设不存在 ⇒ 中文「曝光预设不存在」+ 退出码 **2** + **不扫描不落盘**；空串 / 纯空白 ⇒ 「曝光预设名不能为空」+ 退出码 2。口径：PDF ⇒ 走 `save_manager`（含 A4 归一 + 纠偏）；jpg/png/tiff ⇒ **字节层**调 `exposure.apply_exposure` 后原格式重编码（只改像素，**不改几何、不做 A4 归一、不做纠偏**）。不带该参数 ⇒ 与实现前**逐字节一致**。
 - `hp_scan discover [--timeout N] [--format json|text]`
 - `hp_scan status --ip IP [--format json|text]`
 - `hp_scan history [--limit N] [--format json|text]`
