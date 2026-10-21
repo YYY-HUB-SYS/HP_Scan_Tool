@@ -141,7 +141,7 @@ AIGC:
 | 实现函数 | `escl_engine.py::probe_escl(ip, port, timeout)` |
 | 探测路径 | ① `/eSCL/ScannerStatus` → ② `/ScannerStatus`（根路径兜底） |
 | 返回 | eSCL 基础 URL（如 `http://x.x.x.x/eSCL/`）或 None |
-| 超时 | 2 秒（`escl_engine.probe_escl` 默认 `timeout=2.0`；发现流程 `scan_coordinator.py:440` 传 3 秒） |
+| 超时 | 2 秒（`escl_engine.probe_escl` 默认 `timeout=2.0`；发现流程 `scan_coordinator.py:509` 传 3 秒） |
 
 #### 2.2.3 手动添加
 
@@ -182,8 +182,8 @@ AIGC:
 | 顶层 `Platen` 子元素存在 | `has_platen = True` | True |
 | 顶层 `Adf` 子元素存在 | `has_adf = True` | False |
 | `Adf/Duplex` = "true" | `has_duplex = True` | False |
-| `MaxWidth` | `max_width` | 2480（dataclass 默认，`escl_engine.py:67`）；解析时该标签缺省取 2550 |
-| `MaxHeight` | `max_height` | 3508（dataclass 默认，`escl_engine.py:68`）；解析时该标签缺省取 4200 |
+| `MaxWidth` | `max_width` | 2480（dataclass 默认，`escl_engine.py:132`）；解析时该标签缺省取 2550 |
+| `MaxHeight` | `max_height` | 3508（dataclass 默认，`escl_engine.py:133`）；解析时该标签缺省取 4200 |
 | `DiscreteResolutions` 或 `SupportedResolutions` 下 `Width` | `resolutions` | [75,150,200,300,600] |
 | `ColorModes` 或 `SupportedColorModes` 子元素 | `color_modes` | ["RGB24","Grayscale8"] |
 | `DocumentFormats` 或 `SupportedDocumentFormats` 子元素 | `formats` | ["image/jpeg","application/pdf"] |
@@ -206,7 +206,7 @@ AIGC:
 |------|---|
 | 优先级 | P0 |
 | 实现函数 | `escl_engine.py::execute_scan()`（返回 `(图片字节, 扩展名)`；**不落盘**） |
-| 超时 | 30 秒（`escl_engine.execute_scan` 默认 `timeout=30.0`）；协调器 `scan_coordinator.py:713` 传 90 秒。⚠️ 多页路径 `execute_multipage_scan` 默认 90 秒，协调器传 300 秒 |
+| 超时 | 30 秒（`escl_engine.execute_scan` 默认 `timeout=30.0`）；协调器 `scan_coordinator.py:838` 传 90 秒。⚠️ 多页路径 `execute_multipage_scan` 默认 90 秒，协调器传 300 秒 |
 | 轮询间隔 | 0.5 秒 |
 
 > **2026-10-21 订正**：本节原写「`execute_scan()` → `scan_to_file()`」。`scan_to_file()` 已于 `50aeb59` 删除（死代码、零调用），`execute_scan()` 之后**不再有引擎层的落盘函数**——落盘已下沉到 `save_manager`（见 §2.4.3）。
@@ -253,7 +253,7 @@ M232 系列 ApolloLedmServer 固件创建 ScanJob 后立刻删除 job 记录，�
 
 #### 2.4.3 PDF 合成
 
-**打印机永远只出图片，PDF 由本地合成**（`escl_engine.py:562` 的口径）：选 PDF 时请求层仍要 `image/jpeg`（`REQUEST_FORMAT["pdf"] = ("image/jpeg", "pdf")`），落盘层再用 Pillow 把图片合成为 PDF：
+**打印机永远只出图片，PDF 由本地合成**（`escl_engine.py:716` 的口径）：选 PDF 时请求层仍要 `image/jpeg`（`REQUEST_FORMAT["pdf"] = ("image/jpeg", "pdf")`），落盘层再用 Pillow 把图片合成为 PDF：
 
 ```
 execute_scan 返回 (jpeg_bytes, "jpg")        # 请求的是 jpg，落盘扩展名标为 pdf
@@ -265,7 +265,7 @@ save_manager._write_pdf()  ← 逐页 Image.open + 合成 A4 画布 + 保存 PDF
 返回 pdf_path
 ```
 
-> **2026-10-21 订正**：本节原写「引擎用 Pillow 把 JPEG 转为 PDF」，流程图里的 `scan_to_file 检测 output_format="pdf" && ext!="pdf"` 随 `scan_to_file()` 一起于 `50aeb59` 删除。现在**引擎层零 PDF 转换**，转换点唯一且在 `save_manager._write_pdf()`（`save_manager.py:662`）。
+> **2026-10-21 订正**：本节原写「引擎用 Pillow 把 JPEG 转为 PDF」，流程图里的 `scan_to_file 检测 output_format="pdf" && ext!="pdf"` 随 `scan_to_file()` 一起于 `50aeb59` 删除。现在**引擎层零 PDF 转换**，转换点唯一且在 `save_manager._write_pdf()`（`save_manager.py:738`）。
 
 #### 2.4.4 ADF 自动检测
 
@@ -356,7 +356,7 @@ _start_scan（GUI）→ ScanCoordinator 调度
 #### 2.5.1 配置文件路径策略
 
 ```
-# scan_coordinator.py:202-220 / config_io.py:config_dir()
+# scan_coordinator.py:252-220 / config_io.py:config_dir()
 def _app_dir():
     appdata = os.environ.get("APPDATA", "")
     if not appdata:
@@ -370,7 +370,7 @@ CONFIG_FILE = os.path.join(_app_dir(), "scan_config.json")
 
 **为什么用 `%APPDATA%` 而不是 EXE 所在目录**：v3.1 曾把配置写在 EXE 同级目录（`sys.executable` 所在），v4.0 已统一改到 Windows 标准应用数据目录 `%APPDATA%\HP_Scan_Tool\`（与 `presets.json` / `history.json` / `profile` 同目录，避免 U 盘只读时写不进去）。
 
-> **2026-10-21 订正**：本节原写 `_app_dir()` 优先取 `os.path.dirname(sys.executable)`、并解释"为什么不用 `__file__`"。当前实现是 `scan_coordinator.py:202` 的 `%APPDATA%` 版本，**EXE 同级目录不再写配置**。
+> **2026-10-21 订正**：本节原写 `_app_dir()` 优先取 `os.path.dirname(sys.executable)`、并解释"为什么不用 `__file__`"。当前实现是 `scan_coordinator.py:252` 的 `%APPDATA%` 版本，**EXE 同级目录不再写配置**。
 
 #### 2.5.2 配置写入时机
 
@@ -574,7 +574,7 @@ def _strip_ns(el) -> str:
     return el.tag.split("}")[-1] if "}" in el.tag else el.tag
 ```
 
-> **2026-10-21 订正**：原写 `tag(el)`，全仓 `*.py` 搜 `def tag` **零命中**；实际函数名是 `escl_engine._strip_ns(el)`（`escl_engine.py:34`）。
+> **2026-10-21 订正**：原写 `tag(el)`，全仓 `*.py` 搜 `def tag` **零命中**；实际函数名是 `escl_engine._strip_ns(el)`（`escl_engine.py:35`）。
 
 | 机型 | Server | 命名空间 |
 |------|--------|---------|
@@ -611,7 +611,7 @@ def _strip_ns(el) -> str:
 </scan:ScanSettings>
 ```
 
-> **2026-10-21 订正**：原模板与实际请求体不符（`escl_engine._build_scan_job_xml`，`escl_engine.py:505-538`）。逐项差异：
+> **2026-10-21 订正**：原模板与实际请求体不符（`escl_engine._build_scan_job_xml`，`escl_engine.py:659`）。逐项差异：
 > - 根元素是 `<scan:ScanSettings>`，**不是** `<scan:ScanJob>`；
 > - 命名空间走常量 `NS_SCAN` = `http://schemas.hp.com/imaging/escl/2011/05/03`（**不是** `.../scanner/escl/2011/09`）与 `NS_PWG`；
 > - 多了 `<pwg:Version>2.0</pwg:Version>`；
@@ -676,7 +676,7 @@ class ScannerInfo:
         return self.model or self.name
 ```
 
-> **2026-10-21 订正**：原清单里 `max_width: int = 2550` / `max_height: int = 4200`，与 `escl_engine.py:67-68` 的 dataclass 默认**不符** —— 代码默认是 **2480 / 3508（A4 @300dpi）**，文档写的 2550/4200 是 Letter/Legal。另补上原先漏掉的字段 **`capabilities_known: bool = False`**（`escl_engine.py:80`）：它是「设备到底有没有 ADF」的**唯一权威信号** —— `fetch_capabilities` 真正拿到能力文档才置位（`escl_engine.py:355`），回退探测路径不会置位（`escl_engine.py:347`）。
+> **2026-10-21 订正**：原清单里 `max_width: int = 2550` / `max_height: int = 4200`，与 `escl_engine.py:132-133` 的 dataclass 默认**不符** —— 代码默认是 **2480 / 3508（A4 @300dpi）**，文档写的 2550/4200 是 Letter/Legal。另补上原先漏掉的字段 **`capabilities_known: bool = False`**（`escl_engine.py:145`）：它是「设备到底有没有 ADF」的**唯一权威信号** —— `fetch_capabilities` 真正拿到能力文档才置位（`escl_engine.py:434`），回退探测路径不会置位（`escl_engine.py:317`）。
 
 ### 5.2 ScanJob（⚠️ 当前代码里没有这个类）
 
@@ -693,7 +693,7 @@ class ScanJob:
 ### 5.3 格式映射表
 
 ```python
-# escl_engine.py:542-561
+# escl_engine.py:696-700
 FORMAT_MIME = {
     "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "png": "image/png",
@@ -732,7 +732,7 @@ REQUEST_FORMAT = {
 - **统一位置**：`%APPDATA%\HP_Scan_Tool\scan_config.json`（开发模式与 EXE 模式**相同**）
 - 同目录还有：`presets.json`（`preset_manager._presets_path()`）、`history.json`（`history_manager`）、各设备档案（`profile_manager`）
 
-> **2026-10-21 订正**：本节原写「开发模式 = 脚本同级目录 / EXE 模式 = EXE 所在目录」。v4.0 已统一改到 Windows 标准应用数据目录 `%APPDATA%\HP_Scan_Tool\`（`scan_coordinator.py:202 _app_dir()` / `config_io.py:config_dir()`），**EXE 同级目录不再写配置**。
+> **2026-10-21 订正**：本节原写「开发模式 = 脚本同级目录 / EXE 模式 = EXE 所在目录」。v4.0 已统一改到 Windows 标准应用数据目录 `%APPDATA%\HP_Scan_Tool\`（`scan_coordinator.py:252 _app_dir()` / `config_io.py:config_dir()`），**EXE 同级目录不再写配置**。
 
 ### 6.2 JSON Schema
 
@@ -786,7 +786,7 @@ REQUEST_FORMAT = {
 
 > **2026-10-21 订正**：原文的 schema 缺 `source` / `duplex` / `direct_save` / `extra_dirs` / `disabled_ips` / `selected_scanner_ip` / `window_*` 共 9 个**代码里真实存在**的键，且多了一个**代码里不存在**的 `theme` 键。以上键集合按 HEAD 时点（`hp_scan_gui_pyside.py` 的 `cfg[...]` 写点与 `cfg.get(...)` 读点）逐条核对。
 >
-> **2026-10-21 二次订正**：原文末行「⚠️ 在途的纠偏接入批次（尚未提交）还会新增 4 个纠偏相关键……落地后本表需再订正」——**该批次已提交并落地**（`c6037a4`「feat(skew): 自动纠偏接线」，已在 HEAD 之内）。4 个键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`）**已正式列入上表**，默认值取自 `save_manager.DESKEW_CONFIG_DEFAULTS`（唯一真源，`save_manager.py:82-87`）；`scan_coordinator.apply_deskew_defaults()`（`scan_coordinator.py:223`）在启动时把它们补进 `scan_config.json`。
+> **2026-10-21 二次订正**：原文末行「⚠️ 在途的纠偏接入批次（尚未提交）还会新增 4 个纠偏相关键……落地后本表需再订正」——**该批次已提交并落地**（`c6037a4`「feat(skew): 自动纠偏接线」，已在 HEAD 之内）。4 个键（`deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive`）**已正式列入上表**，默认值取自 `save_manager.DESKEW_CONFIG_DEFAULTS`（唯一真源，`save_manager.py:101-87`）；`scan_coordinator.apply_deskew_defaults()`（`scan_coordinator.py:37`）在启动时把它们补进 `scan_config.json`。
 >
 > ⚠️ **仍存在的缺口**：这 4 个键目前**只有默认值，GUI 里没有开关可改** —— 用户只能改 `scan_config.json` 里的数值，界面不可调。
 
@@ -896,14 +896,16 @@ REQUEST_FORMAT = {
 请确认打印机已开机并完成初始化、面板上没有其它任务在执行；
 若设备刚从休眠唤醒，请稍后重试。
 ```
-（`escl_engine.SCAN_TIMEOUT_MESSAGE`，`escl_engine.py:587-591`；首页超时另有 `FIRST_PAGE_TIMEOUT_MESSAGE`，`:592-596`）
+（`escl_engine.SCAN_TIMEOUT_MESSAGE`，`escl_engine.py:833-837`；首页超时另有 `FIRST_PAGE_TIMEOUT_MESSAGE`，`:838-842`）
 
 ```
-打印机当前不可用（HTTP 503）。
-若选择的是输稿器(ADF)扫描，请确认输稿器里已放入纸张后重试；
-否则请等待设备空闲后重试。
+打印机当前不可用（HTTP 503，来源：平板）：设备尚未就绪，可能仍在收尾上一个扫描任务。请稍候重试（已自动重试 {retries} 次仍未成功）；若持续失败，请确认打印机面板上没有其它任务在执行。
 ```
-（`escl_engine.py:697-701`）
+
+```
+打印机当前不可用（HTTP 503，来源：输稿器）：输稿器里没有纸，设备正在等纸（不是设备故障）。请往输稿器里放入纸张，放纸后请重试。
+```
+（`escl_engine._SERVICE_UNAVAILABLE_MESSAGE_PLEN` / `_SERVICE_UNAVAILABLE_MESSAGE_FEEDER`，`escl_engine.py:772-782`；**2026-10-21 二次订正**：原文只写了单套旧文案「打印机当前不可用（HTTP 503）。若选择的是输稿器(ADF)扫描…」，实际已按请求 XML 里的 `InputSource` **分流成平板/输稿器两套**——平板场景指向输稿器放纸是**指错方向**）
 
 **代码里实际存在的另外几条错误文案**（`escl_engine.py`）：
 

@@ -211,9 +211,9 @@ preset_manager.py (在用)
 | 任务栏图标不闪烁 | ⚠️ v3.1 遗留 | v4.0 **没有** `SetCurrentProcessExplicitAppUserModelID` 调用（全仓零命中），未做显式任务栏分组设置 |
 | 窗口防逐帧渲染 | ✅ | withdraw → build → update_idletasks → deiconify |
 | 嵌入式字体 | ✅ | AddFontResourceExW 私有加载，ClearType 优化 |
-| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:375`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
+| 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:405`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
 | 页面删除 | ✅ | 多页预览中删除不需要的页面 |
-| 并发扫描 | ⚠️ 后端支持 / GUI 未开放 | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:305-306`）；但 GUI 扫描期间 `scan_btn.setEnabled(False)`（`hp_scan_gui_pyside.py:1851`）、只跟踪单个 `_current_job_id` ⇒ **GUI 上一次只能扫一台**，与 `PRD.md` §13「单线程扫描，不支持并发」一致 |
+| 并发扫描 | ⚠️ 后端支持 / GUI 未开放 | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:382`）；但 GUI 扫描期间 `scan_btn.setEnabled(False)`（`hp_scan_gui_pyside.py:1851`）、只跟踪单个 `_current_job_id` ⇒ **GUI 上一次只能扫一台**，与 `PRD.md` §13「单线程扫描，不支持并发」一致 |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
 
 ### 4.3 架构分离（2026-07-19 完成，**2026-10-20 已回退**）
@@ -279,7 +279,7 @@ GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）*
 
 - `NextDocument` 轮询比 Job URI 更稳定（M232 等机型 Job URI 返回 404）
 - 双协议发现：mDNS 为主，WSD 兜底，按 IP 去重
-- HTTPS 301 重定向**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:330-343` 的 `_http_get_loose_tls`）
+- HTTPS 301 重定向**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:332` 的 `_http_get_loose_tls`）
 
 ### 5.4 PyInstaller 打包
 
@@ -319,7 +319,7 @@ GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）*
 **核心功能**:
 - 曝光矫正（去灰底/亮度/对比度/Gamma/阴影高光/通道增益）—— ✅ 已交付（`ExposurePanel` + 落盘链路）
 - 预设系统（4 个内置预设 + 用户自定义）—— ✅ 已交付（`%APPDATA%\HP_Scan_Tool\presets.json`）
-- 文档扶正/去歪斜 —— ✅ **已交付**（`skew_detect.py`，纯 PIL 零依赖）：**检测与落盘施加纠偏均已接入扫描流水线**（`c6037a4`）—— 每页写入缓存后调 `estimate_skew` 测角度、写进 `page_meta.deskew_angle`（绝不旋转缓存原件），落盘时 `save_manager.save_pages` 按阈值施加纠偏。`skew_detect` 是**静态 import**（`scan_coordinator.py:29` / `save_manager.py:42`）⇒ PyInstaller 依赖分析实测 FOUND ⇒ **随 EXE 交付**。⚠️ **GUI 里没有纠偏开关** —— `deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive` 这 4 个键只有默认值（`save_manager.DESKEW_CONFIG_DEFAULTS`），界面不可调
+- 文档扶正/去歪斜 —— ✅ **已交付**（`skew_detect.py`，纯 PIL 零依赖）：**检测与落盘施加纠偏均已接入扫描流水线**（`c6037a4`）—— 每页写入缓存后调 `estimate_skew` 测角度、写进 `page_meta.deskew_angle`（绝不旋转缓存原件），落盘时 `save_manager.save_pages` 按阈值施加纠偏。`skew_detect` 是**静态 import**（`scan_coordinator.py:30` / `save_manager.py:57`）⇒ PyInstaller 依赖分析实测 FOUND ⇒ **随 EXE 交付**。⚠️ **GUI 里没有纠偏开关** —— `deskew_enabled` / `deskew_apply_threshold` / `skew_warn_threshold` / `skew_warn_consecutive` 这 4 个键只有默认值（`save_manager.DESKEW_CONFIG_DEFAULTS`），界面不可调
 - 后续可能加：裁边、去污、OCR
 
 **技术要点**:
@@ -343,7 +343,7 @@ GUI 参数区新增「扫描模式」单选：**单面** / **双面（手动）*
 
 | 限制 | 说明 |
 |------|------|
-| M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:330-343`） |
+| M232 能力查询 HTTPS 301 | 部分机型 HTTPS 端口返回 301 重定向，**已跟随**（http 目标直接跟、https 目标走宽松 TLS 重试：`escl_engine.py:332`） |
 | 无扫描预览（原图查看） | 简化后的 PreviewDialog 只加载缩略图，不做全分辨率预览 |
 | 单文件 EXE 体积 | **65,987,523 字节（62.93 MiB）**，2026-10-21 11:1x 用最终代码重打实测（临时 `--distpath`，未覆盖运行中的 exe），包含所有依赖。⚠️ `dist/` 现存仍是 01:30 旧包（65,866,395 字节 / 62.80 MiB）；「63,452,740 字节旧包（2026-07-28）」与「改造前基线 64,968,184 字节」均已过期 |
 | 无自动更新 | 当前版本无自动检查更新机制 |
