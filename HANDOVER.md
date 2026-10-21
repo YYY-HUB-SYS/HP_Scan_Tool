@@ -71,11 +71,11 @@ HP Scan Tool 已稳定为**纯扫描工具**，职责边界清晰：
 │   │   └── icon_64.png
 │   └── styles/
 │       └── app.qss
-├── tests/                  # pytest 测试（2026-10-21 05:55 实测 65 个 .py：conftest.py + 62 个 test_*.py + 2 个测试辅助模块）
+├── tests/                  # pytest 测试（2026-10-21 11:1x 实测 79 个 .py：conftest.py + 75 个 test_*.py + 3 个测试辅助模块）
 │   ├── conftest.py
 │   ├── cli_subprocess_probe.py   # CLI 子进程测试用探针（辅助模块，非测试）
 │   ├── skew_fixtures.py          # 倾斜检测测试用夹具（辅助模块，非测试）
-│   └── test_*.py                 # 62 个测试模块（缓存 / 历史 / CLI / eSCL / 曝光 / 预设 / 倾斜检测 /
+│   └── test_*.py                 # 75 个测试模块（缓存 / 历史 / CLI / eSCL / 曝光 / 预设 / 倾斜检测 /
 │                                 #   文档会话 / 双面合并 / GUI 一致性 / 协调器 / 落盘 …）
 ├── docs/                     # 项目文档
 │   ├── SPEC-v3.3.md              # v3.3 规格文档（User Stories + 技术方案）
@@ -428,11 +428,11 @@ pytest tests/ -v
 
 测试覆盖：缓存 / 历史 / CLI / 配置并发 / eSCL 健壮性 / 预设 / 曝光 / 曝光集成 / GUI 一致性 / 监听 / 页元数据 / 保存 / 协调器 / 倾斜检测 / 文档会话 / 双面合并 等，见 `tests/`。
 
-**测试文件数（2026-10-21 05:55 工作区实测）**：`tests/` 下共 **65 个 `.py`** —— `conftest.py` 1 个 + `test_*.py` **62 个** + 测试辅助模块 2 个（`cli_subprocess_probe.py` / `skew_fixtures.py`，不是测试文件）。
+**测试文件数（2026-10-21 11:1x 工作区实测）**：`tests/` 下共 **79 个 `.py`** —— `conftest.py` 1 个 + `test_*.py` **75 个** + 测试辅助模块 3 个（`cli_subprocess_probe.py` / `fake_http_server.py` / `skew_fixtures.py`，不是测试文件）。
 
 > 统计方式：按文件名对 `tests/` 下的 `.py` 归类计数（`Get-ChildItem tests -Filter *.py -File` 后按 `conftest.py` / `test_*.py` / 其余辅助模块三类归类）。
 > ⚠️ 此前文档写的「当前 15 个测试文件：`conftest.py` + 14 个 `test_*.py`」**已过期**。
-> ⚠️ 统计口径说明：统计时 `tests/` 仍有**未提交的新测试文件**在陆续加入 ⇒ 数字会继续涨，以实际目录为准；只数 HEAD 里的（`git ls-tree -r --name-only HEAD -- tests/`）为 **60 个 `.py`**（`conftest.py` 1 + `test_*.py` 57 + 辅助模块 2）。
+> 统计口径说明：本轮已把 `tests/` 下**所有**新增测试文件提交入库 ⇒ 工作区与 HEAD 一致；只数 HEAD 里的（`git ls-tree -r --name-only HEAD -- tests/`）同为 **79 个 `.py`**（`conftest.py` 1 + `test_*.py` 75 + 辅助模块 3）。后续若再新增测试，以实际目录为准。
 
 ---
 
