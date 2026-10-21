@@ -82,10 +82,12 @@ DisableProgramGroupPage=yes
 Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 
 [Tasks]
-; ★ Inno 的 task **默认就是勾选**的，只能用 `Flags: unchecked` 取消
-;   （写 `Flags: checked` 会报 "unknown flag" 并**中止编译**）。
-;   ⇒ 桌面图标默认**不勾**（干净），用户想要再勾。
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务:"; Flags: unchecked
+; ★ 这里**故意不设任何 task**。
+;   原因（实测 2026-10-22）：桌面图标若挂在 task 上（`Tasks: desktopicon`），
+;   那么**覆盖升级时按本次任务选择重建图标** ⇒ 用户上一次装过（图标在）、
+;   这一次没勾（默认不勾）⇒ **桌面图标被删掉** ⇒ 用户以为装坏了。
+;   ⇒ 桌面快捷方式**总是创建**（行为可预期，升级不掉）。
+;   （`[Tasks]` 段保留是 Inno 的格式要求；空的 [Tasks] 段不会显示任务页。）
 
 [Files]
 ; ★ 源目录 = onedir 发布产物（`python build_exe.py --onedir` 的输出）
@@ -97,7 +99,7 @@ Name: "{group}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppNameCN}}"; Filename: "{uninstallexe}"
 ; 桌面快捷方式：★ 显式指定高清图标（从 EXE 资源取图标容易糊）
 ;   ★ 图标在 `_internal\resources\icons\`（PyInstaller 6.x 把数据文件放在 _internal 下）
-Name: "{autodesktop}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\_internal\resources\icons\app.ico"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\_internal\resources\icons\app.ico"
 
 [Run]
 ; 安装完成后启动（★ [Run] 是 Inno 官方的「安装后动作」位置，静默安装同样执行）
@@ -135,9 +137,19 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Reply: Integer;
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
+    // ★★★ 卸载前**必须先停掉正在运行的程序**（实测 2026-10-22）
+    //   安装器末尾的 [Run] 会启动应用 ⇒ 用户直接从控制面板卸载时它还在跑
+    //   ⇒ 它占着 DLL ⇒ 卸载「成功」了但**目录删不掉**
+    //   （实测残留 63 个文件 / 149 MiB，winerror=5「拒绝访问」/ 32「正在使用」）。
+    //   ★ /IM 后面**不能加引号**（实测带引号杀不掉）。
+    Exec('taskkill', '/F /IM {#MyAppExeName} /T', '', SW_HIDE,
+         ewWaitUntilTerminated, ResultCode);
+    Sleep(2000);
+
     // ★ 必须用 **SuppressibleMsgBox** 而不是 MsgBox：
     //   普通 MsgBox 在**静默模式**下不显示、直接返回 **IDYES**
     //   ⇒ 静默卸载会把用户数据删掉（不可恢复）。
@@ -156,6 +168,14 @@ begin
     else
       UserDataDirs(False);
   end;
+
+  // 卸载收尾：把**空的应用目录**也删掉。
+  // ★ 为什么需要：卸载时若还有文件被占用（刚杀掉的实例句柄还没释放），
+  //   Inno 会删掉文件但**保留目录** ⇒ 用户的「程序」里留一个空文件夹。
+  //   实测：文件全删（剩 0 个）但 `{app}` 空目录还在。
+  //   RemoveDir 只删**空**目录 ⇒ 非空时静默失败（不报错，不影响卸载结果）。
+  if CurUninstallStep = usPostUninstall then
+    RemoveDir(ExpandConstant('{app}'));
 end;
 
 // ── 升级时的兜底强退 ────────────────────────────────────────────────────
@@ -169,7 +189,11 @@ function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
 begin
-  Exec('taskkill', '/F /IM "{#MyAppExeName}" /T', '', SW_HIDE,
+  // ★ /IM 后面**不能加引号**！实测（2026-10-22）：`taskkill /F /IM "HP_Scan_Tool.exe" /T`
+  //   **杀不掉**运行中的实例（taskkill 的 /IM 按字面匹配图像名，带引号就匹配不上）
+  //   ⇒ 覆盖安装时旧实例还占着文件 ⇒ 安装装不上、卸载也删不干净（文件被占用）。
+  //   不带引号的 `/F /IM HP_Scan_Tool.exe /T` 实测 rc=0、进程立刻消失。
+  Exec('taskkill', '/F /IM {#MyAppExeName} /T', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
   Result := True;
 end;
