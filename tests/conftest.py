@@ -87,7 +87,9 @@ def _no_startfile_in_tests():
     ★ 测试期间**禁止** `os.startfile` 真正执行（2026-10-21 修）。
 
     背景（实测）：产品代码在「保存后」会 `os.startfile(dirname(saved_files[0]))`
-    打开所在文件夹（`hp_scan_gui_pyside.py:4921` / `:5620`，**这是产品行为，不改**）。
+    打开所在文件夹（`hp_scan_gui_pyside.py` 的 `_open_folder_after_save`，
+    ★ 2026-10-21 起该行为由配置 `open_folder_prompt` 控制、默认仍是「直接打开」，
+    **这是产品行为，不改**）。
     而 `tests/test_gui_v4_fixes.py` 的
     `test_single_page_crop_keeps_rotation` /
     `test_single_page_crop_page_meta_matches_actual` /

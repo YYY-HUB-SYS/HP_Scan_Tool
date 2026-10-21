@@ -213,7 +213,7 @@ preset_manager.py (在用)
 | 嵌入式字体 | ✅ | AddFontResourceExW 私有加载，ClearType 优化 |
 | 多页分组管理 | ✅ | 插入分割 / 移除分割（`hp_scan_gui_pyside.py:3525`「＋分组线 / －分组线」按钮）。⚠️ **「重命名分组」未实现** —— 落盘文件名由 `save_manager.build_output_name`（`save_manager.py:405`）按组号自动生成（`{base}_{N:03d}.pdf`），用户无法自定义组名 |
 | 页面删除 | ✅ | 多页预览中删除不需要的页面 |
-| 并发扫描 | ⚠️ 后端支持 / GUI 未开放 | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:382`）；但 GUI 扫描期间 `scan_btn.setEnabled(False)`（`hp_scan_gui_pyside.py:1851`）、只跟踪单个 `_current_job_id` ⇒ **GUI 上一次只能扫一台**，与 `PRD.md` §13「单线程扫描，不支持并发」一致 |
+| 并发扫描 | ✅ 后端支持 / **GUI 已开放多台并发** | 后端 `scan_coordinator` 用 `QThreadPool` 且 `setMaxThreadCount(4)`（`scan_coordinator.py:382`）。★ **2026-10-21 起 GUI 也开放了**（`c5de886`）：扫描期间不再禁用扫描按钮，改用在途 job 表 `_active_jobs`（job_id → **该 job 自己的设备**）跟踪多台 ⇒ 每台各自可取消、各自回填结果与进度；状态栏仍只放**一个**取消按钮，取消**最近启动**的那台（再点一次轮到上一台）⇒ 每台都能单独取消。⚠️ **双面/续扫（会话）模式仍保持串行**（会话本质是顺序的：正面→背面、逐批追加，并行会把记账搞乱）⇒ 该模式下按钮仍禁用并拒绝开第二批。⚠️ 已知不足：① 曝光参数仍是全局态（并发下 B 台启动会清掉 A 台残留曝光，未改）；② 预览对话框仍是模态 `exec()`，A 台完成时弹预览会挡住主窗口（B 台仍在后台扫） |
 | ADF 自动检测 | ✅ | 扫描前查询 adf_loaded，自动切换平板/输稿器 |
 
 ### 4.3 架构分离（2026-07-19 完成，**2026-10-20 已回退**）
