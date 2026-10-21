@@ -5,6 +5,7 @@ CLI 命令行模式 — argparse 子命令入口
 """
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -26,6 +27,10 @@ from escl_engine import (
 from wsd_engine import discover_all_scanners
 import history_manager
 import save_manager
+# 曝光预设：preset_manager 是**预设名的唯一真源**（内置 + 用户自定义），
+# exposure 是**像素处理引擎**。两个模块都不碰 Qt ⇒ CLI 依赖链仍然纯控制台。
+import exposure
+import preset_manager
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +149,114 @@ def _non_negative_int(value: str) -> int:
     return limit
 
 
+# ── 曝光预设（--exposure）─────────────────────────────────────────────
+#
+# ★ 背景：preset_manager / exposure 已在 2026-10-20 并回本项目，
+#   save_manager 的落盘链路也支持曝光（顺序：曝光 → 旋转 → 纠偏 → A4 归一），
+#   但 CLI 的 `scan` 子命令**压根没有曝光参数** ⇒ 这条入口用不上。
+#
+# ★ 预设名是**唯一真源 = preset_manager**（内置 4 个 + %APPDATA% 下的用户
+#   自定义预设）⇒ CLI 不自己维护一份名字表 ⇒ 不会与 GUI 漂移。
+
+#: 曝光参数字典的字段（exposure.apply_exposure / save_manager 认的键）
+_EXPOSURE_PARAM_KEYS = ("mode", "brightness", "contrast", "gamma",
+                        "shadows", "highlights", "channel_gains")
+
+#: 曝光参数的默认值（预设条目缺字段时用）
+_EXPOSURE_PARAM_DEFAULTS = {
+    "mode": "off",
+    "brightness": 0,
+    "contrast": 0,
+    "gamma": 1.0,
+    "shadows": 0,
+    "highlights": 0,
+    "channel_gains": (1.0, 1.0, 1.0),
+}
+
+
+def _builtin_exposure_names() -> list:
+    """内置曝光预设名（唯一真源 = preset_manager.builtin_presets）。"""
+    names = []
+    for preset in preset_manager.builtin_presets():
+        name = preset.get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def _exposure_params_from_preset(preset: dict) -> dict:
+    """
+    把预设条目转成曝光参数字典（交给 apply_exposure / save_manager）。
+
+    ★ 只挑**已知字段**：预设 JSON 由用户编辑，可能带 "name" / "builtin" 之类
+      的额外键 ⇒ 直接 `apply_exposure(**preset)` 会因未知关键字炸掉。
+    """
+    params = dict(_EXPOSURE_PARAM_DEFAULTS)
+    for key in _EXPOSURE_PARAM_KEYS:
+        if key in preset:
+            params[key] = preset[key]
+    return params
+
+
+def _resolve_exposure_preset(name: str):
+    """
+    按名字找曝光预设。
+
+    返回 (预设条目 | None, 全部可用预设名列表)。
+    找不到 ⇒ 第一项为 None ⇒ 调用方必须**明确报错退出**（不许静默忽略）。
+    """
+    found = None
+    available = []
+    for preset in preset_manager.load_presets():
+        pname = preset.get("name") if isinstance(preset, dict) else None
+        if not isinstance(pname, str) or not pname:
+            continue
+        available.append(pname)
+        if pname == name and found is None:
+            found = preset
+    return found, available
+
+
+def _apply_exposure_bytes(data: bytes, ext: str, params: dict) -> bytes:
+    """
+    对图片字节应用曝光，返回**同格式**的新字节。
+
+    ★ 只改像素、**不改几何**（不缩放、不加 A4 白边）⇒ CLI 原有的
+      「非 PDF 字节原样落盘」契约在指定曝光时只多出「像素被处理过」这一项
+      变化（尺寸 / 格式 / 扩展名都不变）。
+    ★ PDF 不走这里：PDF 由 save_manager 合成（那边本来就支持曝光）。
+    """
+    from PIL import Image
+
+    with Image.open(io.BytesIO(data)) as src:
+        img = src.copy()
+    out = None
+    converted = None
+    try:
+        out = exposure.apply_exposure(img, **params)
+        if out.mode not in ("RGB", "L"):
+            converted = out.convert("RGB")
+            target = converted
+        else:
+            target = out
+        buf = io.BytesIO()
+        if ext == "png":
+            target.save(buf, "PNG")
+        elif ext in ("tiff", "tif"):
+            target.save(buf, "TIFF")
+        else:
+            target.save(buf, "JPEG", quality=95)
+        return buf.getvalue()
+    finally:
+        for im in (converted, out):
+            if im is not None and im is not img:
+                im.close()
+        img.close()
+
+
 def _write_pdf_via_save_manager(data: bytes, fpath: str,
-                                device_name: str = "", device_ip: str = "") -> str:
+                                device_name: str = "", device_ip: str = "",
+                                exposure: dict | None = None) -> str:
     """
     把扫描到的**图片字节**合成为 PDF 并落盘，返回落盘路径。
 
@@ -158,6 +269,10 @@ def _write_pdf_via_save_manager(data: bytes, fpath: str,
 
     CLI 手里只有内存里的字节、没有缓存页文件，故先落一个临时缓存页交给
     save_manager 处理；临时目录用完即删（不留中间产物）。
+
+    exposure: 曝光参数字典（None = 不做曝光）。**直接交给 save_manager**
+    ⇒ 曝光在「曝光 → 旋转 → 纠偏 → A4 归一」的既定顺序里生效，
+    与 GUI 完全一致。
     """
     tmp_dir = tempfile.mkdtemp(prefix="hp_scan_cli_")
     try:
@@ -165,7 +280,8 @@ def _write_pdf_via_save_manager(data: bytes, fpath: str,
         with open(cache_file, "wb") as f:
             f.write(data)
         save_manager.save_single(cache_file, "pdf", fpath,
-                                 device_name=device_name, device_ip=device_ip)
+                                 device_name=device_name, device_ip=device_ip,
+                                 exposure=exposure)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return fpath
@@ -209,6 +325,28 @@ def cmd_scan(args):
     source = args.source
     output = args.output or os.path.join(os.path.expanduser("~"), "Documents", "HP_Scans")
 
+    # ── 曝光预设解析（**先于任何网络动作**）────────────────────────
+    # 预设不存在 ⇒ **立刻**报错退出：不扫描、不落盘、不吐 traceback。
+    # （早失败 = 用户不用干等一次真实扫描才发现预设名打错了。）
+    # 用 getattr 而不是 args.exposure：手工构造的 Namespace（老调用方 /
+    # 外部脚本）没有这个键时不该炸 —— 缺省即"不做曝光"。
+    exposure_params = None
+    exposure_name = getattr(args, "exposure", None)
+    if exposure_name:
+        try:
+            preset, available = _resolve_exposure_preset(exposure_name)
+        except Exception as e:
+            print(f"错误: 读取曝光预设失败 — {e}", file=sys.stderr)
+            return 1
+        if preset is None:
+            print(f"错误: 曝光预设不存在: {exposure_name}", file=sys.stderr)
+            if available:
+                print("可用曝光预设: " + "、".join(available), file=sys.stderr)
+            else:
+                print("可用曝光预设: （无）", file=sys.stderr)
+            return 2
+        exposure_params = _exposure_params_from_preset(preset)
+
     # 探测 eSCL —— **单轮**探测，候选 = 默认(http:80 / https:443) + http:443。
     #
     # 改造前分两轮：第 1 轮 probe_escl(ip)、第 2 轮 probe_escl(ip, port=443)。
@@ -238,7 +376,9 @@ def cmd_scan(args):
     # 执行扫描
     # 进度提示走 stderr：stdout 留给结果（失败时 stdout 必须为空，
     # 否则消费方（如 `hp_scan scan ... > out`）会拿到半截输出）。
-    print(f"正在扫描 (DPI={resolution}, 格式={fmt}, 来源={source})...", file=sys.stderr)
+    exposure_hint = f", 曝光={exposure_name}" if exposure_name else ""
+    print(f"正在扫描 (DPI={resolution}, 格式={fmt}, 来源={source}"
+          f"{exposure_hint})...", file=sys.stderr)
     try:
         data, ext = execute_scan(
             scanner=scanner,
@@ -283,12 +423,21 @@ def cmd_scan(args):
     if ext == "pdf" and data[:5] != b"%PDF-":
         try:
             _write_pdf_via_save_manager(data, fpath,
-                                        device_name=device_name, device_ip=ip)
+                                        device_name=device_name, device_ip=ip,
+                                        exposure=exposure_params)
         except Exception as e:
             print(f"错误: PDF 合成失败 — {e}", file=sys.stderr)
             return 1
         history_recorded = True
     else:
+        # 非 PDF（jpg/png/tiff）：字节原样写入，行为与改造前完全一致。
+        # 指定了曝光 ⇒ 先在**字节层**应用曝光（只改像素，不改几何）。
+        if exposure_params is not None:
+            try:
+                data = _apply_exposure_bytes(data, ext, exposure_params)
+            except Exception as e:
+                print(f"错误: 曝光处理失败 — {e}", file=sys.stderr)
+                return 1
         with open(fpath, "wb") as f:
             f.write(data)
 
@@ -310,7 +459,7 @@ def cmd_scan(args):
 
     # 记录历史（PDF 路径已由 save_manager 记过一条，不重复记）
     if not history_recorded:
-        history_manager.append({
+        record = {
             "device_name": device_name,
             "device_ip": ip,
             "page_count": 1,
@@ -321,7 +470,12 @@ def cmd_scan(args):
             "color_mode": color_mode,
             "output_format": fmt,
             "scan_source": source,
-        })
+        }
+        # ★ 只有**真的用了**曝光才加这个键 —— 不指定 --exposure 时
+        #   历史记录必须与改造前**逐字段一致**（向后兼容）。
+        if exposure_params is not None:
+            record["exposure"] = exposure_params
+        history_manager.append(record)
 
     return 0
 
@@ -475,6 +629,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="扫描来源 (默认 Platen)")
     p_scan.add_argument("--duplex", action="store_true", help="启用双面扫描 (仅 ADF 支持)")
     p_scan.add_argument("--output", help="输出目录 (默认 ~/Documents/HP_Scans)")
+    # --exposure：曝光预设名。预设名的唯一真源是 preset_manager
+    # （内置 4 个 + %APPDATA%\HP_Scan_Tool\presets.json 里的用户自定义预设），
+    # 所以 help 里的内置名单是**运行时从 preset_manager 取的** ⇒ 不会与 GUI 漂移。
+    # ★ help 文本里的 % 必须写成 %%：argparse 用 % 格式化 help 串
+    #   （_expand_help）⇒ 单个 % 会抛 ValueError（unsupported format character）。
+    p_scan.add_argument(
+        "--exposure",
+        help="曝光预设名（可选）。内置预设: "
+             + "、".join(_builtin_exposure_names())
+             + "；用户自定义预设见 %%APPDATA%%\\HP_Scan_Tool\\presets.json。"
+               "不指定则不做曝光处理（默认，产物与不加曝光时一致）。"
+               "预设名不存在会直接报错退出并列出可用预设")
 
     # discover 子命令
     p_discover = subparsers.add_parser("discover", help="发现局域网扫描仪")
