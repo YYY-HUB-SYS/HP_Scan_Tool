@@ -198,8 +198,15 @@ class TestF3CapabilityKnown:
         assert (source, adf) == ("Feeder", False)
         assert warning == scan_coordinator.WARN_CAPABILITY_UNKNOWN
 
-    def test_platen_forced_when_capability_known_without_adf(self, coordinator, scanner):
+    def test_platen_forced_when_device_reports_no_adf(self, coordinator, scanner):
+        """★ 2026-10-22：设备**明确报告**没有输稿器 ⇒ 强制平板。
+
+        ★ 区分「明确报告没有」与「没查到」：实测 17.17.171.111 / .203
+        都是 M232 系列、**都有**输稿器，但能力文档里查不到 ⇒ 那属于
+        「**未知**」，必须保留用户的选择。
+        """
         scan_coordinator.mark_capabilities_known(scanner)
+        scanner.adf_capability_known = True   # 设备明确报告没有输稿器
         source, adf, warning = coordinator.resolve_source_detailed(scanner, "Feeder")
         assert (source, adf) == ("Platen", False)
         assert warning == scan_coordinator.WARN_NO_ADF

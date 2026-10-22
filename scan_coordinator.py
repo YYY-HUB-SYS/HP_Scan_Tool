@@ -639,10 +639,13 @@ class ScanCoordinator(QObject):
             return "Platen", False, None
 
         has_adf = bool(getattr(scanner, "has_adf", False))
+        # ★ 2026-10-22：设备**是否明确报告过**输稿器能力。
+        #   没报告 ⇒ **不知道**，不等于「没有」⇒ 保留用户显式选择（不强制平板）。
+        adf_known = bool(getattr(scanner, "adf_capability_known", False))
         escl_url = getattr(scanner, "escl_url", "")
 
         if not has_adf:
-            if capabilities_known(scanner):
+            if adf_known:
                 # 能力**已确认**（查询成功且解析结果里没有 Adf 段）
                 # ⇒ 设备真的没有 ADF ⇒ 强制平板。
                 if requested == "Feeder":

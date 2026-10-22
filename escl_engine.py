@@ -127,6 +127,11 @@ class ScannerInfo:
     serial: str = ""
     vendor: str = "HP"
     has_adf: bool = False
+    # ★ 2026-10-22：设备**是否明确报告过**输稿器能力。
+    #   False = **没查到**（能力文档拿不到 / 文档里没提输稿器）⇒ **不等于没有**。
+    #   实测 17.17.171.111 / .203 都是 M232 系列、**都有**输稿器，
+    #   但一个的能力文档里没有 Adf 段、另一个的文档根本拿不到。
+    adf_capability_known: bool = False
     has_duplex: bool = False
     has_platen: bool = True
     max_width: int = 2480   # A4 210mm @300dpi
@@ -331,6 +336,8 @@ def _probe_adf_from_status(scanner: ScannerInfo, base: str, timeout: float):
             _wall_clock_for((2.0, timeout)),
             "ScannerStatus 探测")
         if r.status_code == 200 and "AdfState" in r.text:
+            # ★ 设备**明确报了** AdfState ⇒ 能力已知
+            scanner.adf_capability_known = True
             scanner.has_adf = True
             logger.info("从 ScannerStatus 检测到 ADF: %s", scanner.ip)
     except Exception:
@@ -440,6 +447,10 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
         # 这是"设备到底有没有 ADF"的**唯一权威信号**：不再靠"字段有没有变"
         # 来猜（那种启发式在 WSD / GUI 链路上是幂等 no-op ⇒ 永远判"未知"）。
         scanner.capabilities_known = True
+        # ★ 2026-10-22：能力文档拿到了，但**文档里没有 `<scan:Adf>` 段** ⇒
+        #   只能判为「**输稿器能力未知**」（`adf_capability_known` 保持 False），
+        #   **不能**判成「设备没有输稿器」—— 实测 17.17.171.111（M232dwc）
+        #   明明有输稿器，文档里却没有这一段。
 
         # 型号 / 序列号
         # HP 真机报的是 pwg:MakeAndModel，部分机型报 Model，两个都认，
@@ -467,6 +478,8 @@ def fetch_capabilities(scanner: ScannerInfo, timeout: float = 3.0) -> ScannerInf
             elif t == "Adf":
                 adf_sections.append(child)
                 scanner.has_adf = True
+                # ★ 文档里**明确有** `<scan:Adf>` 段 ⇒ 能力已知
+                scanner.adf_capability_known = True
 
         # 从 Platen 或 Adf 中提取能力
         source_section = None

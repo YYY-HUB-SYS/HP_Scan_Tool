@@ -224,15 +224,23 @@ class TestKnownSignalOnRealLinkages:
 
 
 class TestSourceDecisionWithKnownCapability:
-    def test_real_device_without_adf_falls_back_to_platen(self, coordinator):
-        """设备**确实没有 ADF** 且能力查询**成功** ⇒ 回退平板（不是"能力未知"）。"""
+    def test_device_without_adf_section_is_unknown_not_no_adf(self, coordinator):
+        """★ 2026-10-22：能力文档拿到了、但**没有 `<scan:Adf>` 段**
+
+        ⇒ 只能判「输稿器能力**未知**」，**不能**判「设备没有输稿器」
+        （实测 17.17.171.111 / .203 都是 M232 系列、**都有**输稿器，
+        一个文档里没这一段、另一个文档根本拿不到）
+        ⇒ 保留用户显式的「输稿器」选择，不静默改成平板。
+        """
         with _fake_escl_server(CAPS_NO_ADF_XML) as base:
             s = _scanner_with(base)
             escl_engine.fetch_capabilities(s, timeout=3.0)
             source, adf, warning = coordinator.resolve_source_detailed(s, "Feeder")
         assert s.capabilities_known is True
-        assert (source, adf) == ("Platen", False)
-        assert warning == scan_coordinator.WARN_NO_ADF
+        assert s.adf_capability_known is False, (
+            '能力文档里没有 Adf 段 ⇒ 只能是「未知」，不能是「明确没有」')
+        assert (source, adf) == ("Feeder", False)
+        assert warning == scan_coordinator.WARN_CAPABILITY_QUERY_FAILED
 
     def test_query_failure_keeps_feeder_with_warning(self, coordinator):
         """能力查询失败 ⇒ capabilities_known=False ⇒ 按用户选择走 + 警告。"""

@@ -2865,7 +2865,11 @@ class ScanApp(QMainWindow, _UiPostMixin):
             for i, card in enumerate(self.cards):
                 card.set_selected(i == idx)
 
-            self._update_source_options(self.selected.has_adf, self.selected.has_duplex)
+            _sel = self.selected
+            _adf_unknown = ((not _sel.has_adf)
+                            and (not getattr(_sel, "adf_capability_known", False)))
+            self._update_source_options(_sel.has_adf, _sel.has_duplex,
+                                        _adf_unknown)
             self._load_profile()
 
             label = _label_for(self.selected)
@@ -2959,11 +2963,20 @@ class ScanApp(QMainWindow, _UiPostMixin):
             for i, card in enumerate(self.cards):
                 card.set_selected(i == self.selected_idx)
 
-    def _update_source_options(self, has_adf: bool, has_duplex: bool):
+    def _update_source_options(self, has_adf: bool, has_duplex: bool,
+                               adf_unknown: bool = False):
+        """更新来源选项
+
+        ★ 2026-10-22：`adf_unknown` = 设备**没报告**输稿器能力
+          （能力文档拿不到 / 文档里没提）⇒ 这**不等于**「设备没有输稿器」
+          （实测 17.17.171.111 与 .203 都是 M232 系列、**都有**输稿器，
+          但一个的文档里没有 Adf 段、另一个的文档根本拿不到）
+          ⇒ **仍然显示「ADF」选项**，让用户能用；选了由设备裁决。
+        """
         """更新来源选项"""
         self.source_combo.clear()
         self.source_combo.addItem("平板")
-        if has_adf:
+        if has_adf or adf_unknown:
             self.source_combo.addItem("ADF")
             self.source_combo.addItem("自动")  # 自动检测输稿器状态
             self.source_combo.setCurrentText("自动")  # 有ADF时默认自动
