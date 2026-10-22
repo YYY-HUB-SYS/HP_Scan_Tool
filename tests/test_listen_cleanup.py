@@ -5,7 +5,7 @@ listen_engine 清理回归测试 — HP Scan Tool v4.0
   监听模式取消/超时后，finally 只 session.close()，**不删打印机上的 ScanJob**
   ⇒ 打印机上残留一个未完成 job ⇒ 紧接着的普通扫描撞 409
      （提示"打印机上有一个未完成的扫描任务"，其实是自己上次监听留下的），
-     且要等 15-20 分钟 TTL 才被回收。
+      且实测可能很久都不被回收。
   修法：监听路径的 finally 同样 session.delete(job_uri)（失败忽略、记 debug），
   与 execute_scan 对齐；job_uri 未绑定（创建就失败）时不能二次抛错。
 """

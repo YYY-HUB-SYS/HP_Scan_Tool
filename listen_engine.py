@@ -112,7 +112,7 @@ def listen_for_scan(
         # ★ 清理打印机上的扫描任务（与 execute_scan 对齐）：
         #   监听被取消/超时后，打印机上会残留一个未完成的 ScanJob；
         #   紧接着的普通扫描会撞 409（提示"打印机上有一个未完成的扫描任务"，
-        #   其实是自己上次监听留下的），且要等 15–20 分钟 TTL 才被回收。
+        #   其实是自己上次监听留下的），且实测可能很久都不被回收。
         #   job_uri 可能未绑定（创建任务就失败）⇒ 用 None 哨兵，不抛二次异常。
         if job_uri:
             try:
@@ -220,7 +220,7 @@ def listen_for_multipage_scan(
 
     finally:
         # ★ 同 listen_for_scan：监听取消/超时后必须删掉打印机上的 ScanJob，
-        #   否则残留 job 会让紧接着的普通扫描撞 409（等 15–20 分钟 TTL 才回收）。
+        #   否则残留 job 会让紧接着的普通扫描撞 409（残留记录可能长期不回收）。
         if job_uri:
             try:
                 session.delete(job_uri, timeout=3)

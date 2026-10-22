@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # 在整条 logger 链上找不到任何 handler，Python 会启用兜底 handler
 # `logging.lastResort`，把它**直接写进 stderr**。而 `logger.exception(...)`
 # 自带 `exc_info=True` ⇒ 记录里还带着完整 traceback（含本地绝对路径）
-# ⇒ 用户在「去打印机面板取消任务 / 等 15-20 分钟」这类**可执行指引**后面
+# ⇒ 用户在「去打印机面板取消任务 / 重启打印机」这类**可执行指引**后面
 # 紧接着又看到一坨 Python 栈。
 #
 # 处理：给本模块的 logger 挂一个 `NullHandler`。
@@ -53,7 +53,7 @@ logger.addHandler(logging.NullHandler())
 # 设备 / 协议类"可操作"错误的特征词。
 #
 # 协议层（escl_engine）对这些失败已经写好了**用户下一步该做什么**
-# （409 → 去打印机面板取消任务 / 等 15-20 分钟；503 → 输稿器放纸；
+# （409 → 去打印机面板取消任务 / 重启打印机；503 → 输稿器放纸；
 #  超时 → 确认设备已开机）。CLI 必须把这段话**原样**呈现给用户，
 # 而不是只甩一段 Python traceback。
 #

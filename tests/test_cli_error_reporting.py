@@ -4,8 +4,8 @@ CLI 错误呈现 + 探测去重回归测试 — HP Scan Tool v4.0
 锁死 F-1（Important）：`execute_scan` 抛出的异常，CLI 不得退化成 Python traceback
 ------------------------------------------------------------------
 协议层（escl_engine）已经把"设备/协议类失败"的可执行指引写好了：
-  - HTTP 409 →「打印机上残留了一个未完成的扫描任务……请在打印机面板上取消该任务，
-    设备回收需要 15-20 分钟」
+  - HTTP 409 →「打印机上残留了一条上次未完成的扫描任务记录……请到打印机面板上
+    查看并取消该任务；若面板上找不到该任务，请重启该打印机后再重试」
   - HTTP 503 →「打印机当前不可用……请确认输稿器里已放入纸张后重试」
   - 超时     →「扫描超时……请确认打印机已开机并完成初始化」
 改造前 CLI 直接让异常逃逸 ⇒ 用户拿到的是 14 行 Python traceback（含本地绝对路径），
@@ -103,7 +103,7 @@ class TestActionableGuidanceSurfaced:
         assert rc != 0, "失败退出码必须非 0"
         err = capsys.readouterr().err
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
-        assert "15-20 分钟" in err, "必须告诉用户设备回收要多久"
+        assert "不会很快自行消失" in err, "必须告诉用户残留记录不会自行回收"
 
     def test_409_guidance_has_no_python_traceback_in_real_process(self, tmp_path):
         """★ 子进程级判据（复审 N-1）：**真实 CLI 进程**的 stderr 不得带 traceback。
@@ -121,7 +121,7 @@ class TestActionableGuidanceSurfaced:
         assert rc != 0, "失败退出码必须非 0"
         assert out == "", f"失败时 stdout 必须为空，实际 {out!r}"
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
-        assert "15-20 分钟" in err, "必须告诉用户设备回收要多久"
+        assert "不会很快自行消失" in err, "必须告诉用户残留记录不会自行回收"
         assert "Traceback" not in err, (
             "真实 CLI 进程的 stderr 不得带 traceback；实际 %r" % err)
         assert "  File " not in err, (

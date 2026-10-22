@@ -3,10 +3,15 @@ eSCL 409 退避与格式契约回归测试 — HP Scan Tool v4.0
 
 锁死两条 finding：
   m-4（Minor）：409 退避窗口失配且不可取消
-       - 设备侧残留 job 的 TTL 实测 15-20 分钟，而退避只有 2/4/8 秒共 14 秒
-         ⇒ 重试成功概率≈0，只是把错误提示推迟 14 秒
+       - 设备侧残留 job **不会很快自行回收**（实测最长 30 天仍未回收），
+         而退避只有 2/4/8 秒共 14 秒 ⇒ 重试成功概率≈0，只是把错误提示推迟 14 秒
        - time.sleep 不可取消 ⇒ 用户点取消后最多再等 14 秒
-       修法：有界退避 + 明确告知 TTL + 分片可取消等待。
+       修法：有界退避 + 分片可取消等待 + **只给确定有效的下一步**
+         （面板取消 / 重启打印机），**不得**承诺"等 N 分钟会好"。
+       ★ 2026-10-22 契约变更：删掉不实的"TTL 15-20 分钟"（实测最长 30 天
+         仍未回收）⇒ 文案改为"不会很快自行消失"；同时把偏宽的
+         "该型号不支持客户端清理"改成"客户端也清不掉（设备返回 404/410）"
+         （真机实测该型号**支持**逐个删 job，DELETE 具体 URI ⇒ 200）。
        ★ 2026-10-21 契约变更：503 的处置**按来源分流** —— 平板（设备还在
          收尾上一个 job，会自愈）走有界退避重试；输稿器（空载等纸，等不出来）
          **不重试**，第一次就抛"放纸后请重试"；错误文案同样按来源分流
@@ -15,6 +20,7 @@ eSCL 409 退避与格式契约回归测试 — HP Scan Tool v4.0
        修法：CLI 去掉 bmp（显式报错）；协议层对不支持的格式显式抛错。
 """
 
+import re
 import threading
 import time
 from unittest import mock
@@ -106,7 +112,7 @@ class TestConflictBackoffIsCancellable:
 
 class TestConflictMessageTellsTtl:
     def test_message_mentions_ttl_and_action(self):
-        """错误文案必须写清设备回收要多久 + 用户能做什么"""
+        """错误文案必须写清"会不会自己好" + 用户能做什么"""
         session = mock.MagicMock()
         session.post.return_value = _Resp(409, "busy")
 
@@ -117,13 +123,47 @@ class TestConflictMessageTellsTtl:
         msg = str(exc.value)
         assert "409" in msg
         assert "未完成" in msg
-        assert "15-20 分钟" in msg, f"必须写清 TTL 等待时间: {msg}"
+        assert "不会很快自行消失" in msg, f"必须写清残留记录不会自行回收: {msg}"
         assert "打印机面板" in msg, f"必须给出可执行动作: {msg}"
-        assert "稍后重试" in msg
+        assert "重启" in msg, f"面板上找不到任务时必须给出重启指引: {msg}"
 
     def test_ttl_hint_constant_matches_message(self):
         assert escl_engine._CONFLICT_TTL_HINT in escl_engine._CONFLICT_MESSAGE
-        assert "15-20 分钟" in escl_engine._CONFLICT_TTL_HINT
+        assert "不会很快自行消失" in escl_engine._CONFLICT_TTL_HINT
+
+    def test_message_makes_no_false_wait_promise(self):
+        """★ 2026-10-22：文案**不得**再承诺"等 15-20 分钟就会好"。
+
+        实测：残留记录最长 30 天仍未回收 ⇒ 承诺具体分钟数是**假承诺**，
+        会让用户对着打印机白等。判据：错误文案里不得出现任何
+        "N 分钟"式的等待承诺。
+        """
+        session = mock.MagicMock()
+        session.post.return_value = _Resp(409, "busy")
+
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(RuntimeError) as exc:
+                _create(session)
+
+        msg = str(exc.value)
+        assert "15-20 分钟" not in msg, f"不得再承诺具体等待分钟数: {msg}"
+        assert not re.search(r"\d+\s*分钟", msg), (
+            "不得出现任何形式的等待分钟数承诺: %s" % msg)
+
+    def test_message_does_not_claim_model_cannot_cleanup(self):
+        """★ 2026-10-22：真机实测该型号**支持逐个删** job（DELETE 具体 URI ⇒ 200），
+        只有 DELETE 集合路径才 405 ⇒ 文案不得再写"该型号不支持客户端清理"，
+        正确的说法是"这些残留记录客户端清不掉（设备返回 404/410）"。"""
+        session = mock.MagicMock()
+        session.post.return_value = _Resp(409, "busy")
+
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(RuntimeError) as exc:
+                _create(session)
+
+        msg = str(exc.value)
+        assert "不支持客户端清理" not in msg, f"措辞偏宽：{msg}"
+        assert "404/410" in msg, f"必须写清客户端为什么清不掉: {msg}"
 
 
 class TestServiceUnavailableIsRetried:
