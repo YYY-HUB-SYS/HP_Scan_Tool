@@ -426,6 +426,22 @@ onedir 安装后是**真实文件**，**完全不解压 `%TEMP%`**（真机验�
 **出包自检**：`python tools/verify_release.py` ⇒ 校验 onedir 完整性 + 无开发期残留 +
 安装包合法 PE + 文件名版本号 ⇒ 生成清单 `build/release/MANIFEST.txt`（每件大小与 sha256）。
 
+**残留扫描**：`python tools/scan_residual.py` ⇒ 扫「装完/卸完看得见的残留」：
+注册表卸载条目 / 安装目录 / 开始菜单+桌面快捷方式 / 进程 / `%TEMP%` 里的
+`_MEI*`（onefile 每次启动解压出来的）与 `is-*`（Inno 自解压临时目录）。
+`--expect-installed` / `--expect-removed` 两种预期；`--strict` 有不该在的残留就退出码 1（可进 CI）。
+★ 借鉴 `Windows_Keeper` 的 `WinKeeper/scan_residual.bat` 思路（**只读借鉴，未改动对方任何文件**）。
+
+**★ `%TEMP%` 残留点（两种形态各一个，回答「别人清 TEMP 会怎样」）**
+
+| 形态 | 残留目录 | 大小 | 正常退出 | 强杀/崩溃 |
+|---|---|---|---|---|
+| onefile 便携版 | `_MEIxxxxxx`（运行期解压） | **138.5 MiB** | 自动清掉 | 残留；**进程死后可手删**（删不掉 = 进程还在跑） |
+| 安装包版 | `is-XXXX.tmp` / `is-XXXX-uninstall.tmp`（Inno 自解压） | 4.5 MiB/个 | 自动清掉 | 残留 |
+
+⇒ 别人「清空 %TEMP%」会**打断正在运行的程序**（DLL 被抽走）——这是 onefile 的固有限制；
+安装包版**不解压 `%TEMP%`**，只留几 MB 的自解压临时目录 ⇒ 风险小得多。
+
 `build_exe.py` 仍是单文件便携版的入口（`--onefile` 单文件模式）。仓库不再保留独立的 `.spec` 文件——它此前是 onedir 配置，与 CI 实际运行的 onefile 模式冲突，且长期未被使用。
 
 注意：打包前确认 `build_exe.py` 里的 `--add-data` 资源路径与 `--hidden-import` 模块列表与当前代码一致。**当前项目内模块全部是静态 import**（`exposure` / `preset_manager` / `page_meta` / `config_io` / `pypdf` 等已由 PyInstaller 依赖分析器实测自动收录），**只有改成动态 import 的模块才需要补进 hidden-imports** —— 否则会变成打包后运行时 ImportError。
