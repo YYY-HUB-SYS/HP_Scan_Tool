@@ -134,6 +134,40 @@ begin
   end;
 end;
 
+// ── 清理历次安装残留的卸载器 exe ────────────────────────────────────────
+// ★ 为什么需要（实测 2026-10-22）：
+//   ① 卸载时**正在运行的卸载器 exe 删不掉**（Windows 不允许删运行中的 exe）
+//      ⇒ 卸载后 `{app}` 里会留下一个 `unins000.exe`（4.26 MiB）而 `unins000.dat`
+//         已被删掉；
+//   ② 下一次安装看到 `unins000.exe` 还在 ⇒ 新的卸载器被**重编号**成
+//      `unins001.exe` ⇒ 那个孤儿 `unins000.exe` 就**永久赖在安装目录里**；
+//   ③ 而下面的 `DelTree('{app}', True, False, True)` 第三个参数是
+//      **DeleteFiles=False**（只删目录、不删文件）⇒ 孤儿 exe **活下来了**。
+//   ⇒ 实测后果：卸载完 `%LOCALAPPDATA%\Programs\HP Scan Tool\` **还在**，
+//      里面躺着一个 4.26 MiB 的 exe ⇒ 用户以为"没卸干净"。
+//
+// ★ 做法：在 usPostUninstall 阶段把 `{app}\unins*.exe` 全删一遍。
+//   正在运行的那个（如果它还在 `{app}` 里）**删不掉** ⇒ Windows 直接拒绝
+//   ⇒ DeleteFile 返回 False，天然跳过 ⇒ 不会误伤自己。
+procedure RemoveStaleUninstallers;
+var
+  AppDir: String;
+  FindRec: TFindRec;
+begin
+  AppDir := ExpandConstant('{app}');
+  if FindFirst(AppDir + '\unins*.exe', FindRec) then
+  begin
+    try
+      repeat
+        // ★ 正在运行的那个删不掉（文件被占用）⇒ DeleteFile 失败即跳过
+        DeleteFile(AppDir + '\' + FindRec.Name);
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   Reply: Integer;
@@ -179,8 +213,14 @@ begin
   //   ⇒ 被占用的文件留着（Inno 会报"无法删除"），空的目录树清掉。
   //   ★ Inno 7 的 DelTree 是 **4 参**：DelTree(Path, IsDir, DeleteFiles, RecurseSubdirs)
   //   （6 参/5 参都报 "Invalid number of parameters"，用小脚本逐个试出来的）
+  // ★★ 顺序要紧：**先**删历次安装残留的 `unins*.exe`
+  //   （见 RemoveStaleUninstallers），**再** DelTree 目录树 ——
+  //   因为 DelTree 不删文件（DeleteFiles=False），孤儿 exe 留着目录就空不掉。
   if CurUninstallStep = usPostUninstall then
+  begin
+    RemoveStaleUninstallers;
     DelTree(ExpandConstant('{app}'), True, False, True);
+  end;
 end;
 
 // ── 升级时的兜底强退 ────────────────────────────────────────────────────
