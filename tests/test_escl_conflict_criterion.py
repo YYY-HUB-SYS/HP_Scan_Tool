@@ -1,0 +1,138 @@
+"""
+409 判据契约测试 — HP Scan Tool v4.0
+
+锁死 **2026-10-22 四台真机逐台验出来的判据**（这一条此前被我判错过两次）：
+
+| 设备 | 设备侧作业记录 | 有没有 `Completed` | `POST /eSCL/ScanJobs` |
+|---|---|---|---|
+| `.101`（OfficeJet Pro 7720） | `Completed` + `Completed` | **有** | **201** ✔ |
+| `.203`（M232） | `Canceled` ×2 | **没有** | **409** ✘ |
+| `.208`（M232） | `Canceled` ×2 | **没有** | **409** ✘ |
+| `.111`（M232） | `Aborted` + `Canceled` | **没有** | **409** ✘ |
+
+★ **判据是「设备侧有没有一条 Completed（成功扫完过）」**：
+  - 「有没有非 Completed 的记录」**不成立**（四台全是 True，`.101` 却能扫）；
+  - 「最近一条是不是 Completed」**也不成立**（`.101` 最新那条是我探测时留下的
+    Aborted，它照样能扫）；
+  - **只有「有没有 Completed」能一致区分四台。**
+★ 409 的响应体**全空**、而 `pwg:State` 仍报 `Idle` ⇒ 用户只看到"打印机坏了"；
+  ⇒ 文案必须说清是「**上次没正常扫完**」并给出**立刻能做的动作**。
+★ 设备侧残留 **DELETE 只会得到 404/410** ⇒ **客户端清不掉** ⇒ 只能重启打印机。
+"""
+
+from unittest import mock
+
+import pytest
+
+import escl_engine
+
+
+def _status_xml(jobs):
+    """造一份 ScannerStatus XML（jobs = [(age, state), ...]）"""
+    body = []
+    for age, state in jobs:
+        body.append(
+            "<scan:JobInfo>"
+            "<pwg:JobUri>/eSCL/ScanJobs/x%d</pwg:JobUri>"
+            "<scan:Age>%d</scan:Age>"
+            "<pwg:ImagesCompleted>0</pwg:ImagesCompleted>"
+            "<pwg:ImagesToTransfer>0</pwg:ImagesToTransfer>"
+            "<pwg:JobState>%s</pwg:JobState>"
+            "<pwg:JobStateReasons><pwg:JobStateReason>JobCanceledByUser"
+            "</pwg:JobStateReason></pwg:JobStateReasons>"
+            "</scan:JobInfo>" % (age, age, state))
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<scan:ScannerStatus '
+            'xmlns:scan="http://schemas.hp.com/imaging/escl/2011/05/03" '
+            'xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm">'
+            '<pwg:Version>2.63</pwg:Version><pwg:State>Idle</pwg:State>'
+            "<scan:Jobs>%s</scan:Jobs></scan:ScannerStatus>"
+            % "".join(body))
+
+
+class _Resp:
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+
+
+class TestJobStateParsing:
+    def test_parses_all_job_states(self):
+        xml = _status_xml([(100, "Completed"), (200, "Canceled")])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert ok is True
+        assert set(st["job_states_all"]) == {"Completed", "Canceled"}
+
+    def test_has_completed_job_true(self):
+        xml = _status_xml([(100, "Completed"), (200, "Canceled")])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            _ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert st["has_completed_job"] is True
+
+    def test_has_completed_job_false(self):
+        xml = _status_xml([(200, "Canceled"), (300, "Aborted")])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            _ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert st["has_completed_job"] is False
+
+    def test_newest_job_first(self):
+        """★ 最新的作业排前面（age 越大越新）"""
+        xml = _status_xml([(100, "Completed"), (300, "Aborted"),
+                           (200, "Canceled")])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            _ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert st["last_job_state"] == "Aborted"
+
+    def test_abnormal_age_sorts_last(self):
+        """★ `.203` 的 age 是 4290491337 秒（≈136 年）⇒ 异常值必须排到最后"""
+        xml = _status_xml([(4290491337, "Canceled"), (100, "Completed")])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            _ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert st["last_job_state"] == "Completed"
+
+    def test_no_jobs_leaves_unknown(self):
+        xml = _status_xml([])
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            _ok, st = escl_engine.probe_scanner_status("http://1.2.3.4/eSCL/")
+        assert st["has_completed_job"] is None
+        assert st["last_job_state"] == ""
+
+
+class TestConflictMessagePicksTheRightStory:
+    def _msg(self, jobs):
+        xml = _status_xml(jobs)
+        with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
+            return escl_engine._conflict_message_for("http://1.2.3.4/eSCL/")
+
+    def test_stale_device_gets_the_precise_message(self):
+        """没有 Completed ⇒ 说清「上次没正常结束」+ 给出动作"""
+        msg = self._msg([(200, "Canceled"), (300, "Aborted")])
+        assert "没有正常结束" in msg, msg
+        assert "Canceled" in msg or "Aborted" in msg, msg
+        assert "打印机面板" in msg, msg
+        assert "重启" in msg, msg
+
+    def test_device_with_completed_job_gets_generic_message(self):
+        """有 Completed（这台机器其实能扫）⇒ 不要说"上次没扫完"（那是误导）"""
+        msg = self._msg([(100, "Completed"), (300, "Aborted")])
+        assert "没有正常结束" not in msg, msg
+
+    def test_message_never_promises_a_wait_time(self):
+        """★ 不得再承诺"等 N 分钟就会好"（实测最长 30 天都不回收）"""
+        for jobs in ([(200, "Canceled")], [(100, "Completed"), (300, "Aborted")]):
+            msg = self._msg(jobs)
+            assert "15-20 分钟" not in msg, msg
+            assert "分钟" not in msg, msg
+
+
+class TestJobCleanupIsNotAbandoned:
+    """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ DELETE 必须给足时间"""
+
+    def test_delete_uses_a_longer_timeout_and_retries(self):
+        """DELETE 超时必须 ≥ 5 秒（设备忙时不返回），且失败要重试"""
+        import inspect
+        src = inspect.getsource(escl_engine.execute_scan)
+        assert "timeout=8" in src or "timeout=6" in src, \
+            "DELETE 超时没放宽（设备忙时不返回 ⇒ 作业停在没收尾状态）"
+        assert "for _attempt in range(2)" in src, "DELETE 失败没有重试"

@@ -567,7 +567,8 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
       完全不变（键集合仍是 {"state", "adf_loaded"}）。
     """
     status = {"state": "Unknown", "adf_loaded": False,
-              "adf_state": ""}
+              "adf_state": "", "job_states_all": [],
+              "last_job_state": "", "has_completed_job": None}
     if include_jobs:
         status["pending_jobs"] = 0
         status["job_states"] = []
@@ -596,6 +597,13 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
                 #    Empty / Jam / HatchOpen / Mispick …）
                 #   ⇒ 我们才能区分「没纸」与「卡纸」，给出对症指引。
                 status["adf_state"] = _adf
+        all_jobs = _parse_job_states(root)
+        status["job_states_all"] = ["%s" % s for _a, s in all_jobs]
+        status["has_completed_job"] = (
+            any(s.lower() == "completed" for _a, s in all_jobs)
+            if all_jobs else None)
+        if all_jobs:
+            status["last_job_state"] = all_jobs[0][1]
         if include_jobs:
             job_states = _parse_pending_job_states(root)
             status["pending_jobs"] = len(job_states)
@@ -630,6 +638,51 @@ def _job_is_unfinished(job_state: str, images_to_transfer: int) -> bool:
     if st == "completed":
         return False
     return images_to_transfer > 0
+
+
+# 设备侧「**没正常收尾**」的作业状态（终态，但不是 Completed）。
+# ★ 实测依据（2026-10-22，四台真机逐台验）：
+#   · 有一条 Completed 的设备 ⇒ POST /ScanJobs **201** ✔
+#   · 最后一条是 Canceled/Aborted 的设备 ⇒ POST **409**（响应体全空，
+#     而 pwg:State 却报 Idle ⇒ 用户只看到「打印机坏了」）；
+#   · DELETE 那几条残留 ⇒ 404/410 ⇒ **客户端清不掉**；
+#   · 正常收尾的设备扫完再 POST 仍然 201 ✔。
+# ⇒ 判据是「**有没有正常收尾的作业**」，不是「有没有旧记录」
+#   （`.101` 也有旧记录，照样能扫）。
+_ABNORMAL_JOB_STATES = {"canceled", "cancelled", "aborted",
+                          "error", "failed"}
+
+
+def _parse_job_states(root) -> list:
+    """设备侧全部作业记录，按**新旧**排序（新的在前）。
+
+    每条 = (age_seconds, state)。`age` 是设备自报的作业年龄（单位秒）。
+    ★ 实测：`.203` 的 `age` 是 4290491337 秒（≈136 年）⇒ **设备端计数器异常**，
+    所以排序要**容错**：age 明显异常（> 10^8）的记录排在最后，不让它盖掉
+    正常的记录。
+    """
+    out = []
+    for el in root.iter():
+        if _strip_ns(el) != "JobInfo":
+            continue
+        state = ""
+        age = 0
+        for child in el.iter():
+            t = _strip_ns(child)
+            if t == "JobState" and child.text:
+                state = child.text.strip()
+            elif t == "Age" and child.text:
+                try:
+                    age = int(float(child.text.strip()))
+                except (TypeError, ValueError):
+                    age = 0
+        if state:
+            out.append((age, state))
+    # 新的在前；age 异常的（> 10^8 秒 ≈ 3 年）排到最后
+    # 新的在前（age 越大越新）；age 明显异常（> 10^8 秒 ≈ 3 年）的排到最后，
+    # 不让它盖掉正常记录（实测 `.203` 的 age 是 4290491337 秒 ≈ 136 年）。
+    out.sort(key=lambda x: (x[0] > 10 ** 8, -x[0]))
+    return out
 
 
 def _parse_pending_job_states(root) -> list:
@@ -765,9 +818,46 @@ _CONFLICT_TTL_HINT = "不会很快自行消失"
 _CONFLICT_MESSAGE = (
     "打印机上残留了一条上次未完成的扫描任务记录（HTTP 409），重试 3 次仍未释放。"
     "这类残留记录不会很快自行消失，客户端也清不掉（设备返回 404/410）："
-    "请到打印机面板上查看并取消该任务；若面板上找不到该任务，"
-    "请重启该打印机后再重试。"
+    "请到打印机面板上查看并取消该任务；若面板上找不到该任务，请重启该打印机后再重试。"
 )
+
+# ★ 2026-10-22 新增：**先探设备状态**再报的 409 文案。
+#   实测依据（四台真机逐台验，2026-10-22）：
+#     · 设备侧最后一条作业是 Canceled/Aborted ⇒ POST /ScanJobs 返 409，
+#       **响应体全空**，而 pwg:State 仍报 Idle ⇒ 用户只看到「打印机坏了」；
+#     · 有一条 Completed 的设备（.101）⇒ POST **201** ✔；
+#     · DELETE 那几条残留 ⇒ **404/410** ⇒ 客户端清不掉。
+#   ⇒ 所以要说清：**是「上次没扫完」留下的**，不是打印机坏了；
+#     并给出**立刻能做的动作**。
+_CONFLICT_MESSAGE_STALE = (
+    "设备上**最近一次**扫描没有正常结束（作业状态：{state}），"
+    "所以它现在不再受理新的扫描任务。"
+    "请在打印机面板上按「取消 / 确认」键结束那个任务；"
+    "若面板上找不到它，请重启该打印机后重试。"
+)
+
+
+def _conflict_message_for(base: str, session=None) -> str:
+    """409 的文案：**先探一次设备状态** ⇒ 给出准确的因果与恢复动作。
+
+    ★ 判据（实测 2026-10-22，四台真机逐台验）：
+      · 设备侧**最近一条**作业是 Completed ⇒ POST /ScanJobs **201** ✔
+        （`.101`：一条 Aborted + 一条 Completed，照样能扫）；
+      · 最近一条是 Canceled/Aborted ⇒ POST **409**（响应体全空，
+        而 pwg:State 仍报 Idle ⇒ 用户只看到「打印机坏了」）；
+      · DELETE 那几条残留 ⇒ 404/410 ⇒ 客户端清不掉 ⇒ 只能重启打印机。
+    ⇒ 所以判据是「**最近一次有没有正常收尾**」，不是「有没有旧记录」。
+    """
+    try:
+        ok, st = probe_scanner_status(base, timeout=3.0, session=session)
+    except Exception:
+        ok, st = False, {}
+    if ok:
+        last = st.get("last_job_state") or ""
+        has_completed = st.get("has_completed_job")
+        if last and has_completed is False:
+            return _CONFLICT_MESSAGE_STALE.format(state=last)
+    return _CONFLICT_MESSAGE
 
 # 503 的有界退避**按来源分流**（2026-10-21 主控拍板）。
 #
@@ -1089,7 +1179,7 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
             #   立刻报错并给出确定有效的下一步（面板取消 / 重启打印机）。
             # 等待过程可被 cancel_event 随时中断（原先一次 sleep 14 秒不可取消）。
             if conflict_retry >= len(_CONFLICT_BACKOFF_SECONDS):
-                raise ScanDeviceError(_CONFLICT_MESSAGE)
+                raise ScanDeviceError(_conflict_message_for(base, session))
             delay = _CONFLICT_BACKOFF_SECONDS[conflict_retry]
             conflict_retry += 1
             logger.info("扫描任务被占用 (409)，%s 秒后重试: %s", delay, scanner.ip)
@@ -1233,10 +1323,18 @@ def execute_scan(
     finally:
         # 清理打印机上的扫描任务（防止任务累积导致409冲突）
         if job_uri:
-            try:
-                session.delete(job_uri, timeout=3)
-            except Exception:
-                pass
+            # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
+            #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
+            #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
+            #   Canceled/Aborted 记录 ⇒ **那台打印机从此拒接新作业（409）**，
+            #   而客户端再去 DELETE 它只会得到 404/410（清不掉）⇒ 只能重启打印机。
+            #   ⇒ 这几行就是「我自己把机器搞成扫不了」的源头，必须收紧。
+            for _attempt in range(2):
+                try:
+                    session.delete(job_uri, timeout=8)
+                    break
+                except Exception:
+                    continue
         session.close()
 
 
@@ -1426,10 +1524,18 @@ def execute_multipage_scan(
         return pages
     finally:
         if job_uri:
-            try:
-                session.delete(job_uri, timeout=3)
-            except Exception:
-                pass
+            # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
+            #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
+            #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
+            #   Canceled/Aborted 记录 ⇒ **那台打印机从此拒接新作业（409）**，
+            #   而客户端再去 DELETE 它只会得到 404/410（清不掉）⇒ 只能重启打印机。
+            #   ⇒ 这几行就是「我自己把机器搞成扫不了」的源头，必须收紧。
+            for _attempt in range(2):
+                try:
+                    session.delete(job_uri, timeout=8)
+                    break
+                except Exception:
+                    continue
         session.close()
 
 
