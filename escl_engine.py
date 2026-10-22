@@ -6,7 +6,10 @@ eSCL (AirScan) 扫描引擎 — 合并版
   - photo-scan-split: 极简 mDNS 发现
 """
 
+import json
+import json
 import logging
+import os
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -1117,6 +1120,144 @@ def _transport_error_to_device_error(exc: BaseException) -> ScanDeviceError:
     return ScanDeviceError(f"{base}（原始错误类型：{type(exc).__name__}）")
 
 
+
+# ══════════════════════════════════════════════════════════════════
+# 「设备侧没删掉的作业」清单（2026-10-22 新增，治本）
+# ══════════════════════════════════════════════════════════════════
+# ★ 背景（实测 + 公网证据）：
+#   · NAPS2 `EsclScanDriver.cs:213-217`：「Some devices (e.g. Kyocera) **stay busy
+#     until the completed job is deleted** … so we always send DELETE for the job」；
+#     NAPS2 issue #906：「删掉已完成的 job 后设备才解锁」。
+#   · 我们实测：设备在处理中时 `DELETE` **长时间不返回**（6 秒读超时）
+#     ⇒ 旧实现 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧记 Canceled/Aborted
+#     ⇒ **那台打印机从此 POST 409**，客户端再 DELETE 只会 404/410（清不掉）
+#     ⇒ 只能重启打印机。
+#     ⇒ 2026-10-22 实测 `.208` 的两条 Canceled Age=2.0 天、`.111` 的 1.0 天
+#       —— **就是这条路把我自己的三台打印机搞成扫不了的。**
+# ⇒ 做法：DELETE 失败/超时就**记进清单**（持久化，跨进程），
+#   **下一次建 job 之前**先把清单里的作业逐个补删。
+_PENDING_JOBS_FILE = "pending_jobs.json"
+_PENDING_JOBS_MAX = 50
+
+
+def _pending_jobs_path() -> Optional[str]:
+    r"""清单文件位置：%APPDATA%\HP_Scan_Tool\pending_jobs.json（与其它配置同目录）"""
+    appdata = os.environ.get("APPDATA", "")
+    base = appdata if appdata else os.path.expanduser("~")
+    d = os.path.join(base, "HP_Scan_Tool")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    return os.path.join(d, _PENDING_JOBS_FILE)
+
+
+def load_pending_jobs() -> list:
+    """读出「设备侧可能还没删掉的作业」清单（读不到就当空）"""
+    p = _pending_jobs_path()
+    if not p or not os.path.isfile(p):
+        return []
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [str(x) for x in data if isinstance(x, str)]
+    except Exception:
+        return []
+
+
+def save_pending_jobs(uris) -> None:
+    p = _pending_jobs_path()
+    if not p:
+        return
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(sorted(set(uris))[:_PENDING_JOBS_MAX], fh,
+                      ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def remember_pending_job(uri: str) -> None:
+    """记下一个「可能还没被设备删掉」的作业 URI"""
+    if not uri:
+        return
+    try:
+        cur = load_pending_jobs()
+        if uri not in cur:
+            cur.append(uri)
+            save_pending_jobs(cur)
+    except Exception:
+        pass
+
+
+def forget_pending_job(uri: str) -> None:
+    try:
+        cur = load_pending_jobs()
+        if uri in cur:
+            cur.remove(uri)
+            save_pending_jobs(cur)
+    except Exception:
+        pass
+
+
+def _abs_job_uri(base: str, uri: str) -> str:
+    """把设备给的作业 URI 变成绝对 URL。
+
+    ★ 设备报的 `pwg:JobUri` 形如 `/eSCL/ScanJobs/<uuid>` —— 那是**相对主机根**的
+      路径，而 base 形如 `http://host:80/eSCL/` ⇒ 必须取 base 的 **origin** 再拼，
+      否则会拼成 `http://host:80/eSCL/eSCL/ScanJobs/...`（错地址 ⇒ DELETE 404 ⇒
+      被误当成「设备已回收」而从清单里丢掉 ⇒ 恰恰丢掉了最该补删的那条）。
+    """
+    if uri.startswith("http"):
+        return uri
+    root = base.rstrip("/")
+    if "/eSCL" in root:
+        root = root.split("/eSCL")[0]
+    if not uri.startswith("/"):
+        uri = "/" + uri
+    return root + uri
+    root = base.rstrip("/")
+    if not root.endswith("/eSCL"):
+        root += "/eSCL"
+    return root + uri
+
+
+def cleanup_pending_jobs(session=None, base: str = "", timeout: float = 8.0) -> int:
+    """把清单里的作业逐个 DELETE 掉；删成功的从清单移除。
+
+    ★ 在**建新 job 之前**调用 ⇒ 设备不会因为「上次那个作业没删」而拒接新任务。
+    ★ 删不掉的（404/410 = 设备已回收）也**从清单移除** —— 那种记录设备自己会清，
+      留着只是噪音。
+    返回：本次成功删掉的个数。
+    """
+    uris = load_pending_jobs()
+    if not uris:
+        return 0
+    remain = []
+    done = 0
+    for uri in uris:
+        url = _abs_job_uri(base, uri) if base else uri
+        ok = False
+        try:
+            if session is not None:
+                r = session.delete(url, timeout=timeout)
+                ok = r.status_code in (200, 201, 202, 204, 404, 410)
+            else:
+                r = requests.delete(url, timeout=timeout, verify=False)
+                ok = r.status_code in (200, 201, 202, 204, 404, 410)
+        except Exception:
+            ok = False
+        if ok:
+            done += 1
+        else:
+            remain.append(uri)
+    save_pending_jobs(remain)
+    if done:
+        logger.info("清理设备侧残留作业 %d 条（剩余 %d 条待清）", done, len(remain))
+    return done
+
+
+
 def _create_scan_job(session, scanner, resolution, color_mode, output_format, source, duplex,
                       max_pages=1, cancel_event=None):
     """
@@ -1155,6 +1296,13 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     )
 
     headers = {"Content-Type": "application/xml"}
+    # ★ 2026-10-22：**先补删**上次没删掉的作业 ⇒ 设备不会因为
+    #   「上次那个作业没收尾」而拒接新任务（POST 409）。
+    try:
+        cleanup_pending_jobs(session, base)
+    except Exception:
+        pass
+
     job_url = f"{base}/ScanJobs"
 
     def _post():
@@ -1348,6 +1496,10 @@ def execute_scan(
                     break
                 except Exception:
                     continue
+            else:
+                # ★ 两次都没删掉 ⇒ 设备可能还留着它 ⇒ 记进清单，
+                #   **下次建 job 之前**先补删（见 cleanup_pending_jobs）。
+                remember_pending_job(job_uri)
         session.close()
 
 
@@ -1549,6 +1701,10 @@ def execute_multipage_scan(
                     break
                 except Exception:
                     continue
+            else:
+                # ★ 两次都没删掉 ⇒ 设备可能还留着它 ⇒ 记进清单，
+                #   **下次建 job 之前**先补删（见 cleanup_pending_jobs）。
+                remember_pending_job(job_uri)
         session.close()
 
 
