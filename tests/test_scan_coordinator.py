@@ -104,11 +104,11 @@ class TestResolveSource:
             assert coordinator.resolve_source(scanner, "Platen") == ("Platen", False)
             assert probe.call_count == 0
 
-    def test_adf_empty_returns_platen(self, coordinator, scanner):
-        scanner.has_adf = True
+    def test_adf_empty_keeps_feeder(self, coordinator, scanner):
+        """★ 2026-10-22：选输稿器 + 输稿器没纸 ⇒ **保持输稿器**（不再静默改成平板）"""
         with mock.patch("scan_coordinator.probe_scanner_status",
                         return_value=(True, {"state": "Idle", "adf_loaded": False})):
-            assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
+            assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
 
     def test_probe_failure_keeps_requested_source(self, coordinator, scanner):
         """探测失败时必须保留用户请求的来源，不能静默改成平板。
@@ -137,13 +137,13 @@ class TestResolveSource:
             assert coordinator.resolve_source(scanner, "Auto") == ("Platen", False)
         with mock.patch("scan_coordinator.probe_scanner_status",
                         return_value=(True, {"state": "Unknown", "adf_loaded": False})):
-            # Feeder 模式下：探测成功但没纸 -> 落 Platen（不是保留 Feeder）
-            assert coordinator.resolve_source(scanner, "Feeder") == ("Platen", False)
+        # Feeder 模式下：探测成功但没纸 -> **保留 Feeder**（2026-10-22 起不再静默改成平板）
+            assert coordinator.resolve_source(scanner, "Feeder") == ("Feeder", False)
 
     @pytest.mark.parametrize("requested,probe_ok,adf_loaded,has_adf,caps_known,expected", [
         ("Platen", True, True, True, True, ("Platen", False)),   # 显式选平板：保持平板
         ("Feeder", True, True, True, True, ("Feeder", True)),    # 选输稿器 + 有纸
-        ("Feeder", True, False, True, True, ("Platen", False)),  # 选输稿器 + 无纸
+        ("Feeder", True, False, True, True, ("Feeder", False)),  # 选输稿器 + 无纸：保留输稿器（2026-10-22 起不再静默改平板）
         ("Feeder", False, False, True, True, ("Feeder", False)), # 选输稿器 + 探测失败：保留来源
         ("Auto", True, True, True, True, ("Feeder", True)),      # 自动 + 有纸
         ("Auto", True, False, True, True, ("Platen", False)),    # 自动 + 无纸

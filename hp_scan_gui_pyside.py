@@ -7,6 +7,7 @@
 import io
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -199,8 +200,30 @@ ANIM = {
     "slow": 300,
 }
 
-_FONT_FAMILY = "Microsoft YaHei UI"
+# ── 字体 ────────────────────────────────────────────────────────────────
+# ★ 2026-10-22 修：**界面在别的机器上全是方块 □□□**（用户实测：另一台电脑上
+#   整个 UI 的中文全部是方块/乱码）。
+#
+# 根因（三条，缺一不可）：
+#   ① 字体族被**写死**成 "Microsoft YaHei UI" —— 那是 Windows **简体中文版**
+#      才带的字体，**英文版 / 精简版 Windows 根本没装**；
+#   ② 仓库里明明带了 10.5 MB 的思源黑体 `NotoSansSC-Regular.ttf`，但原来的
+#      `load_embedded_font()` 只把它 **注册** 进字体库、**从来没被用上**；
+#   ③ QSS 里又写死了 `font-family` 栈，**盖掉** `app.setFont()`。
+#   ⇒ 本机（有 YaHei UI）界面完全正常 ⇒ **所有本地测试都测不出这个问题**
+#      ⇒ 只有拿到别人的机器上才会暴露。
+#
+# 修法：启动时挑一个**真能渲染汉字**的字体族 ——
+#   ① 优先系统字体（观感与系统一致）；
+#   ② 系统里没有能渲染汉字的字体 ⇒ 用**内嵌**思源黑体；
+#   ③ 两者都不可用 ⇒ 退回系统默认（至少不崩）。
+#   并把选中的族**写进 QSS 的 font-family 栈**（否则 QSS 会盖掉）。
 _FONT_SIZE = 10
+_FONT_FAMILY = "Microsoft YaHei UI"      # 实际取值由 resolve_font_family() 决定
+_FONT_PREFERRED = ("Microsoft YaHei UI", "Microsoft YaHei", "SimSun",
+                   "Noto Sans SC", "Source Han Sans SC")
+_CJK_PROBE = "扫描仪设置保存输稿器墨粉黑白"
+_EMBEDDED_FONT_FAMILY = None
 
 
 def get_resource_path(relative_path):
@@ -225,11 +248,90 @@ def load_stylesheet():
     return ""
 
 
+
+
 def load_embedded_font():
-    """加载嵌入式思源黑体作为备选字体"""
+    """加载内嵌的思源黑体，返回它的 family 名（失败返回 None）。
+
+    ★ 2026-10-22：以前只 `addApplicationFont()` 就完事 —— **注册了却没人用**
+      ⇒ 目标机器没有系统中文字体时，界面所有中文都是方块。
+      现在**返回族名**，交给 `resolve_font_family()` 真正用上。
+    ★ 幂等：已加载过就直接返回（否则重复注册会白占一份内存）。
+    """
+    global _EMBEDDED_FONT_FAMILY
+    if _EMBEDDED_FONT_FAMILY:
+        return _EMBEDDED_FONT_FAMILY
     font_path = get_resource_path(os.path.join("fonts", "NotoSansSC-Regular.ttf"))
-    if os.path.exists(font_path):
-        QFontDatabase.addApplicationFont(font_path)
+    if not os.path.exists(font_path):
+        return None
+    fid = QFontDatabase.addApplicationFont(font_path)
+    if fid == -1:
+        return None
+    fams = QFontDatabase.applicationFontFamilies(fid)
+    if not fams:
+        return None
+    _EMBEDDED_FONT_FAMILY = fams[0]
+    return _EMBEDDED_FONT_FAMILY
+
+
+def font_is_available(family):
+    """这个字体族在**当前系统的字体库**里吗？（存在性判据）
+
+    ★ 为什么不用「能不能渲染汉字」当判据（实测 2026-10-22）：
+      · `QFontMetrics.inFont(ch)` 对**根本不存在的字体**也返回 True
+        （Qt 会静默回退到某个默认字体）⇒ 假阳性；
+      · `QRawFont.supportsCharacter(ch)` 在 Windows 平台上一律返回 False
+        ⇒ 假阴性。
+      ⇒ 两个都不能用。**存在性**才是可靠的：字体库里没有 ⇒ 一定画不出汉字；
+        而 YaHei UI / SimSun / Noto Sans SC 这些**本身就是中文字体**，
+        存在就一定能画。
+    """
+    if not family:
+        return False
+    try:
+        return family in set(QFontDatabase.families())
+    except Exception:       # pragma: no cover - 字体引擎异常不该拖垮启动
+        return False
+
+
+def resolve_font_family():
+    """挑一个**当前机器上有**的中文字体族；都没有 ⇒ 用**内嵌**思源黑体。
+
+    返回 (选中的族, 说明文字)；说明文字用于日志与自检。
+    ★ 顺序：先系统字体（观感与系统一致）→ 再内嵌字体（保证中文能画出来）。
+    ★ 内嵌字体注册后 family 名是 "Noto Sans SC" ⇒ 它也会出现在
+      `QFontDatabase.families()` 里 ⇒ 在没有中文字体的机器上，
+      本函数会自动选中**它**（因为它是我们自己注册进去的）。
+    """
+    global _FONT_FAMILY
+    for cand in _FONT_PREFERRED:
+        if font_is_available(cand):
+            _FONT_FAMILY = cand
+            note = ("内嵌字体 %s" % cand if cand == _EMBEDDED_FONT_FAMILY
+                    else "系统字体 %s" % cand)
+            return _FONT_FAMILY, note
+    if _EMBEDDED_FONT_FAMILY:
+        _FONT_FAMILY = _EMBEDDED_FONT_FAMILY
+        return _FONT_FAMILY, "内嵌字体 %s" % _EMBEDDED_FONT_FAMILY
+    return _FONT_FAMILY, "系统默认（可能缺中文字形）"
+
+
+_QSS_FONT_RE = re.compile(r"(font-family\s*:\s*)([^;}]+)(;|})")
+
+
+def inject_font_family(qss, family):
+    """把选中的字体族**插到 QSS 的 font-family 栈最前面**。
+
+    ★ 为什么必须改 QSS：QSS 里的 `font-family` 会**盖掉** `app.setFont()`
+      ⇒ 只设应用字体不生效（控件照样用 QSS 里那个写死的族）。
+    """
+    if not qss or not family:
+        return qss
+
+    def _sub(m):
+        return '%s"%s", %s%s' % (m.group(1), family, m.group(2).strip(), m.group(3))
+
+    return _QSS_FONT_RE.sub(_sub, qss)
 
 
 def pil_to_qpixmap(img):
@@ -2059,6 +2161,14 @@ class ScanApp(QMainWindow, _UiPostMixin):
         if x is not None and y is not None:
             self.move(x, y)
 
+        # ★ 2026-10-22：**只有真实启动（main()）才允许自动发现**。
+        #   单元测试会直接构造 ScanApp ⇒ 若启动流程无条件触发发现，
+        #   测试进程里就会跑**真实 mDNS/WSD 发现**（zeroconf + WSDiscovery
+        #   + 一堆线程 + 真实套接字）⇒ 违反「测试不发真实网络」，而且会把
+        #   台账 §12 那个潜伏的 pytest 进程 abort 触发出来（实测 4/5 崩）。
+        #   main() 会在建好窗口后把这里打开。
+        self._allow_startup_autodiscover = False
+
         # 加载字体
         load_embedded_font()
 
@@ -2122,6 +2232,16 @@ class ScanApp(QMainWindow, _UiPostMixin):
         QTimer.singleShot(0, self._finish_loading)
         if not saved:
             logger.info("无已保存扫描仪，直接进入主界面")
+            # ★ 2026-10-22：**自动**开始一次后台发现。
+            #   旧行为：只提示「点击『刷新』搜索打印机」⇒ 新装的机器（没有已保存
+            #   设备）打开就是**一张设备卡片都没有**，用户必须手动点刷新；
+            #   而刷新要走一遍 mDNS+WSD 发现（旧实现实测 **18 秒**）
+            #   ⇒ 用户的第一印象就是「这软件卡住了 / 找不到打印机」。
+            #   现在：窗口照常立刻显示，设备在后台自己找出来（实测 5.2 秒）。
+            #   ★ 已有设备的机器**不**自动发现（保持原行为：先显示已保存设备，
+            #     后台只探测它们的能力，不做全网发现）。
+            if getattr(self, "_allow_startup_autodiscover", False):
+                QTimer.singleShot(0, self._auto_discover)
             return
 
         # 第2步：后台并行探测设备能力（不阻塞UI）
@@ -2194,7 +2314,13 @@ class ScanApp(QMainWindow, _UiPostMixin):
         self.show()
         # ★ 批次 4：启动时恢复未完成的文档会话（并**重新登记缓存保护**）
         self._restore_open_sessions()
-        self.status_bar.showMessage("点击「刷新」搜索打印机，或「手动添加」输入IP")
+        # ★ 2026-10-22：文案按「有没有已保存设备」分两种说法
+        if not self.coordinator.scanners:
+            self.status_bar.showMessage(
+                "正在搜索打印机…（也可以点「刷新」或「手动添加」输入IP）")
+        else:
+            self.status_bar.showMessage(
+                "点击「刷新」搜索打印机，或「手动添加」输入IP")
 
     def _build_scanner_panel(self, parent_layout):
         """构建左侧扫描仪列表面板"""
@@ -6362,14 +6488,23 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
+    # ★ 2026-10-22：**先定字体，再套样式表**（QSS 里的 font-family 会
+    #   盖掉 app.setFont() ⇒ 顺序不能反）
+    load_embedded_font()
+    _font_family, _font_note = resolve_font_family()
+    app.setFont(QFont(_font_family, _FONT_SIZE))
+    logger.info("界面字体: %s（%s）", _font_family, _font_note)
+
     # 加载样式表
     qss = load_stylesheet()
     if qss:
-        app.setStyleSheet(qss)
-
-    load_embedded_font()
+        app.setStyleSheet(inject_font_family(qss, _font_family))
 
     window = ScanApp()
+    # ★ 2026-10-22：打开「启动时自动发现」的闸门
+    #   （只有真实启动才允许；单元测试直接构造 ScanApp 时是关的，
+    #    免得测试进程里跑起真实 mDNS/WSD 发现）
+    window._allow_startup_autodiscover = True
     # 不立即 show()，由启动加载界面在探测完成后自动显示
     # window.show()  # 已移至 _on_startup_complete()
 

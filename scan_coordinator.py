@@ -116,7 +116,9 @@ WARN_CAPABILITY_UNKNOWN = WARN_CAPABILITY_QUERY_FAILED
 # ② 能力查询**成功**且解析结果里没有 Adf 段 ⇒ 设备确实没有输稿器
 #    ⇒ 已回退平板，提示用户"设备不支持输稿器"。
 WARN_NO_ADF = "已确认该扫描仪不支持输稿器（ADF），已改为平板（Platen）扫描。"
-WARN_NO_PAPER = "输稿器（ADF）里没有纸，已改为平板（Platen）扫描。"
+WARN_NO_PAPER = (
+    "检测到输稿器（ADF）里没有纸。已按您选择的「输稿器」继续扫描；"
+    "若设备提示「设备没有返回任何扫描数据」，请往输稿器里放入纸张后重试。")
 WARN_PROBE_FAILED = "输稿器（ADF）状态探测失败，已按您选择的「输稿器」继续扫描。"
 
 # 参与"能力是否真的拿到"判定的字段（只看能力，不看身份字段）
@@ -677,6 +679,14 @@ class ScanCoordinator(QObject):
         if requested == "Feeder":
             if loaded:
                 return "Feeder", True, None
+            # ★ 2026-10-22：**不再静默改成平板**。
+            #   用户明确选了「输稿器」⇒ 就按输稿器扫；没纸的话由设备给出
+            #   准确答复（503「输稿器里没有纸」/ 404「设备没有返回任何扫描数据」），
+            #   而不是我们替用户改扫平板、最后报一句没头没脑的「扫描已取消」。
+            #   （本模块自己的注释早就写着「绝不静默把『输稿器』改成『平板』」，
+            #     这里原本是**自相矛盾**的 —— 2026-10-22 对齐。）
+            #   ★「自动」模式仍然按探测结果落平板（那是机器决策，不是用户意图）。
+            return "Feeder", False, WARN_NO_PAPER
             return "Platen", False, WARN_NO_PAPER
         # requested == "Auto"
         if loaded:

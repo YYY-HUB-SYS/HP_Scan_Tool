@@ -212,7 +212,7 @@ def discover_scanners(timeout: float = 4.0) -> list[ScannerInfo]:
 
 
 def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0,
-               extra_ports=()) -> Optional[str]:
+               extra_ports=(), wake_retry: bool = True) -> Optional[str]:
     """
     探测指定 IP 的 eSCL 服务（休眠唤醒仅用于 ReadTimeout）。
 
@@ -296,7 +296,15 @@ def probe_escl(ip: str, port: Optional[int] = None, timeout: float = 2.0,
         return result
 
     # 仅 ReadTimeout 时才做唤醒重试（打印机可能休眠）
-    if err:
+    #
+    # ★ 2026-10-22：`wake_retry=False` 可关掉它。
+    #   背景：WSD 批量发现会对**内网所有** WSD 服务逐个探 eSCL，
+    #   其中大部分不是扫描仪 ⇒ 不可达 ⇒ 走 ReadTimeout 分支 ⇒ 唤醒重试
+    #   又要 +1.5 秒 sleep **再**跑一整轮候选 ⇒ 单 IP 最高 7.5 秒。
+    #   （实测：内网 13 个候选 IP 串行 = 44 秒；13 个里只有 4 台是扫描仪。）
+    #   ⇒ 批量探测时关掉唤醒重试：WSD 刚刚才收到这些设备的回应，
+    #     它们并不需要被『唤醒』。
+    if err and wake_retry:
         try:
             import socket
             s = socket.socket()
@@ -558,7 +566,8 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
       **默认 False** ⇒ 返回契约与既有调用方（cli.py / scan_coordinator.py）
       完全不变（键集合仍是 {"state", "adf_loaded"}）。
     """
-    status = {"state": "Unknown", "adf_loaded": False}
+    status = {"state": "Unknown", "adf_loaded": False,
+              "adf_state": ""}
     if include_jobs:
         status["pending_jobs"] = 0
         status["job_states"] = []
@@ -580,7 +589,13 @@ def probe_scanner_status(escl_url: str, timeout: float = 5.0, session=None,
             if t == "State" and el.text:
                 status["state"] = el.text.strip()
             if t == "AdfState" and el.text:
-                status["adf_loaded"] = "Loaded" in (el.text.strip() or "")
+                _adf = el.text.strip()
+                status["adf_loaded"] = "Loaded" in _adf
+                # ★ 2026-10-22：把 AdfState **原值**也带出来
+                #   （公网实现 NAPS2 / sane-airscan 都细分到
+                #    Empty / Jam / HatchOpen / Mispick …）
+                #   ⇒ 我们才能区分「没纸」与「卡纸」，给出对症指引。
+                status["adf_state"] = _adf
         if include_jobs:
             job_states = _parse_pending_job_states(root)
             status["pending_jobs"] = len(job_states)
@@ -1225,6 +1240,73 @@ def execute_scan(
         session.close()
 
 
+# ── 「设备一个文档都没给」的错误文案与判定（2026-10-22 新增）────────────
+# ★ 为什么要有（用户实测原话：「扫描会自动取消」）：
+#   旧实现把「取页时第一个 NextDocument 就回 404」当成「没有更多页了」**立刻
+#   return**（哪怕 0 页）⇒ 返回空列表 ⇒ 协调器按**取消**处理 ⇒ 界面显示
+#   「扫描已取消」，而真实原因（输稿器没纸 / 设备里没东西可扫）
+#   **一个字都没告诉用户**。
+#
+# ★ eSCL 规范语义（经 node-hp-scan-to 的抓包文档**逐字引用** Mopria eSCL 规范）：
+#     404 = "no more page. The last page has already been transmitted."
+#     410 = "the scan job doesn't exist anymore."
+#     503 = "the job is active, but the scanner can't return the payload at
+#            the moment. Retry later."
+#   ⇒「还没准备好」是 **503** 的语义；404/410 一页都没有 ⇒ 作业确实没产出文档。
+#   ⇒ 公网实现（NAPS2 / sane-airscan）都有独立的 NO_DOCS / FeederEmpty 状态，
+#     **没有一个**把「0 页」报成「取消」。
+_NO_DOCUMENT_MESSAGE_FEEDER = (
+    "设备没有返回任何扫描数据：输稿器（ADF）里没有纸，或纸没有被设备吸入。"
+    "请确认输稿器里已放入纸张后重试。"
+)
+_NO_DOCUMENT_MESSAGE_PLEN = (
+    "设备没有返回任何扫描数据：平板上没有可扫描的文档。"
+    "请把要扫描的纸张放到平板玻璃上后重试。"
+)
+_NO_DOCUMENT_MESSAGE_JAM = (
+    "设备没有返回任何扫描数据：输稿器（ADF）状态异常（卡纸 / 托盘故障 / 盖板未关）。"
+    "请打开打印机面板处理卡纸、关好盖板、放好纸张后重试。"
+)
+
+# 「空 404」时的设备状态复查节流（秒）—— 免得对着设备狂刷状态查询
+_EMPTY_STATUS_PROBE_INTERVAL = 2.0
+
+
+def _no_document_message(source: str, adf_state: str = "") -> str:
+    """按来源给「设备没给出任何数据」的文案（输稿器 / 平板各一套）"""
+    _st = (adf_state or "").strip().lower()
+    if "jam" in _st or "hatchopen" in _st or "tray" in _st:
+        return _NO_DOCUMENT_MESSAGE_JAM
+    if (source or "").strip().lower() == "feeder":
+        return _NO_DOCUMENT_MESSAGE_FEEDER
+    return _NO_DOCUMENT_MESSAGE_PLEN
+
+
+def _device_still_working(session, base: str) -> bool:
+    """设备还在处理这个 job 吗？（区分「还没开始吐数据」与「做完了但没给东西」）
+
+    ★ 依据 ScannerStatus 的 State 与未完成 job 数（`include_jobs=True`）。
+    ★ 探测失败 ⇒ **保守当成"还在忙"**（宁可多等，也不要把"设备慢"误报成失败）。
+    ★ 公网实现（NAPS2 / node-hp-scan-to）判定"作业真结束"靠的正是
+      ScannerStatus 里的 JobState / JobStateReason ⇒ 我们把这条接上了。
+    """
+    try:
+        ok, st = probe_scanner_status(base, timeout=3.0, session=session,
+                                      include_jobs=True)
+    except Exception:
+        return True
+    if not ok:
+        return True
+    try:
+        if int(st.get("pending_jobs") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    state = str(st.get("state") or "").strip().lower()
+    return state in ("processing", "scanning", "transferring", "pending")
+
+
+
 def execute_multipage_scan(
     scanner: ScannerInfo,
     resolution: int = 300,
@@ -1261,6 +1343,16 @@ def execute_multipage_scan(
         pages = []
         nd_url = job_uri.rstrip("/") + "/NextDocument"
         overall_start = time.time()
+        # ★ 2026-10-22：把「**已经拿到过页**」与「**一页都没拿到**」分开处理。
+        #   旧实现：404 ⇒ 立刻 return pages（**哪怕 0 页**）⇒ 空列表
+        #          ⇒ 协调器按**取消**处理 ⇒ 界面「扫描已取消」，无任何指引。
+        #   新实现：
+        #     · 已经拿到过页之后的 404/410 ⇒ 正常收尾（行为不变）；
+        #     · **一页都没拿到**的 404/410 ⇒ 作业没产出任何文档：
+        #         用 ScannerStatus 交叉验证一次（设备还忙？还在处理就继续等；
+        #         闲下来了就确定没产出）⇒ 抛**带指引的错误**，不再冒充"取消"。
+        empty_document_seen = False
+        last_status_probe = 0.0
 
         while time.time() - overall_start < timeout:
             # 检查取消
@@ -1269,6 +1361,7 @@ def execute_multipage_scan(
 
             # 等待当前页面就绪
             page_start = time.time()
+            got_page = False
             while time.time() - page_start < page_timeout:
                 if cancel_event and cancel_event.is_set():
                     return pages if pages else []
@@ -1282,11 +1375,30 @@ def execute_multipage_scan(
                         if progress_callback:
                             progress_callback(len(pages), len(pages))
                         time.sleep(0.3)
+                        got_page = True
                         break
-                    elif r.status_code == 404:
-                        return pages
-                    elif r.status_code == 410:
-                        return pages  # 扫描过期，当前页面不可用
+                    elif r.status_code in (404, 410):
+                        if pages:
+                            # 已经拿到过页 ⇒ 这是「没有更多页了」的正常收尾信号
+                            return pages
+                        # ★ 一页都没有 ⇒ 作业没产出任何文档。
+                        #   规范里「还没准备好」是 503 的语义，404/410 出现即作业
+                        #   已结束；但为防个别机型过早回 404，用 ScannerStatus
+                        #   交叉验证：设备还忙 ⇒ 继续等；闲下来了 ⇒ 确定没产出。
+                        empty_document_seen = True
+                        _now = time.time()
+                        if _now - last_status_probe >= _EMPTY_STATUS_PROBE_INTERVAL:
+                            last_status_probe = _now
+                            if not _device_still_working(session, base):
+                                _adf_state = ""
+                                try:
+                                    _ok, _st = probe_scanner_status(
+                                        base, timeout=3.0, session=session)
+                                    _adf_state = (_st or {}).get("adf_state", "")
+                                except Exception:
+                                    pass
+                                raise ScanDeviceError(
+                                    _no_document_message(source, _adf_state))
                     elif r.status_code == 503:
                         pass
                 except requests.RequestException:
@@ -1296,12 +1408,21 @@ def execute_multipage_scan(
                     if cancel_event and cancel_event.is_set():
                         return pages if pages else []
                     time.sleep(0.1)
-            else:
-                # 单页超时
-                if pages:
-                    break  # 已有页面，结束扫描
-                raise ScanDeviceError(FIRST_PAGE_TIMEOUT_MESSAGE)
 
+            if got_page:
+                continue
+            # ── 页级窗口用完，一页都没拿到 ──
+            if pages:
+                break  # 已有页面，结束扫描
+            if empty_document_seen and not _device_still_working(session, base):
+                raise ScanDeviceError(_no_document_message(source))
+            # 设备还在忙 ⇒ 继续等（外层还有总预算 timeout）
+
+        # ── 总预算用尽 ──
+        if not pages:
+            # ★ 一页都没拿到、又不是用户取消 ⇒ **绝不能**返回空列表
+            #   （空列表会被协调器当成"取消"⇒ 界面显示「扫描已取消」）
+            raise ScanDeviceError(_no_document_message(source))
         return pages
     finally:
         if job_uri:

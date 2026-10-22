@@ -297,8 +297,19 @@ class TestProbeScannerStatus:
         assert st["state"] == "Unknown"
 
     def test_get_scanner_status_contract_unchanged(self):
-        """get_scanner_status 必须保持原有返回契约（cli.py cmd_status 依赖它）"""
+        """get_scanner_status 必须保持**原有键**（cli.py cmd_status 依赖它）
+
+        ★ 2026-10-22：新增 `adf_state`（AdfState 的**原值**）——
+          公网实现（NAPS2 / sane-airscan / node-hp-scan-to）都把 AdfState
+          细分到 Empty / Jam / HatchOpen / Mispick …，我们只做
+          `"Loaded" in text` 的布尔化 ⇒ 卡纸与没纸分不开，给不出对症指引。
+        ★ **cli.py 不受影响**：它用的是 `if "adf_loaded" in status` 这种
+          **存在性**判断，不是精确键集合 ⇒ 多一个键不会破坏它。
+        """
         with mock.patch("escl_engine.requests.get", return_value=_Resp(200, STATUS_XML)):
             st = escl_engine.get_scanner_status("http://1.2.3.4/eSCL/")
-        assert set(st.keys()) == {"state", "adf_loaded"}
+        assert {"state", "adf_loaded"} <= set(st.keys())
         assert st["state"] == "Idle"
+        assert st["adf_loaded"] is False
+        # ★ AdfState 原值（2026-10-22 新增）：能区分「没纸」与「卡纸」
+        assert st["adf_state"] == "ScannerAdfEmpty"

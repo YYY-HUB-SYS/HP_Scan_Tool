@@ -488,19 +488,28 @@ class TestBackoffLadder:
 
 class TestExistingContractsUnbroken:
     def test_get_scanner_status_contract_unchanged(self):
-        """get_scanner_status 的返回契约不得变（cli.py cmd_status 依赖它）。"""
+        """get_scanner_status 的**原有键**不得变（cli.py cmd_status 依赖它）。
+
+        ★ 2026-10-22：新增 `adf_state`（AdfState 原值）⇒ 键集合多一个。
+          ★ **cli.py 不受影响**：它用的是 `if "adf_loaded" in status` 这种
+            **存在性**判断，不是精确键集合。
+        """
         with mock.patch("escl_engine.requests.get",
                         return_value=_Resp(200, _STATUS_IDLE)):
             st = escl_engine.get_scanner_status("http://192.168.1.50/eSCL/")
-        assert set(st.keys()) == {"state", "adf_loaded"}
+        assert {"state", "adf_loaded"} <= set(st.keys())
 
     def test_probe_scanner_status_default_contract_unchanged(self):
-        """默认调用 probe_scanner_status 不得多吐键（保持既有契约）。"""
+        """默认调用 probe_scanner_status 必须带上**原有键**（保持既有契约）。
+
+        ★ 2026-10-22：额外多一个 `adf_state`（AdfState 原值，用来区分
+          「没纸」与「卡纸」）；`include_jobs=True` 时的既有键不受影响。
+        """
         with mock.patch("escl_engine.requests.get",
                         return_value=_Resp(200, _STATUS_IDLE)):
             ok, st = escl_engine.probe_scanner_status("http://192.168.1.50/eSCL/")
         assert ok is True
-        assert set(st.keys()) == {"state", "adf_loaded"}
+        assert {"state", "adf_loaded"} <= set(st.keys())
 
     def test_escl_engine_does_not_import_qt(self):
         """escl_engine 不得 import Qt（CLI 也要能用它）。"""

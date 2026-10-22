@@ -281,12 +281,12 @@ class TestSourceDecisionWithKnownCapability:
                         return_value=(True, {"state": "Idle", "adf_loaded": True})):
             assert coordinator.resolve_source(s, "Feeder") == ("Feeder", True)
 
-        # ③ 输稿器无纸 → 回退平板（带 WARN_NO_PAPER）
+        # ③ 输稿器无纸 → **保留输稿器**（2026-10-22 起不再静默改成平板）（带 WARN_NO_PAPER）
         s.has_adf = True
         with mock.patch("scan_coordinator.probe_scanner_status",
                         return_value=(True, {"state": "Idle", "adf_loaded": False})):
             source, adf, warning = coordinator.resolve_source_detailed(s, "Feeder")
-        assert (source, adf) == ("Platen", False)
+        assert (source, adf) == ("Feeder", False)
         assert warning == scan_coordinator.WARN_NO_PAPER
 
         # ④ 自动 → 由探测决定
