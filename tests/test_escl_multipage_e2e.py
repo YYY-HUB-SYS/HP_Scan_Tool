@@ -104,6 +104,12 @@ class _FakeSession:
         self.calls.append(("GET", url))
         self.get_timeouts.append(timeout)
         if not self._get_resps:
+            if timeout == _CLEANUP_TIMEOUT:
+                # ★ 收尾补取是**有界**的：队列空了 ⇒ 「没有更多文档」⇒ 404
+                #   （确定答复 ⇒ 调用方可以放心删作业）。
+                #   注意：**取页轮询**（timeout=15）队列空了仍然要炸 ——
+                #   那条守护（「轮询不许多发」）保持原样，不放宽。
+                return _Resp(404)
             raise AssertionError("协议层发出了多余的 GET 请求: %s" % url)
         nxt = self._get_resps.pop(0)
         if callable(nxt):
@@ -135,7 +141,7 @@ class _FakeSession:
         return [t for t in self.get_timeouts if t != _CLEANUP_TIMEOUT]
 
     def cleanup_gets(self):
-        """**收尾补取**的 GET（有界，至多 1 次、至多 3 秒）。"""
+        """**收尾补取**的 GET（有界：每次 3 秒超时、至多 3 次）。"""
         return [t for t in self.get_timeouts if t == _CLEANUP_TIMEOUT]
 
     @property
@@ -366,10 +372,10 @@ class TestMultipageCancel:
         assert result == [], "取消且未取到页时应返回空列表，实际: %r" % (result,)
         assert session.polling_gets() == [], \
             "已取消就不该再轮询取页，实际轮询 %d 次" % len(session.polling_gets())
-        # ★ 允许**至多 1 次**收尾补取（3 秒、有界）：设备可能还攥着那一页，
+        # ★ 允许**有界（至多 3 次）**的收尾补取（每次 3 秒超时）：设备可能还攥着那一页，
         #   不取走它 ⇒ 那台打印机会从此拒接新作业（409）。
-        assert len(session.cleanup_gets()) <= 1, \
-            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
+        assert len(session.cleanup_gets()) <= 3, \
+            "收尾补取有界（至多 3 次），实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_still_deletes_job(self):
         """取消也要清理设备上的 job（否则设备侧任务累积 → 后续 409）。"""
@@ -422,8 +428,8 @@ class TestExecuteScanCancelReturnsEmpty:
         assert result[1] == "jpg", "取消时仍要报出扩展名，实际: %r" % (result[1],)
         assert session.polling_gets() == [], \
             "已取消就不该轮询取页，实际轮询 %d 次" % len(session.polling_gets())
-        assert len(session.cleanup_gets()) <= 1, \
-            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
+        assert len(session.cleanup_gets()) <= 3, \
+            "收尾补取有界（至多 3 次），实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_during_polling_returns_none_data(self):
         """取页轮询途中被取消 ⇒ 返回 (None, ext)，并立刻停止轮询。"""
@@ -441,10 +447,10 @@ class TestExecuteScanCancelReturnsEmpty:
             "轮询中取消必须返回 (None, ext)，实际: %r" % (result,)
         assert len(session.polling_gets()) == 1, \
             "取消后必须立刻停止轮询，实际轮询 GET %d 次" % len(session.polling_gets())
-        # ★ 收尾补取（3 秒、有界，至多 1 次）允许发生 —— 它不是"继续轮询"，
+        # ★ 收尾补取（有界：每次 3 秒超时、至多 3 次）允许发生 —— 它不是"继续轮询"，
         #   而是去把设备还攥着的那一页取走，否则那台打印机会卡成 409。
-        assert len(session.cleanup_gets()) <= 1, \
-            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
+        assert len(session.cleanup_gets()) <= 3, \
+            "收尾补取有界（至多 3 次），实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_does_not_raise_any_exception(self):
         """★ 取消**不抛异常** —— 既不是 ScanCancelled，也不是别的类型。"""

@@ -31,12 +31,23 @@ class _Resp:
 
 
 class _Session:
-    """记录 DELETE 的假 session"""
+    """记录 DELETE 的假 session
+
+    ★ 2026-10-24：`cleanup_pending_jobs` 现在**先取文档再删**（真机实测：
+      不取走文档就删 ⇒ 设备端的忙标志解不开 ⇒ 那台打印机长期 409），
+      所以这个假 session 也要能回答 GET NextDocument。
+      这里回 **404** = 「设备已经没有文档了」⇒ 补取拿到**确定答复** ⇒ 可以删。
+    """
 
     def __init__(self, results=None, raise_on=()):
         self.results = list(results or [])
         self.raise_on = set(raise_on)
         self.deleted = []
+        self.gets = []
+
+    def get(self, url, timeout=None):
+        self.gets.append(url)
+        return _Resp(404)
 
     def delete(self, url, timeout=None):
         self.deleted.append(url)
