@@ -23,6 +23,14 @@ eSCL 多页扫描整链路 + 取页轮询取消语义测试 — HP Scan Tool v4.
     —— 注意这是 **2 元组**而不是 list，与上面两个取消分支**形态不一致**
     （产品代码现状；本文件只如实断言，**不改产品代码**，已上报主控拍板）。
 
+★ **2026-10-23 增补**：取消/失败的收尾现在会**补取一次文档**再删作业
+  （`escl_engine._drain_job`，**3 秒超时、有界**）——
+  真机实测（台账 §13.23）：设备 POST 之后会自己扫好一页**攥在手里**，
+  客户端不取走就 DELETE ⇒ 设备的「忙」标志解不开 ⇒ **那台打印机从此 409**。
+  ⇒ 守护口径相应调整为：
+    · **轮询取页**（超时 15 秒）：取消后必须**立刻停止**（计数必须保持原样）；
+    · **收尾补取**（超时 3 秒）：**至多允许 1 次** —— 它不是"继续轮询"。
+
 ★ 本文件**不发任何真实 HTTP**：`requests.Session` 被替换成记录用的假 session，
 另有 autouse 护栏把 `requests.adapters.HTTPAdapter.send` 打成必炸 —— 万一实现
 绕过假 session 直接调 requests，会立刻失败而不是偷偷打真机。
@@ -47,6 +55,10 @@ ND_URL = JOB_URI + "/NextDocument"
 PAGE1 = b"\xff\xd8PAGE-1\xff\xd9"
 PAGE2 = b"\xff\xd8PAGE-2\xff\xd9"
 PAGE3 = b"\xff\xd8PAGE-3\xff\xd9"
+
+# ★ 收尾补取（`_drain_job`）用的超时值 —— 与取页轮询的 15 秒**故意不同**，
+#   好让守护测试能区分"还在轮询"与"收尾时把设备攥着的那页取走"。
+_CLEANUP_TIMEOUT = 3.0
 
 
 class _Resp:
@@ -112,6 +124,19 @@ class _FakeSession:
 
     def urls(self, method):
         return [u for m, u in self.calls if m == method]
+
+    def polling_gets(self):
+        """**轮询取页**的 GET（取页超时 15 秒）。
+
+        ★ 收尾补取（`_drain_job`）用的是 **3 秒**超时 ⇒ 用超时值就能把
+          「还在轮询」与「收尾时把设备攥着的那页取走」区分开 ——
+          守护要盯的是**别继续轮询**，不是「一次 HTTP 都不许发」。
+        """
+        return [t for t in self.get_timeouts if t != _CLEANUP_TIMEOUT]
+
+    def cleanup_gets(self):
+        """**收尾补取**的 GET（有界，至多 1 次、至多 3 秒）。"""
+        return [t for t in self.get_timeouts if t == _CLEANUP_TIMEOUT]
 
     @property
     def pending_gets(self):
@@ -339,8 +364,12 @@ class TestMultipageCancel:
 
         assert isinstance(result, list), "返回的必须是列表，实际: %r" % (type(result),)
         assert result == [], "取消且未取到页时应返回空列表，实际: %r" % (result,)
-        assert session.urls("GET") == [], \
-            "已取消就不该再取页，实际: %r" % (session.urls("GET"),)
+        assert session.polling_gets() == [], \
+            "已取消就不该再轮询取页，实际轮询 %d 次" % len(session.polling_gets())
+        # ★ 允许**至多 1 次**收尾补取（3 秒、有界）：设备可能还攥着那一页，
+        #   不取走它 ⇒ 那台打印机会从此拒接新作业（409）。
+        assert len(session.cleanup_gets()) <= 1, \
+            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_still_deletes_job(self):
         """取消也要清理设备上的 job（否则设备侧任务累积 → 后续 409）。"""
@@ -391,8 +420,10 @@ class TestExecuteScanCancelReturnsEmpty:
         assert len(result) == 2, "返回的必须是 (数据, 扩展名)，实际: %r" % (result,)
         assert result[0] is None, "取消时数据必须是 None（不是空 bytes），实际: %r" % (result[0],)
         assert result[1] == "jpg", "取消时仍要报出扩展名，实际: %r" % (result[1],)
-        assert session.urls("GET") == [], \
-            "已取消就不该取页，实际: %r" % (session.urls("GET"),)
+        assert session.polling_gets() == [], \
+            "已取消就不该轮询取页，实际轮询 %d 次" % len(session.polling_gets())
+        assert len(session.cleanup_gets()) <= 1, \
+            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_during_polling_returns_none_data(self):
         """取页轮询途中被取消 ⇒ 返回 (None, ext)，并立刻停止轮询。"""
@@ -408,9 +439,12 @@ class TestExecuteScanCancelReturnsEmpty:
 
         assert result == (None, "jpg"), \
             "轮询中取消必须返回 (None, ext)，实际: %r" % (result,)
-        assert len(session.urls("GET")) == 1, \
-            "取消后必须立刻停止轮询，实际 GET %d 次" % len(session.urls("GET"))
-        assert session.pending_gets == 1, "取消后不该再取下一页"
+        assert len(session.polling_gets()) == 1, \
+            "取消后必须立刻停止轮询，实际轮询 GET %d 次" % len(session.polling_gets())
+        # ★ 收尾补取（3 秒、有界，至多 1 次）允许发生 —— 它不是"继续轮询"，
+        #   而是去把设备还攥着的那一页取走，否则那台打印机会卡成 409。
+        assert len(session.cleanup_gets()) <= 1, \
+            "收尾补取至多 1 次，实际 %d 次" % len(session.cleanup_gets())
 
     def test_cancel_does_not_raise_any_exception(self):
         """★ 取消**不抛异常** —— 既不是 ScanCancelled，也不是别的类型。"""

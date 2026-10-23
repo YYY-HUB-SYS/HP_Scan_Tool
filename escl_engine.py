@@ -1253,6 +1253,21 @@ def cleanup_pending_jobs(session=None, base: str = "", timeout: float = 8.0) -> 
     for uri in uris:
         url = _abs_job_uri(base, uri) if base else uri
         ok = False
+        # ★ 2026-10-23：**先取走文档、再删**（真机实测，见 §13.23）。
+        #   上次没删掉的作业，设备可能还攥着那一页；直接 DELETE 解不开设备的
+        #   「忙」标志（DELETE 200 但设备仍然 409）⇒ 补删时先把文档取走。
+        try:
+            if session is not None:
+                _drain_job(session, url, max_gets=1, timeout=min(timeout, 5.0))
+            else:
+                tmp = requests.Session()
+                tmp.verify = False
+                try:
+                    _drain_job(tmp, url, max_gets=1, timeout=min(timeout, 5.0))
+                finally:
+                    tmp.close()
+        except Exception:
+            pass
         try:
             if session is not None:
                 r = session.delete(url, timeout=timeout)
@@ -1438,6 +1453,43 @@ def _create_scan_job(session, scanner, resolution, color_mode, output_format, so
     return base, job_uri, ext
 
 
+def _drain_job(session, job_uri, max_gets: int = 2, timeout: float = 5.0) -> int:
+    """把作业里**还没被取走的文档**取出来（best-effort，出错就当没取到）。
+
+    ★ 为什么必须有这一步（2026-10-23 真机实测，见台账 §13.23）：
+      设备在 POST 之后会**自己扫好一页、把它攥在手里** ——
+      ScannerStatus 里表现为 ``Processing`` + ``ImagesCompleted=1``。
+      客户端如果**不取走文档就直接 DELETE**，设备端的「忙」标志**解不开**：
+      实测 DELETE 返回 **200**，设备**仍然 409** 拒接新作业
+      ⇒ 那台打印机在很长一段时间里扫不了东西。
+      ⇒ 收尾顺序必须是：**先把文档取走（NextDocument），再 DELETE**。
+
+    - 只在「**这一页我们没拿到**」时调用（已经取过的作业再取一次只会 404）。
+    - 最多取 ``max_gets`` 页、每页最多 ``timeout`` 秒 ⇒ 不会拖住主流程。
+    - 任何异常都吞掉 —— 收尾不能反过来把一次成功的扫描变成失败。
+    """
+    if not job_uri:
+        return 0
+    url = job_uri.rstrip("/") + "/NextDocument"
+    total = 0
+    for _ in range(max(0, int(max_gets))):
+        try:
+            r = session.get(url, timeout=timeout)
+        except Exception:
+            break
+        code = getattr(r, "status_code", 0)
+        if code == 200:
+            try:
+                total += len(r.content or b"")
+            except Exception:
+                pass
+            continue          # 可能还有下一页
+        if code in (404, 410):
+            break             # 没有更多页了
+        break                 # 503 / 其它：别死磕
+    return total
+
+
 def execute_scan(
     scanner: ScannerInfo,
     resolution: int = 300,
@@ -1455,6 +1507,7 @@ def execute_scan(
     session = requests.Session()
     session.verify = False
     job_uri = None
+    got_document = False          # ★ 这一页我们到底拿到没有（决定收尾要不要先取文档）
     ext = REQUEST_FORMAT.get((output_format or "jpg").lower(), ("image/jpeg", "jpg"))[1]
 
     try:
@@ -1480,6 +1533,7 @@ def execute_scan(
                     lambda: session.get(nd_url, timeout=15),
                     _wall_clock_for(15), "取扫描数据")
                 if r.status_code == 200:
+                    got_document = True
                     return r.content, ext
                 elif r.status_code == 503:
                     pass  # 扫描进行中
@@ -1499,6 +1553,16 @@ def execute_scan(
     finally:
         # 清理打印机上的扫描任务（防止任务累积导致409冲突）
         if job_uri:
+            # ★ 2026-10-23：收尾**必须先取文档、再删作业**。
+            #   实测：设备 POST 之后会自己扫好一页攥在手里（Processing +
+            #   ImagesCompleted=1）；客户端不取走就直接 DELETE ⇒ 设备端的
+            #   「忙」标志**解不开**（DELETE 返回 200，设备仍然 409）
+            #   ⇒ 那台打印机长时间扫不了东西。
+            #   ⇒ 只有「我们一页都没拿到」（取消/超时/无文档）时才有未取走的
+            #      文档要取；已经拿到过文档的作业再取一次只会 404，不必白花时间。
+            if not got_document:
+                # ★ 有界：只补取一次、最多 3 秒 ⇒ 取消/超时不会因此"卡住"
+                _drain_job(session, job_uri, max_gets=1, timeout=3.0)
             # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
             #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
             #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
@@ -1704,6 +1768,13 @@ def execute_multipage_scan(
         return pages
     finally:
         if job_uri:
+            # ★ 2026-10-23：收尾**必须先取文档、再删作业**（真机实测，见 §13.23）。
+            #   设备 POST 之后会自己扫好一页攥在手里；客户端不取走就直接 DELETE
+            #   ⇒ 设备的「忙」标志解不开（DELETE 200 但设备仍然 409）。
+            #   ⇒ 只有「我们一页都没拿到」（取消/超时/无文档）时才需要补取。
+            if not pages:
+                # ★ 有界：只补取一次、最多 3 秒
+                _drain_job(session, job_uri, max_gets=1, timeout=3.0)
             # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
             #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
             #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
