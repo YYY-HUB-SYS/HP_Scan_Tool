@@ -103,7 +103,8 @@ class TestActionableGuidanceSurfaced:
         assert rc != 0, "失败退出码必须非 0"
         err = capsys.readouterr().err
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
-        assert "不会很快自行消失" in err, "必须告诉用户残留记录不会自行回收"
+        assert "打印机面板" in err, "必须告诉用户去面板处理"
+        assert "断电" in err, "必须告诉用户断电重启（面板重启可能清不掉）"
 
     def test_409_guidance_has_no_python_traceback_in_real_process(self, tmp_path):
         """★ 子进程级判据（复审 N-1）：**真实 CLI 进程**的 stderr 不得带 traceback。
@@ -121,7 +122,8 @@ class TestActionableGuidanceSurfaced:
         assert rc != 0, "失败退出码必须非 0"
         assert out == "", f"失败时 stdout 必须为空，实际 {out!r}"
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
-        assert "不会很快自行消失" in err, "必须告诉用户残留记录不会自行回收"
+        assert "打印机面板" in err, "必须告诉用户去面板处理"
+        assert "断电" in err, "必须告诉用户断电重启（面板重启可能清不掉）"
         assert "Traceback" not in err, (
             "真实 CLI 进程的 stderr 不得带 traceback；实际 %r" % err)
         assert "  File " not in err, (

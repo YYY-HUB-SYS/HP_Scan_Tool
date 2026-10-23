@@ -106,26 +106,46 @@ class TestConflictMessagePicksTheRightStory:
             return escl_engine._conflict_message_for("http://1.2.3.4/eSCL/")
 
     def test_stale_device_gets_the_precise_message(self):
-        """没有 Completed ⇒ 说清「上次没正常结束」+ 给出动作"""
+        """没有 Completed ⇒ 说清「上次没正常结束」+ 是哪个状态"""
         msg = self._msg([(200, "Canceled"), (300, "Aborted")])
         assert "没有正常结束" in msg, msg
         assert "Canceled" in msg or "Aborted" in msg, msg
         assert "打印机面板" in msg, msg
-        assert "重启" in msg, msg
+        assert "断电" in msg, "必须给出断电指引（面板重启可能清不掉）"
 
     def test_device_with_completed_job_gets_generic_message(self):
         """有 Completed（这台机器其实能扫）⇒ 不要说"上次没扫完"（那是误导）"""
         msg = self._msg([(100, "Completed"), (300, "Aborted")])
         assert "没有正常结束" not in msg, msg
+        assert "打印机面板" in msg, msg
+        assert "断电" in msg, msg
+
+    def test_no_records_at_all_gets_the_internal_marker_message(self):
+        """★ 一条记录都没有 ⇒ 设备内部还留着标记（状态接口查不到）⇒ 必须说断电
+
+        ★ 实测 2026-10-23：17.17.171.208 / .111 的作业记录**已经空了**
+        （被重启过、记录已被设备清掉）⇒ **却仍然 409** ⇒ 那个标记在设备内部、
+        状态接口查不到 ⇒ 面板上的「重启」键可能清不掉，**必须断电**。
+        """
+        msg = self._msg([])
+        assert "查不到任何作业记录" in msg, msg
+        assert "断电" in msg, msg
+        assert "最近一次" not in msg, "没有记录时不能说『最近一次』"
+
+    def test_all_three_variants_mention_power_cycle(self):
+        """三种措辞**共有**的关键信息：面板 + 断电 10 秒"""
+        for jobs in ([(200, "Canceled")], [(100, "Completed")], []):
+            msg = self._msg(jobs)
+            assert "打印机面板" in msg, msg
+            assert "断电" in msg, msg
 
     def test_message_never_promises_a_wait_time(self):
         """★ 不得再承诺"等 N 分钟就会好"（实测最长 30 天都不回收）"""
-        for jobs in ([(200, "Canceled")], [(100, "Completed"), (300, "Aborted")]):
+        for jobs in ([(200, "Canceled")], [(100, "Completed"), (300, "Aborted")],
+                     []):
             msg = self._msg(jobs)
             assert "15-20 分钟" not in msg, msg
             assert "分钟" not in msg, msg
-
-
 class TestJobCleanupIsNotAbandoned:
     """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ DELETE 必须给足时间"""
 

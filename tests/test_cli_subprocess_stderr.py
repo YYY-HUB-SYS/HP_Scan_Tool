@@ -55,7 +55,8 @@ class TestActionableErrorHasNoTracebackInRealProcess:
         rc, out, err = conflict_run
         assert rc != 0, "失败退出码必须非 0"
         assert "打印机面板" in err, "必须告诉用户去打印机面板取消任务"
-        assert "不会很快自行消失" in err, "必须告诉用户残留记录不会自行回收"
+        assert "打印机面板" in err, "必须告诉用户去面板处理"
+        assert "断电" in err, "必须告诉用户断电重启（面板重启可能清不掉）"
 
     def test_stderr_has_no_traceback(self, conflict_run):
         rc, out, err = conflict_run
