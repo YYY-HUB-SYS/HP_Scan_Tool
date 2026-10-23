@@ -138,6 +138,26 @@ if size < 5 * 1024 * 1024:
     print("!! 安装包只有 %.1f MiB ⇒ 多半没装上运行库，**不出半成品**" % (size / 1048576.0))
     sys.exit(1)
 
+# ★ 2026-10-24：清单（build/release/MANIFEST.txt）必须**跟着这次构建**重生成。
+#   实测过：重打安装包后，清单里**还是上一次**的字节数与 SHA256
+#   （MANIFEST 只有手动跑 tools/verify_release.py 才会更新，而本脚本从没调用它）
+#   ⇒ 谁看那份清单都会被误导。verify_release.py 是 MANIFEST 的唯一生成者
+#   ⇒ 这里直接调它（顺带把 onedir 完整性/残留检查也过一遍）。
+print("\n=== ③' 出包清单（MANIFEST）重生成 ===", flush=True)
+if run([PY, os.path.join(HERE, "tools", "verify_release.py"), "--quiet"], cwd=HERE) != 0:
+    print("!! 清单重生成失败（tools/verify_release.py）⇒ **不出半成品**")
+    sys.exit(1)
+_manifest = os.path.join(RELEASE_DIR, "MANIFEST.txt")
+if os.path.isfile(_manifest):
+    _mtext = open(_manifest, encoding="utf-8", errors="replace").read()
+    if (digest not in _mtext) or (str(size) not in _mtext):
+        print("!! 清单里没有本次的字节数/SHA256 ⇒ 清单不可信")
+        sys.exit(1)
+    print("  清单已含本次构建的字节数与 SHA256 ✔")
+else:
+    print("!! 清单文件没生成 ⇒ **不出半成品**")
+    sys.exit(1)
+
 print("\n=== 完成 ===")
 print("  安装包: %s" % setup)
 print("  下一步：")

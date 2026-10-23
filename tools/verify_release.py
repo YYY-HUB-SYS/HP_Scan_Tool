@@ -110,8 +110,16 @@ lines = ["# HP Scan Tool 出包清单",
          "  %s" % os.path.basename(setup),
          "  字节: %d" % size,
          "  SHA256: %s" % sha256(setup),
-         "",
-         "[onedir 产物目录] %s" % os.path.relpath(ONEDIR, ROOT),
+         ""]
+# ★ 2026-10-24：便携版（onefile）**也是交付物**，清单里必须有它 ——
+#   否则拿到清单的人没法核对「免安装备选」到底是哪一版、字节对不对。
+PORTABLE = os.path.join(ROOT, "dist", "HP_Scan_Tool.exe")
+if os.path.isfile(PORTABLE):
+    lines += ["[便携版 onefile] dist\\HP_Scan_Tool.exe",
+              "  字节: %d" % os.path.getsize(PORTABLE),
+              "  SHA256: %s" % sha256(PORTABLE),
+              ""]
+lines += ["[onedir 产物目录] %s" % os.path.relpath(ONEDIR, ROOT),
          "  文件数: %d" % len(files),
          "  合计: %d 字节（%s）" % (total, human(total)),
          ""]
