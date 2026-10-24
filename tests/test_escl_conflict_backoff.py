@@ -135,8 +135,15 @@ class TestConflictMessageTellsTtl:
         """★ 2026-10-22：文案**不得**再承诺"等 15-20 分钟就会好"。
 
         实测：残留记录最长 30 天仍未回收 ⇒ 承诺具体分钟数是**假承诺**，
-        会让用户对着打印机白等。判据：错误文案里不得出现任何
-        "N 分钟"式的等待承诺。
+        会让用户对着打印机白等。
+
+        ★ **2026-10-24 口径细化**（别与"开机要几分钟才就绪"混为一谈）：
+          · **禁止**：把"分钟"用在「等一等设备自己会恢复」上（假承诺）；
+          · **允许且必须**：写明「**等打印机启动完成（约 5 分钟）**」——
+            那是**实测事实**（2026-10-24 `.111`：重启后第 5 分钟才受理新作业）。
+            没有这句，用户重启完**马上扫**照样撞 409 ⇒ 会以为这招没用。
+        ⇒ 判据因此从"不得出现任何分钟数"改成"**不得承诺自愈**"，
+          并另加一条"必须写明等启动完成"（见 test_boot_wait_is_mentioned）。
         """
         session = mock.MagicMock()
         session.post.return_value = _Resp(409, "busy")
@@ -147,8 +154,23 @@ class TestConflictMessageTellsTtl:
 
         msg = str(exc.value)
         assert "15-20 分钟" not in msg, f"不得再承诺具体等待分钟数: {msg}"
-        assert not re.search(r"\d+\s*分钟", msg), (
-            "不得出现任何形式的等待分钟数承诺: %s" % msg)
+        for forbidden in ("等一会儿就好", "等几分钟就好", "会自己恢复",
+                          "自行恢复", "很快就会好"):
+            assert forbidden not in msg, f"不得承诺设备会自愈: {msg}"
+
+    def test_boot_wait_is_mentioned(self):
+        """★ 必须写明「等打印机启动完成」——实测重启后第 5 分钟才受理（2026-10-24）。"""
+        session = mock.MagicMock()
+        session.post.return_value = _Resp(409, "busy")
+
+        with mock.patch("escl_engine.time.sleep"):
+            with pytest.raises(RuntimeError) as exc:
+                _create(session)
+
+        msg = str(exc.value)
+        assert "启动" in msg, f"必须写明要等打印机启动完成: {msg}"
+        assert "分钟" in msg, f"必须给出大致的就绪时间: {msg}"
+        assert "再试" in msg, f"必须说明等完再试: {msg}"
 
     def test_message_does_not_claim_model_cannot_cleanup(self):
         """★ 2026-10-22：真机实测该型号**支持逐个删** job（DELETE 具体 URI ⇒ 200），

@@ -201,6 +201,18 @@ if result.returncode == 0:
         print(f"\n打包成功!")
         print(f"  位置: {exe}")
         print(f"  大小: {size_mb:.1f} MB")
+        # ★ 2026-10-24：便携版打完 ⇒ **清单必须跟着重生成**。
+        #   清单（build/release/MANIFEST.txt）里也记了便携版的大小与 SHA256，
+        #   而清单是在**安装包**那一步生成的（那时便携版还是上一版）⇒
+        #   不在这里补一次，清单里的便携版永远是旧的
+        #   （实测：打包后清单对不上便携版 ⇒ 被 tests/test_build_chain_manifest.py 抓到）。
+        _setup = os.path.join(HERE, "build", "release", "HP_Scan_Tool_Setup_v4.0.0.0.exe")
+        _verify = os.path.join(HERE, "tools", "verify_release.py")
+        if os.path.isfile(_setup) and os.path.isfile(_verify):
+            print("  ⇒ 重生成出包清单（MANIFEST，含本次便携版）")
+            subprocess.run([sys.executable, _verify, "--quiet"], cwd=HERE)
+        else:
+            print("  （还没有安装包 ⇒ 清单留待 build_installer.py 生成）")
 else:
     print(f"\n打包失败，返回码: {result.returncode}")
     sys.exit(1)
