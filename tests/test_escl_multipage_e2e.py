@@ -196,6 +196,18 @@ def _session(get_resps=(), post_status=201, post_headers=None):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_appdata(tmp_path, monkeypatch):
+    """★ 收尾在取不到文档时会把作业记进待清清单
+    （%APPDATA%\\HP_Scan_Tool\\pending_jobs.json）
+    ⇒ 测试必须隔离 APPDATA，否则会污染**用户真实**的清单
+    （清单里若留下真机 URI，下次运行会真的去设备上取那个作业）。"""
+    appdata = tmp_path / "appdata"
+    (appdata / "HP_Scan_Tool").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    yield appdata
+
+
+@pytest.fixture(autouse=True)
 def _no_real_http():
     """护栏：本文件的用例**一个真实请求都不许发**。
 
@@ -222,14 +234,16 @@ class TestMultipageFullChain:
 
         _run_multipage(session, source="Feeder")
 
-        assert session.methods() == ["POST", "GET", "GET", "GET", "DELETE"], \
-            "动作序列不对: %r" % (session.calls,)
+        assert session.methods() == ["POST", "GET", "GET", "GET"], \
+            "★ 收尾绝不能有 DELETE（取消设备上的作业 ⇒ M232 永久锁死），" \
+            "实际: %r" % (session.calls,)
         assert session.urls("POST") == [SCANJOBS_URL], \
             "建 job 必须打到 /ScanJobs，实际: %r" % (session.urls("POST"),)
         assert session.urls("GET") == [ND_URL, ND_URL, ND_URL], \
             "取页必须打到 {job_uri}/NextDocument，实际: %r" % (session.urls("GET"),)
-        assert session.deleted == [JOB_URI], \
-            "收尾必须 DELETE 建出来的 job，实际: %r" % (session.deleted,)
+        assert session.deleted == [], \
+            "★ 收尾绝不能 DELETE 建出来的 job（DELETE = 取消 = 锁死设备），" \
+            "实际: %r" % (session.deleted,)
 
     def test_page_count_order_and_bytes(self):
         """页数 / 页序 / 每页字节内容 —— 少取一页或顺序颠倒都必须红。"""
@@ -281,14 +295,15 @@ class TestMultipageFullChain:
         assert [data for data, _e in result] == [PAGE1, PAGE2]
 
     def test_job_is_deleted_and_session_closed(self):
-        """收尾必须 DELETE job（防止设备侧任务累积 → 后续 409）并关闭 session。"""
+        """★ 收尾**绝不** DELETE job（DELETE = 取消 = M232 永久锁死），
+        但 session 必须关闭。"""
         session = _session([_Resp(200, content=PAGE1), _Resp(404)])
 
         _run_multipage(session, source="Feeder")
 
-        assert session.deleted == [JOB_URI]
-        assert session.calls[-1] == ("DELETE", JOB_URI), \
-            "DELETE 必须是最后一个动作，实际: %r" % (session.calls,)
+        assert session.deleted == [], \
+            "★ 收尾绝不能 DELETE（取消设备上的作业 ⇒ M232 永久锁死），" \
+            "实际: %r" % (session.deleted,)
         assert session.closed is True, "session 必须关闭"
 
     def test_adf_request_carries_multipage_contract(self):
@@ -335,7 +350,8 @@ class TestMultipageFullChain:
         result = _run_multipage(session, source="Feeder")
 
         assert result == [(PAGE1, "jpg")], "410 时应保留已取页，实际: %r" % (result,)
-        assert session.deleted == [JOB_URI]
+        assert session.deleted == [], \
+            "★ 收尾绝不能 DELETE（取消 = 锁死设备），实际: %r" % (session.deleted,)
 
 
 class TestMultipageCancel:
@@ -377,16 +393,17 @@ class TestMultipageCancel:
         assert len(session.cleanup_gets()) <= 3, \
             "收尾补取有界（至多 3 次），实际 %d 次" % len(session.cleanup_gets())
 
-    def test_cancel_still_deletes_job(self):
-        """取消也要清理设备上的 job（否则设备侧任务累积 → 后续 409）。"""
+    def test_cancel_never_deletes_job(self):
+        """★ 取消也**绝不** DELETE job —— DELETE 的语义是「取消设备上的作业」
+        ⇒ 设备记 `JobCanceledByUser` ⇒ M232 永久锁死（台账 §13.32）。"""
         cancel = threading.Event()
         cancel.set()
         session = _session([_Resp(200, content=PAGE1)])
 
         _run_multipage(session, source="Feeder", cancel_event=cancel)
 
-        assert session.deleted == [JOB_URI], \
-            "取消后也必须 DELETE job，实际: %r" % (session.deleted,)
+        assert session.deleted == [], \
+            "★ 取消后也绝不能 DELETE job，实际: %r" % (session.deleted,)
 
     def test_cancel_during_job_creation_returns_empty_pages_tuple(self):
         """★ 建 job 阶段（409 退避）被取消 ⇒ 返回 `([], ext)`。
@@ -472,13 +489,13 @@ class TestExecuteScanCancelReturnsEmpty:
 
         assert result == (None, "jpg"), "取消的返回形态必须是 (None, ext)，实际: %r" % (result,)
 
-    def test_cancel_still_deletes_job(self):
-        """取消也要清理设备上的 job。"""
+    def test_cancel_never_deletes_job(self):
+        """★ 取消也**绝不** DELETE job（DELETE = 取消 = M232 永久锁死）。"""
         cancel = threading.Event()
         cancel.set()
         session = _session([_Resp(200, content=PAGE1)])
 
         _run_scan(session, cancel_event=cancel)
 
-        assert session.deleted == [JOB_URI], \
-            "取消后也必须 DELETE job，实际: %r" % (session.deleted,)
+        assert session.deleted == [], \
+            "★ 取消后也绝不能 DELETE job，实际: %r" % (session.deleted,)

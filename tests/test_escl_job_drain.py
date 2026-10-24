@@ -1,23 +1,29 @@
-"""收尾契约：**先把文档取走，再删作业** — HP Scan Tool v4.0
+"""收尾契约：**只取文档，绝不 DELETE** — HP Scan Tool v4.0
 
-★ 为什么必须有这一步（2026-10-23 真机实测，见台账 §13.23）：
-  设备在 POST 之后会**自己扫好一页、把它攥在手里**
-  （ScannerStatus 里表现为 ``Processing`` + ``ImagesCompleted=1``）。
-  客户端如果**不取走文档就直接 DELETE** ⇒ 设备端的「忙」标志**解不开**：
-  实测 DELETE 返回 **200**，设备**仍然 409** 拒接新作业
-  ⇒ 那台打印机在很长一段时间里扫不了东西。
+★ 2026-10-24 真机实测坐实（见台账 §13.32，证据在 `.101` 与三台 M232 上）：
 
-★ 2026-10-24 追加的第二条（更隐蔽）：
-  **取不到「确定答复」时，绝不能删作业。**
-  设备还在扫描时会回 **503**（= 还没准备好）—— 这时如果照常 DELETE：
-  设备随后扫出那一页、却已经没人能取走（事后 NextDocument ⇒ **410**）
-  ⇒ 那台打印机就永久卡在「拒接新作业」上。
-  ⇒ 正确处置：**这一轮不删**，把它记进待清清单，**下一轮建 job 前再取**。
+  ① **DELETE 的语义是「取消设备上的作业」** ——
+     设备会把作业记成 `JobStateReason=JobCanceledByUser`
+     （`.203` / `.208` / `.111` 的残留记录实测就是它；
+       `.101` 正常收尾的是 `JobCompletedSuccessfully`）。
+     ⇒ 在 M232 机型上，被取消的作业会让**扫描子系统永久锁死**：
+       `POST /ScanJobs` 一律 **409**，而客户端再去 DELETE 只得到 **404/410**
+       ⇒ **清不掉，只有断电重启能清**。
+     ⇒ 这就是「三台打印机扫不了东西」的真正成因。
 
-★ 本文件守的是**顺序与边界**：
-  - 失败/取消/无文档（没拿到过文档）⇒ **必须补取**再删；
-  - 补取拿到**确定答复**（200 / 404 / 410）⇒ 可以删；
-  - 补取**没拿到确定答复**（503 / 超时 / 异常）⇒ **不许删**，要记进清单；
+  ② **DELETE 本来就是多余的** ——
+     文档一取走，设备**自己**就把作业记成 `Completed` 并回收；
+     我们随后发出的 DELETE 拿到的是 **404**（作业早没了）。
+
+★ 所以收尾的正解只有两步：
+  - 把文档取走（`NextDocument`）；
+  - 取不到「确定答复」（503 / 超时 / 异常）⇒ **不许 DELETE**，
+    记进待清清单，**下一轮建 job 前再取**。
+
+★ 本文件守的是**这条红线**：
+  - 收尾三条路径（`execute_scan` / `execute_multipage_scan` /
+    `cleanup_pending_jobs`）**一律不得发出 DELETE**；
+  - 取不到确定答复 ⇒ 条目必须留在待清清单里；
   - 已经拿到过文档（成功路径）⇒ **不必**再取（再取只会 404，白花时间）。
 """
 
@@ -139,15 +145,17 @@ class TestDrainHelper:
 
 
 class TestExecuteScanCleanup:
-    def test_no_document_drains_before_delete(self, monkeypatch):
+    def test_no_document_drains_and_never_deletes(self, monkeypatch):
+        """★ 一页都没拿到 ⇒ 先补取；**收尾绝不 DELETE**。"""
         events = []
         _install_fakes(monkeypatch, events, get_results=[_Resp(404), _Resp(404)])
         with pytest.raises(escl_engine.ScanDeviceError):
             escl_engine.execute_scan(_scanner(), timeout=0.01)
         kinds = _kinds(events)
-        assert "DELETE" in kinds
-        assert kinds.index("GET") < kinds.index("DELETE"), \
-            "顺序错：必须先取文档再删作业"
+        assert "GET" in kinds, "收尾必须先把文档取走"
+        assert "DELETE" not in kinds, \
+            "★ 收尾发 DELETE = 取消设备上的作业 ⇒ 设备记 JobCanceledByUser " \
+            "⇒ M232 永久锁死（409，客户端也清不掉）"
 
     def test_incomplete_drain_must_not_delete(self, monkeypatch):
         """★ 核心守护：设备还在扫描（503）⇒ **不许删作业**，要记进待清清单。"""
@@ -158,7 +166,7 @@ class TestExecuteScanCleanup:
         assert "DELETE" not in _kinds(events), \
             "没拿到确定答复就删作业 ⇒ 设备随后攥住那一页 ⇒ 那台打印机会卡死"
         assert len(escl_engine.load_pending_jobs()) == 1, \
-            "没删掉的作业必须记进待清清单，下一轮再取"
+            "没收尾的作业必须记进待清清单，下一轮再取"
 
     def test_success_path_does_not_drain_again(self, monkeypatch):
         events = []
@@ -166,19 +174,23 @@ class TestExecuteScanCleanup:
         data, ext = escl_engine.execute_scan(_scanner(), timeout=5.0)
         assert data == b"jpgdata"
         kinds = _kinds(events)
-        assert "DELETE" in kinds, "收尾仍然必须删作业"
+        assert "DELETE" not in kinds, \
+            "★ 文档一取走设备自己就记 Completed 并回收（DELETE 只是 404 空操作）；" \
+            "发 DELETE 反而会 cancel 掉作业 ⇒ 锁死设备"
         assert not any(e[0] == "GET" and e[2] == CLEANUP_TIMEOUT for e in events), \
             "已经拿到过文档 ⇒ 不必再取（再取只会 404）"
 
 
 class TestMultipageCleanup:
-    def test_no_pages_drains_then_deletes(self, monkeypatch):
+    def test_no_pages_drains_and_never_deletes(self, monkeypatch):
         events = []
         _install_fakes(monkeypatch, events, get_results=[_Resp(404)])
         with pytest.raises(escl_engine.ScanDeviceError):
             escl_engine.execute_multipage_scan(_scanner(), timeout=0.01, page_timeout=0.01)
         kinds = _kinds(events)
-        assert kinds.index("GET") < kinds.index("DELETE")
+        assert "GET" in kinds, "收尾必须先把文档取走"
+        assert "DELETE" not in kinds, \
+            "★ 多页路径的收尾同样绝不能 DELETE（取消 = 锁死设备）"
 
     def test_incomplete_drain_must_not_delete(self, monkeypatch):
         events = []
@@ -200,18 +212,21 @@ class TestMultipageCleanup:
 
 
 class TestPendingCleanupDrains:
-    def test_pending_cleanup_drains_before_delete(self, monkeypatch):
+    def test_pending_cleanup_drains_and_never_deletes(self, monkeypatch):
+        """★ 补收尾 = 只取文档；**不发 DELETE**。"""
         events = []
         escl_engine.remember_pending_job("http://10.0.0.9/eSCL/ScanJobs/j1")
         sess = _FakeSession(events, get_results=[_Resp(404)], delete_codes=[200])
         done = escl_engine.cleanup_pending_jobs(sess, "http://10.0.0.9/eSCL/")
         assert done == 1
         kinds = _kinds(events)
-        assert kinds.index("GET") < kinds.index("DELETE"), \
-            "补删时也必须先把文档取走"
+        assert "GET" in kinds, "补收尾时必须先把文档取走"
+        assert "DELETE" not in kinds, \
+            "★ 补收尾也绝不能 DELETE（取消 = 锁死设备）"
+        assert escl_engine.load_pending_jobs() == [], "处理完的条目必须从清单移除"
 
     def test_incomplete_drain_keeps_entry_and_does_not_delete(self, monkeypatch):
-        """★ 设备还没答复 ⇒ 这一轮不删、条目保留 ⇒ 下一轮继续取。"""
+        """★ 设备还没答复 ⇒ 这一轮不处理、条目保留 ⇒ 下一轮继续取。"""
         events = []
         escl_engine.remember_pending_job("http://10.0.0.9/eSCL/ScanJobs/j1")
         sess = _FakeSession(events, get_results=[_Resp(503), _Resp(503)])
@@ -220,8 +235,8 @@ class TestPendingCleanupDrains:
         assert "DELETE" not in _kinds(events), "没拿到确定答复就不许删"
         assert len(escl_engine.load_pending_jobs()) == 1, "条目必须保留，下轮再取"
 
-    def test_drain_failure_does_not_block_delete(self, monkeypatch):
-        """补取彻底失败（抛异常）⇒ 仍然要删（否则清单永远清不掉）。"""
+    def test_drain_failure_keeps_entry_and_never_deletes(self, monkeypatch):
+        """补取彻底失败（抛异常）⇒ 保留条目、下一轮再取；**绝不改用 DELETE**。"""
         events = []
         escl_engine.remember_pending_job("http://10.0.0.9/eSCL/ScanJobs/j1")
 
@@ -231,12 +246,14 @@ class TestPendingCleanupDrains:
         monkeypatch.setattr(escl_engine, "_drain_job", _boom)
         sess = _FakeSession(events, delete_codes=[200])
         done = escl_engine.cleanup_pending_jobs(sess, "http://10.0.0.9/eSCL/")
-        assert done == 1, "取文档彻底失败也要照删"
-        assert any(e[0] == "DELETE" for e in events)
+        assert done == 0, "取文档彻底失败 ⇒ 不知道设备状态 ⇒ 不能算处理完"
+        assert "DELETE" not in _kinds(events), \
+            "★ 兜底路径更不能 DELETE（那正是当初把机器搞废的动作）"
+        assert len(escl_engine.load_pending_jobs()) == 1, "条目必须保留，下轮再取"
 
 
 class TestStaticGuards:
-    """静态守住：别让人把收尾顺序改回去"""
+    """静态守住：别让人把收尾改回「取完就 DELETE」"""
 
     @pytest.mark.parametrize("func_name", [
         "execute_scan", "execute_multipage_scan", "cleanup_pending_jobs"])
@@ -244,7 +261,22 @@ class TestStaticGuards:
         import inspect
         src = inspect.getsource(getattr(escl_engine, func_name))
         assert "_drain_job" in src, \
-            "%s 的收尾路径必须调用 _drain_job（先取文档再删作业）" % func_name
+            "%s 的收尾路径必须调用 _drain_job（先把文档取走）" % func_name
+
+    @pytest.mark.parametrize("func_name", [
+        "execute_scan", "execute_multipage_scan", "cleanup_pending_jobs"])
+    def test_cleanup_path_never_deletes(self, func_name):
+        """★★ 红线：收尾**绝不能**发 DELETE。
+
+        DELETE = 「取消设备上的作业」⇒ 设备记 `JobCanceledByUser`
+        ⇒ M232 机型上扫描子系统被永久锁死（POST 一律 409），
+        客户端再 DELETE 只得 404/410 ⇒ 只有断电重启能清。
+        """
+        import inspect
+        src = inspect.getsource(getattr(escl_engine, func_name))
+        assert ".delete(" not in src, \
+            "★ %s 的收尾里出现了 DELETE ⇒ 会把设备上的作业 cancel 掉 ⇒ " \
+            "M232 永久锁死（见台账 §13.32）" % func_name
 
     def test_drain_helper_exists(self):
         assert callable(escl_engine._drain_job)

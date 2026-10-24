@@ -1260,12 +1260,17 @@ def _abs_job_uri(base: str, uri: str) -> str:
 
 
 def cleanup_pending_jobs(session=None, base: str = "", timeout: float = 8.0) -> int:
-    """把清单里的作业逐个 DELETE 掉；删成功的从清单移除。
+    """把清单里的作业逐个**收尾**（补取文档），处理完的从清单移除。
 
-    ★ 在**建新 job 之前**调用 ⇒ 设备不会因为「上次那个作业没删」而拒接新任务。
-    ★ 删不掉的（404/410 = 设备已回收）也**从清单移除** —— 那种记录设备自己会清，
-      留着只是噪音。
-    返回：本次成功删掉的个数。
+    ★★ 2026-10-24 真机实测 ⇒ **这里绝不能再发 DELETE**（台账 §13.32）：
+      DELETE 的语义是「**取消**设备上的作业」⇒ 设备把作业记成
+      `JobStateReason=JobCanceledByUser` ⇒ **M232 机型上扫描子系统被永久锁死**
+      （POST 一律 409；客户端再 DELETE 只得 404/410 ⇒ 只有断电能清）。
+      而且 DELETE **本来就没用**：文档一取走，设备自己就记 Completed 并回收
+      （.101 实测：随后 DELETE 返回 404）。
+    ★ 在**建新 job 之前**调用 ⇒ 把上次没取干净的文档取走，设备才肯接新任务。
+    ★ 取不到确定答复（503 / 超时）⇒ **保留条目**，下一轮再取；**绝不取消**。
+    返回：本次处理完（设备已给出确定答复）的条数。
     """
     uris = load_pending_jobs()
     if not uris:
@@ -1294,30 +1299,21 @@ def cleanup_pending_jobs(session=None, base: str = "", timeout: float = 8.0) -> 
         except Exception:
             # `_drain_job` 自己会吞掉传输层异常（返回"没有确定答复"）；
             # 能走到这里说明是**代码级**异常 ⇒ 不知道设备那边是什么状态
-            # ⇒ 仍然照删（否则清单永远清不掉）。
-            complete = True
-        if not complete:
-            # ★ 设备还没给出确定答复（503 = 还在扫描 / 超时）⇒ **这一轮先不删**
-            #   ⇒ 保留在清单里，下一轮再来取 ——
-            #   删了就再也取不回来（事后 NextDocument ⇒ 410）⇒ 那台打印机会卡死。
-            remain.append(uri)
-            continue
-        try:
-            if session is not None:
-                r = session.delete(url, timeout=timeout)
-                ok = r.status_code in (200, 201, 202, 204, 404, 410)
-            else:
-                r = requests.delete(url, timeout=timeout, verify=False)
-                ok = r.status_code in (200, 201, 202, 204, 404, 410)
-        except Exception:
-            ok = False
-        if ok:
+            #   ⇒ **保留条目、下一轮再取**。
+            #   ★ 绝不能因此改用 DELETE：DELETE = 取消 = 锁死设备（见上面说明）。
+            complete = False
+        if complete:
+            # 设备给出了确定答复（200 取到文档 / 404·410 没有更多页）
+            # ⇒ 设备自己会把作业记成 Completed 并回收 ⇒ **不发 DELETE**。
             done += 1
         else:
+            # ★ 设备还没给出确定答复（503 = 还在扫描 / 超时）⇒ **这一轮不处理**
+            #   ⇒ 保留在清单里，下一轮再来取 ——
+            #   取消它 ⇒ 设备记 JobCanceledByUser ⇒ 那台打印机从此 409。
             remain.append(uri)
     save_pending_jobs(remain)
     if done:
-        logger.info("清理设备侧残留作业 %d 条（剩余 %d 条待清）", done, len(remain))
+        logger.info("收尾设备侧残留作业 %d 条（剩余 %d 条待清）", done, len(remain))
     return done
 
 
@@ -1604,15 +1600,19 @@ def execute_scan(
 
         raise ScanDeviceError(SCAN_TIMEOUT_MESSAGE)
     finally:
-        # 清理打印机上的扫描任务（防止任务累积导致409冲突）
+        # ★★ 2026-10-24：**绝不发 DELETE**（真机实测坐实，见台账 §13.32）。
+        #   DELETE 在 eSCL 里的语义是「**取消**设备上的作业」：
+        #   设备会把作业记成 `JobStateReason=JobCanceledByUser`
+        #   （.203/.208/.111 的残留记录实测就是它；.101 正常收尾的是
+        #   `JobCompletedSuccessfully`）
+        #   ⇒ 在 M232 机型上，被取消的作业会让**扫描子系统永久锁死**：
+        #     POST 一律 409，而客户端再去 DELETE 只会得到 404/410（清不掉）
+        #     ⇒ **只有断电重启能清**。
+        #   ⇒ 而且 DELETE **本来就没用**：文档一取走，设备自己就把作业记成
+        #     Completed 并回收（.101 实测：我们随后发出的 DELETE 拿到的是 404）。
+        #   ⇒ 收尾只做两件事：① 把文档取走；② 取不到确定答复 ⇒ 记进待清清单
+        #     （下一轮建 job 之前先补取，见 cleanup_pending_jobs）。
         if job_uri:
-            # ★ 2026-10-23：收尾**必须先取文档、再删作业**。
-            #   实测：设备 POST 之后会自己扫好一页攥在手里（Processing +
-            #   ImagesCompleted=1）；客户端不取走就直接 DELETE ⇒ 设备端的
-            #   「忙」标志**解不开**（DELETE 返回 200，设备仍然 409）
-            #   ⇒ 那台打印机长时间扫不了东西。
-            #   ⇒ 只有「我们一页都没拿到」（取消/超时/无文档）时才有未取走的
-            #      文档要取；已经拿到过文档的作业再取一次只会 404，不必白花时间。
             if not got_document:
                 # ★ 2026-10-24：补取**最多 3 次**（设备还在扫描时会回 503，
                 #   等一下再试），并且**看它有没有给出确定答复**。
@@ -1620,32 +1620,15 @@ def execute_scan(
                     _drained, complete = _drain_job(session, job_uri, max_gets=3,
                                                     timeout=3.0)
                 except Exception:
-                    complete = False     # 连试都不行 ⇒ 绝不能删
+                    complete = False     # 连试都不行 ⇒ 绝不能删（更不能取消）
             else:
                 complete = True
             if not complete:
-                # ★★ **取不到确定答复 ⇒ 绝不删作业**！
-                #   设备可能正攥着那一页（503 = 还在扫描）；删了就再也取不回来
-                #   （事后 NextDocument ⇒ 410，实测）⇒ 那台打印机会一直 409。
-                #   ⇒ 记进待清清单 ⇒ **下次建 job 之前**先把它取走再删。
+                # ★★ **取不到确定答复 ⇒ 绝不发 DELETE**！
+                #   设备可能正攥着那一页（503 = 还在扫描）；取消它 ⇒ 设备记
+                #   JobCanceledByUser ⇒ 那台打印机从此拒接新作业（409）。
+                #   ⇒ 记进待清清单 ⇒ **下次建 job 之前**先把它取走。
                 remember_pending_job(job_uri)
-            else:
-                # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
-                #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
-                #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
-                #   Canceled/Aborted 记录 ⇒ **那台打印机从此拒接新作业（409）**，
-                #   而客户端再去 DELETE 它只会得到 404/410（清不掉）⇒ 只能重启打印机。
-                #   ⇒ 这几行就是「我自己把机器搞成扫不了」的源头，必须收紧。
-                for _attempt in range(2):
-                    try:
-                        session.delete(job_uri, timeout=8)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    # ★ 两次都没删掉 ⇒ 设备可能还留着它 ⇒ 记进清单，
-                    #   **下次建 job 之前**先补删（见 cleanup_pending_jobs）。
-                    remember_pending_job(job_uri)
         session.close()
 
 
@@ -1834,41 +1817,24 @@ def execute_multipage_scan(
             raise ScanDeviceError(_no_document_message(source))
         return pages
     finally:
+        # ★★ 2026-10-24：**绝不发 DELETE**（理由同 execute_scan，见台账 §13.32）。
+        #   DELETE = 取消设备上的作业 ⇒ 设备记 `JobCanceledByUser`
+        #   ⇒ M232 机型上扫描子系统被永久锁死（409，客户端也清不掉）。
+        #   ⇒ 文档一取走，设备自己就会记 Completed 并回收（DELETE 只是 404 空操作）。
         if job_uri:
-            # ★ 2026-10-23：收尾**必须先取文档、再删作业**（真机实测，见 §13.23）。
-            #   设备 POST 之后会自己扫好一页攥在手里；客户端不取走就直接 DELETE
-            #   ⇒ 设备的「忙」标志解不开（DELETE 200 但设备仍然 409）。
-            #   ⇒ 只有「我们一页都没拿到」（取消/超时/无文档）时才需要补取。
             if not pages:
                 # ★ 2026-10-24：补取最多 3 次，并且**看有没有拿到确定答复**
                 try:
                     _drained, complete = _drain_job(session, job_uri, max_gets=3,
                                                     timeout=3.0)
                 except Exception:
-                    complete = False     # 连试都不行 ⇒ 绝不能删
+                    complete = False     # 连试都不行 ⇒ 绝不能删（更不能取消）
             else:
                 complete = True
             if not complete:
-                # ★★ 取不到确定答复 ⇒ **绝不删**（设备可能还攥着那一页）
-                #   ⇒ 记进待清清单 ⇒ 下次建 job 之前先取走再删。
+                # ★★ 取不到确定答复 ⇒ **绝不发 DELETE** ⇒ 记进待清清单，
+                #   下一轮建 job 之前先把它取走。
                 remember_pending_job(job_uri)
-            else:
-                # ★ 2026-10-22：DELETE 超时放宽到 8 秒并**重试一次**。
-                #   实测：设备在处理中时 DELETE 会**长时间不返回**（我们 6 秒读超时）
-                #   ⇒ 原来 3 秒就放弃 ⇒ 作业停在「没收尾」状态 ⇒ 设备侧留下
-                #   Canceled/Aborted 记录 ⇒ **那台打印机从此拒接新作业（409）**，
-                #   而客户端再去 DELETE 它只会得到 404/410（清不掉）⇒ 只能重启打印机。
-                #   ⇒ 这几行就是「我自己把机器搞成扫不了」的源头，必须收紧。
-                for _attempt in range(2):
-                    try:
-                        session.delete(job_uri, timeout=8)
-                        break
-                    except Exception:
-                        continue
-                else:
-                    # ★ 两次都没删掉 ⇒ 设备可能还留着它 ⇒ 记进清单，
-                    #   **下次建 job 之前**先补删（见 cleanup_pending_jobs）。
-                    remember_pending_job(job_uri)
         session.close()
 
 

@@ -166,7 +166,8 @@ class TestNoDocumentIsNotCancel:
         session = _FakeSession([_Resp(200, content=b"P1"), _Resp(404)])
         result = _run_multipage(session, IDLE, source="Feeder")
         assert [d for d, _e in result] == [b"P1"]
-        assert session.deleted == [JOB_URI]
+        assert session.deleted == [], \
+            "★ 收尾绝不能 DELETE（取消 = 锁死设备），实际: %r" % (session.deleted,)
 
     def test_410_after_pages_still_ends_normally(self):
         """已经拿到过页之后的 410 ⇒ 正常收尾（保留已拿到的页）"""
@@ -248,3 +249,15 @@ class TestNoDocumentMessageHelper:
         msg = escl_engine._no_document_message("Feeder", "ScannerAdfEmpty")
         assert "卡纸" not in msg
         assert "输稿器" in msg
+
+
+@pytest.fixture(autouse=True)
+def _isolated_appdata(tmp_path, monkeypatch):
+    """★ 收尾在取不到文档时会把作业记进待清清单
+    （%APPDATA%\\HP_Scan_Tool\\pending_jobs.json）
+    ⇒ 测试必须隔离 APPDATA，否则会污染**用户真实**的清单
+    （清单里若留下真机 URI，下次运行会真的去设备上取那个作业）。"""
+    appdata = tmp_path / "appdata"
+    (appdata / "HP_Scan_Tool").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    yield appdata

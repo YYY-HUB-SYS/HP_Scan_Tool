@@ -1,18 +1,20 @@
 """
-「设备侧没删掉的作业」清单契约测试 — HP Scan Tool v4.0
+「设备侧没收尾的作业」清单契约测试 — HP Scan Tool v4.0
 
-★ 治本的那一条（2026-10-22）：DELETE 不回包时**记下来**，
-  **下次建 job 之前**先补删 ⇒ 设备不会因为「上次那个作业没收尾」而拒接新任务。
+★ 2026-10-24 真机实测坐实（台账 §13.32）：**DELETE 不能再发**。
+  DELETE 的语义是「**取消**设备上的作业」⇒ 设备把作业记成
+  `JobStateReason=JobCanceledByUser` ⇒ **M232 机型上扫描子系统被永久锁死**
+  （`POST /ScanJobs` 一律 409；客户端再 DELETE 只得 404/410 ⇒ 只有断电能清）。
+  ⇒ `.203` / `.208` / `.111` 那三条 Canceled 残留就是这么来的。
 
-★ 为什么必须有（实测 + 公网证据）：
-  · NAPS2 `EsclScanDriver.cs:213-217`：「Some devices (e.g. Kyocera) **stay busy
-    until the completed job is deleted** … so we always send DELETE for the job」；
-    NAPS2 issue #906：「删掉已完成的 job 后设备才解锁」。
-  · 我们实测：设备在处理中时 DELETE **长时间不返回**（6 秒读超时）⇒ 3 秒就放弃
-    ⇒ 作业停在没收尾状态 ⇒ 设备侧记 Canceled/Aborted ⇒ **那台打印机从此 409**，
-    客户端再 DELETE 只会 404/410（清不掉）⇒ 只能重启打印机。
-    ⇒ 2026-10-22 实测 `.208` 的两条 Canceled Age=2.0 天、`.111` 的 1.0 天
-      —— **就是这条路把三台打印机搞成扫不了的。**
+★ 而 DELETE **本来也没用**：文档一取走，设备自己就把作业记成 `Completed`
+  并回收（`.101` 实测：随后发出的 DELETE 拿到的是 404）。
+
+★ 所以清单的语义变成：
+  - 收尾时**取不到确定答复**（503 / 超时 / 异常）⇒ 记进清单；
+  - 下一轮建 job **之前**先把文档取走（`cleanup_pending_jobs`）⇒
+    取到了 / 设备说没有更多页 ⇒ 从清单移除；
+  - **任何情况下都不发 DELETE**。
 """
 
 import json
@@ -31,12 +33,11 @@ class _Resp:
 
 
 class _Session:
-    """记录 DELETE 的假 session
+    """记录 GET / DELETE 的假 session
 
-    ★ 2026-10-24：`cleanup_pending_jobs` 现在**先取文档再删**（真机实测：
-      不取走文档就删 ⇒ 设备端的忙标志解不开 ⇒ 那台打印机长期 409），
-      所以这个假 session 也要能回答 GET NextDocument。
-      这里回 **404** = 「设备已经没有文档了」⇒ 补取拿到**确定答复** ⇒ 可以删。
+    ★ 2026-10-24：产品**不再发 DELETE**了（DELETE = 取消 = 锁死设备）。
+      这里保留 `deleted` 列表，就是为了让守护测试能断言
+      「产品一次 DELETE 都没发过」。
     """
 
     def __init__(self, results=None, raise_on=()):
@@ -47,6 +48,8 @@ class _Session:
 
     def get(self, url, timeout=None):
         self.gets.append(url)
+        if url in self.raise_on:
+            raise RuntimeError("设备不回应（读超时）")
         return _Resp(404)
 
     def delete(self, url, timeout=None):
@@ -93,12 +96,15 @@ class TestPendingJobsList:
 
 
 class TestCleanupPendingJobs:
-    def test_successful_delete_removes_from_list(self):
+    def test_resolved_entry_removes_from_list(self):
+        """设备给了确定答复（404 = 没有更多页）⇒ 条目移除。"""
         escl_engine.remember_pending_job("u1")
         s = _Session([200])
         done = escl_engine.cleanup_pending_jobs(s, "http://1.2.3.4/eSCL/")
         assert done == 1
         assert escl_engine.load_pending_jobs() == []
+        assert s.deleted == [], \
+            "★ 收尾绝不能发 DELETE（取消设备上的作业 ⇒ M232 永久锁死）"
 
     def test_404_also_removes(self):
         """404 = 设备已回收 ⇒ 留着只是噪音 ⇒ 也要移除"""
@@ -106,22 +112,25 @@ class TestCleanupPendingJobs:
         s = _Session([404])
         escl_engine.cleanup_pending_jobs(s, "http://1.2.3.4/eSCL/")
         assert escl_engine.load_pending_jobs() == []
+        assert s.deleted == []
 
-    def test_timeout_keeps_it_for_next_round(self):
-        """★ 设备不回应 ⇒ **保留**在清单里，下次再试"""
+    def test_device_silent_keeps_it_for_next_round(self):
+        """★ 设备不回应 ⇒ **保留**在清单里，下次再试（绝不能改用 DELETE）。"""
         escl_engine.remember_pending_job("u1")
         # 设备的 JobUri 是相对主机根的 ⇒ 绝对 URL = origin + "/u1"
-        s = _Session([200], raise_on=("http://1.2.3.4/u1",))
+        s = _Session([200], raise_on=("http://1.2.3.4/u1/NextDocument",))
         done = escl_engine.cleanup_pending_jobs(s, "http://1.2.3.4/eSCL/")
         assert done == 0
         assert escl_engine.load_pending_jobs() == ["u1"]
+        assert s.deleted == []
 
     def test_relative_uri_is_made_absolute(self):
         """★ 相对 URI ⇒ 拼成 origin + 路径（**不能**拼成 /eSCL/eSCL/...）"""
         escl_engine.remember_pending_job("/eSCL/ScanJobs/xyz")
         s = _Session([200])
         escl_engine.cleanup_pending_jobs(s, "http://1.2.3.4/eSCL/")
-        assert s.deleted == ["http://1.2.3.4/eSCL/ScanJobs/xyz"], s.deleted
+        assert s.gets == ["http://1.2.3.4/eSCL/ScanJobs/xyz/NextDocument"], s.gets
+        assert s.deleted == [], s.deleted
 
     def test_empty_list_is_noop(self):
         s = _Session()
@@ -130,19 +139,19 @@ class TestCleanupPendingJobs:
 
 
 class TestCreateJobCleansUpFirst:
-    """★ 建 job **之前**必须先补删残留"""
+    """★ 建 job **之前**必须先收尾残留"""
 
     def test_create_scan_job_cleans_pending_first(self):
         import inspect
         src = inspect.getsource(escl_engine._create_scan_job)
         assert "cleanup_pending_jobs" in src, \
-            "建 job 之前没有补删残留 ⇒ 设备会拒接新任务（409）"
+            "建 job 之前没有先收尾残留 ⇒ 设备会拒接新任务（409）"
 
-    def test_delete_failure_is_remembered(self):
+    def test_unresolved_job_is_remembered(self):
         import inspect
         src = inspect.getsource(escl_engine.execute_scan)
         assert "remember_pending_job" in src, \
-            "DELETE 失败没有记进清单 ⇒ 下次没法补删"
+            "没收尾的作业没有记进清单 ⇒ 下次没法补取"
         src2 = inspect.getsource(escl_engine.execute_multipage_scan)
         assert "remember_pending_job" in src2, \
-            "多页路径的 DELETE 失败也没有记进清单"
+            "多页路径没收尾的作业也没有记进清单"

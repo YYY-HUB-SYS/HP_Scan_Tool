@@ -167,12 +167,32 @@ class TestConflictMessagePicksTheRightStory:
             assert "再试" in msg, msg
 
 class TestJobCleanupIsNotAbandoned:
-    """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ DELETE 必须给足时间"""
+    """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ 收尾**绝不能**取消作业
 
-    def test_delete_uses_a_longer_timeout_and_retries(self):
-        """DELETE 超时必须 ≥ 5 秒（设备忙时不返回），且失败要重试"""
+    ★ 2026-10-24 真机实测坐实（台账 §13.32）：
+      DELETE 的语义是「**取消**设备上的作业」⇒ 设备把作业记成
+      `JobStateReason=JobCanceledByUser` ⇒ **M232 机型上扫描子系统永久锁死**
+      （`POST /ScanJobs` 一律 409；客户端再 DELETE 只得 404/410 ⇒ 只有断电能清）。
+      而文档一取走，设备**自己**就把作业记成 `Completed` 并回收
+      （`.101` 实测：随后发出的 DELETE 拿到的是 404）
+      ⇒ DELETE 从头到尾就没帮过我们，只留下过锁死的设备。
+    """
+
+    def test_cleanup_never_deletes_the_job(self):
+        """★★ 红线：收尾三条路径都**不得**发 DELETE。"""
         import inspect
-        src = inspect.getsource(escl_engine.execute_scan)
-        assert "timeout=8" in src or "timeout=6" in src, \
-            "DELETE 超时没放宽（设备忙时不返回 ⇒ 作业停在没收尾状态）"
-        assert "for _attempt in range(2)" in src, "DELETE 失败没有重试"
+        for fn in (escl_engine.execute_scan, escl_engine.execute_multipage_scan,
+                   escl_engine.cleanup_pending_jobs):
+            src = inspect.getsource(fn)
+            assert ".delete(" not in src, \
+                "★ %s 的收尾里出现了 DELETE ⇒ 会把设备上的作业 cancel 掉 ⇒ " \
+                "M232 永久锁死（见台账 §13.32）" % fn.__name__
+
+    def test_cleanup_takes_the_document_instead(self):
+        """收尾的唯一动作是「把文档取走」（`_drain_job`）。"""
+        import inspect
+        for fn in (escl_engine.execute_scan, escl_engine.execute_multipage_scan,
+                   escl_engine.cleanup_pending_jobs):
+            src = inspect.getsource(fn)
+            assert "_drain_job" in src, \
+                "%s 的收尾必须先把文档取走" % fn.__name__
