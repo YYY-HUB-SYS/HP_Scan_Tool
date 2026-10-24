@@ -139,13 +139,33 @@ class TestConflictMessagePicksTheRightStory:
             assert "打印机面板" in msg, msg
             assert "断电" in msg, msg
 
-    def test_message_never_promises_a_wait_time(self):
-        """★ 不得再承诺"等 N 分钟就会好"（实测最长 30 天都不回收）"""
+    def test_message_never_promises_the_device_will_heal_by_itself(self):
+        """★ 不得承诺「等 N 分钟它就会自己好」——实测卡住的设备**几天都不恢复**，
+        等多久都是白等。
+
+        ★ **2026-10-24 口径细化**（别与"开机要几分钟才就绪"混为一谈）：
+          · **禁止**：把"分钟"用在「等一等设备自己会恢复」上（假承诺）；
+          · **允许且必须**：写明「**等打印机启动完成（约 5 分钟）**」——
+            那是**实测事实**（2026-10-24 `.111`：重启后第 5 分钟才受理新作业）。
+            没有这句，用户重启完**马上扫**照样撞 409 ⇒ 会以为这招没用。
+        """
         for jobs in ([(200, "Canceled")], [(100, "Completed"), (300, "Aborted")],
                      []):
             msg = self._msg(jobs)
             assert "15-20 分钟" not in msg, msg
-            assert "分钟" not in msg, msg
+            for forbidden in ("等一会儿就好", "等几分钟就好", "会自己恢复",
+                               "自行恢复", "很快就会好"):
+                assert forbidden not in msg, msg
+
+    def test_all_three_variants_mention_boot_wait(self):
+        """★ 三种措辞都必须写明「等打印机启动完成」——否则用户重启完马上扫，
+        又会撞 409（2026-10-24 `.111` 实测：重启后第 5 分钟才受理）。"""
+        for jobs in ([(200, "Canceled")], [(100, "Completed")], []):
+            msg = self._msg(jobs)
+            assert "启动" in msg, msg
+            assert "分钟" in msg, msg
+            assert "再试" in msg, msg
+
 class TestJobCleanupIsNotAbandoned:
     """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ DELETE 必须给足时间"""
 
