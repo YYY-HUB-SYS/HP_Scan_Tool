@@ -27,6 +27,15 @@ import time
 if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+# ★ 2026-10-27：控制台默认 GBK，子进程输出里的 `⇒` 等字符会直接让 print 崩
+#   （构建在 onedir 成功后炸掉 ⇒ 安装包根本不会开始打）。
+#   ⇒ 把 stdout/stderr 重配置为「不可编码时替换为 ?」，而不是让脚本崩。
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 ONEDIR_DIR = os.path.join(HERE, "build", "onedir", "HP_Scan_Tool")
