@@ -1,23 +1,20 @@
 """
 409 判据契约测试 — HP Scan Tool v4.0
 
-锁死 **2026-10-22 四台真机逐台验出来的判据**（这一条此前被我判错过两次）：
+★ 2026-10-27 契约变更：**409 判定不再依赖设备侧可见记录**。
 
-| 设备 | 设备侧作业记录 | 有没有 `Completed` | `POST /eSCL/ScanJobs` |
-|---|---|---|---|
-| `.101`（OfficeJet Pro 7720） | `Completed` + `Completed` | **有** | **201** ✔ |
-| `.203`（M232） | `Canceled` ×2 | **没有** | **409** ✘ |
-| `.208`（M232） | `Canceled` ×2 | **没有** | **409** ✘ |
-| `.111`（M232） | `Aborted` + `Canceled` | **没有** | **409** ✘ |
+背景（真机实测，见台账 §13.34）：
+  · `.111` / `.203` / `.208`（M232）：面板取消键按过、断电重启过，仍 409；
+  · `.208` 的设备侧记录已是 `Completed`（旧判据下完全不该挡路），POST 仍 409；
+  · 用产品 `_drain_job` 补取残留作业（GET NextDocument）→ 0 字节，仍 409；
+  · 代码注释里早有「实测 .208/.111：记录已空，仍 409」。
+  ⇒ 设备侧可见记录与 409 **没有因果关系**，设备内部有状态接口看不到的锁定标记。
 
-★ **判据是「设备侧有没有一条 Completed（成功扫完过）」**：
-  - 「有没有非 Completed 的记录」**不成立**（四台全是 True，`.101` 却能扫）；
-  - 「最近一条是不是 Completed」**也不成立**（`.101` 最新那条是我探测时留下的
-    Aborted，它照样能扫）；
-  - **只有「有没有 Completed」能一致区分四台。**
-★ 409 的响应体**全空**、而 `pwg:State` 仍报 `Idle` ⇒ 用户只看到"打印机坏了"；
-  ⇒ 文案必须说清是「**上次没正常扫完**」并给出**立刻能做的动作**。
-★ 设备侧残留 **DELETE 只会得到 404/410** ⇒ **客户端清不掉** ⇒ 只能重启打印机。
+★ 因此：
+  - `_conflict_message_for` **不再探测设备状态、不再按记录分支**，返回统一文案；
+  - 统一文案保留可尝试的步骤（面板取消 / 断电重启 / 等启动完成约 5 分钟），
+    但明确说明「若仍 409，需恢复默认/出厂设置，或联系管理员」；
+  - 文案**不得**承诺设备会自愈。
 """
 
 from unittest import mock
@@ -57,6 +54,8 @@ class _Resp:
 
 
 class TestJobStateParsing:
+    """probe_scanner_status 的作业解析仍保留（别处还会用），但 409 判定不再依赖它。"""
+
     def test_parses_all_job_states(self):
         xml = _status_xml([(100, "Completed"), (200, "Canceled")])
         with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
@@ -100,54 +99,54 @@ class TestJobStateParsing:
 
 
 class TestConflictMessagePicksTheRightStory:
+    """★ 2026-10-27 契约：409 文案**统一**，不依赖设备侧可见记录。"""
+
     def _msg(self, jobs):
         xml = _status_xml(jobs)
         with mock.patch("escl_engine.requests.get", return_value=_Resp(200, xml)):
             return escl_engine._conflict_message_for("http://1.2.3.4/eSCL/")
 
-    def test_stale_device_gets_the_precise_message(self):
-        """没有 Completed ⇒ 说清「上次没正常结束」+ 是哪个状态"""
-        msg = self._msg([(200, "Canceled"), (300, "Aborted")])
-        assert "没有正常结束" in msg, msg
-        assert "Canceled" in msg or "Aborted" in msg, msg
-        assert "打印机面板" in msg, msg
-        assert "断电" in msg, "必须给出断电指引（面板重启可能清不掉）"
+    def test_same_message_regardless_of_device_jobs(self):
+        """★★ 无论设备侧记录是 Completed / Canceled / 空，都返回同一份文案。"""
+        msgs = {self._msg([(200, "Canceled")]),
+                self._msg([(100, "Completed"), (300, "Aborted")]),
+                self._msg([])}
+        assert len(msgs) == 1, \
+            "409 文案不再依赖设备侧可见记录（实测记录与 409 无关），实际: %d 种" \
+            % len(msgs)
 
-    def test_device_with_completed_job_gets_generic_message(self):
-        """有 Completed（这台机器其实能扫）⇒ 不要说"上次没扫完"（那是误导）"""
-        msg = self._msg([(100, "Completed"), (300, "Aborted")])
-        assert "没有正常结束" not in msg, msg
+    def test_message_mentions_the_http_conflict(self):
+        msg = self._msg([(200, "Canceled")])
+        assert "409" in msg, msg
+        assert "未完成" in msg, msg
+
+    def test_message_mentions_ttl_and_client_cannot_clean(self):
+        """必须写清「不会很快自行消失」+「客户端清不掉（404/410）」。"""
+        msg = self._msg([(200, "Canceled")])
+        assert "不会很快自行消失" in msg, msg
+        assert "404/410" in msg, msg
+
+    def test_message_gives_tryable_steps(self):
+        """保留可尝试的步骤：面板取消 / 断电重启 / 等启动完成。"""
+        msg = self._msg([(200, "Canceled")])
         assert "打印机面板" in msg, msg
         assert "断电" in msg, msg
+        assert "重启" in msg, msg
+        assert "启动" in msg, msg
+        assert "分钟" in msg, msg
+        assert "再试" in msg, msg
 
-    def test_no_records_at_all_gets_the_internal_marker_message(self):
-        """★ 一条记录都没有 ⇒ 设备内部还留着标记（状态接口查不到）⇒ 必须说断电
-
-        ★ 实测 2026-10-23：17.17.171.208 / .111 的作业记录**已经空了**
-        （被重启过、记录已被设备清掉）⇒ **却仍然 409** ⇒ 那个标记在设备内部、
-        状态接口查不到 ⇒ 面板上的「重启」键可能清不掉，**必须断电**。
-        """
-        msg = self._msg([])
-        assert "查不到任何作业记录" in msg, msg
-        assert "断电" in msg, msg
-        assert "最近一次" not in msg, "没有记录时不能说『最近一次』"
-
-    def test_all_three_variants_mention_power_cycle(self):
-        """三种措辞**共有**的关键信息：面板 + 断电 10 秒"""
-        for jobs in ([(200, "Canceled")], [(100, "Completed")], []):
-            msg = self._msg(jobs)
-            assert "打印机面板" in msg, msg
-            assert "断电" in msg, msg
+    def test_message_mentions_factory_reset_as_last_resort(self):
+        """★★ 必须说明：若上述操作仍 409，需恢复默认/出厂或联系管理员。"""
+        msg = self._msg([(200, "Canceled")])
+        assert ("恢复默认" in msg) or ("恢复出厂" in msg), msg
+        assert "联系" in msg, msg
 
     def test_message_never_promises_the_device_will_heal_by_itself(self):
-        """★ 不得承诺「等 N 分钟它就会自己好」——实测卡住的设备**几天都不恢复**，
-        等多久都是白等。
+        """★ 不得承诺「等 N 分钟它就会自己好」——实测卡住的设备**几天都不恢复**。
 
-        ★ **2026-10-24 口径细化**（别与"开机要几分钟才就绪"混为一谈）：
-          · **禁止**：把"分钟"用在「等一等设备自己会恢复」上（假承诺）；
-          · **允许且必须**：写明「**等打印机启动完成（约 5 分钟）**」——
-            那是**实测事实**（2026-10-24 `.111`：重启后第 5 分钟才受理新作业）。
-            没有这句，用户重启完**马上扫**照样撞 409 ⇒ 会以为这招没用。
+        ★ 允许且必须：写明「等打印机启动完成（约 5 分钟）」——
+          那是实测事实（重启后第 5 分钟才受理新作业），不是自愈承诺。
         """
         for jobs in ([(200, "Canceled")], [(100, "Completed"), (300, "Aborted")],
                      []):
@@ -157,14 +156,14 @@ class TestConflictMessagePicksTheRightStory:
                                "自行恢复", "很快就会好"):
                 assert forbidden not in msg, msg
 
-    def test_all_three_variants_mention_boot_wait(self):
-        """★ 三种措辞都必须写明「等打印机启动完成」——否则用户重启完马上扫，
-        又会撞 409（2026-10-24 `.111` 实测：重启后第 5 分钟才受理）。"""
-        for jobs in ([(200, "Canceled")], [(100, "Completed")], []):
-            msg = self._msg(jobs)
-            assert "启动" in msg, msg
-            assert "分钟" in msg, msg
-            assert "再试" in msg, msg
+    def test_does_not_depend_on_device_status_probe(self):
+        """★★ 即使设备状态查询失败，409 文案也必须照常给出（不再依赖探测）。"""
+        with mock.patch("escl_engine.probe_scanner_status",
+                        side_effect=RuntimeError("探测失败")):
+            msg = escl_engine._conflict_message_for("http://1.2.3.4/eSCL/")
+        assert "409" in msg, msg
+        assert "恢复默认" in msg or "恢复出厂" in msg, msg
+
 
 class TestJobCleanupIsNotAbandoned:
     """★ 「中途放弃」是设备留下 Canceled/Aborted 的根源 ⇒ 收尾**绝不能**取消作业
